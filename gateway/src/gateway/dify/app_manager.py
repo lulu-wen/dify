@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import structlog
@@ -51,20 +51,31 @@ _AUTH_FAILURE_HINTS: tuple[str, ...] = ("401", "unauthorized", "expired")
 
 @dataclass
 class CachedApp:
-    """One Dify App provisioned for a ``(customer_id, model_id)`` pair."""
+    """One Dify App provisioned for a ``(customer_id, model_id)`` pair.
+
+    Timestamps are caller-provided (using the AppManager's injected clock)
+    so that tests with a fake clock can deterministically age entries past
+    the TTL. Using ``default_factory=time.time`` would tie creation time to
+    the real wall clock, which mismatches the GC sweep's view of ``now``
+    when a fake clock is in use.
+    """
 
     customer_id: str
     model_id: str
     app_id: str
     app_key: str
-    created_at: float = field(default_factory=time.time)
-    last_used_at: float = field(default_factory=time.time)
+    created_at: float
+    last_used_at: float
 
 
 @dataclass
 class _CachedSession:
+    """Console session entry. ``obtained_at`` is reserved for future
+    diagnostics; freshness is enforced by the lock + ``force`` flag in
+    :meth:`AppManager._refresh_session`, not by elapsed time."""
+
     session: ConsoleSession
-    obtained_at: float = field(default_factory=time.time)
+    obtained_at: float = 0.0
 
 
 # Type alias for the dependency-injected client factory used by the manager.
@@ -190,11 +201,17 @@ class AppManager:
             model_id=model.id,
             app_id=app_id,
         )
+        # IMPORTANT: timestamps must come from ``self._clock`` (not real
+        # time.time) so that GC sweep arithmetic stays consistent under
+        # injected test clocks.
+        now = self._clock()
         return CachedApp(
             customer_id=customer.customer_id,
             model_id=model.id,
             app_id=app_id,
             app_key=app_key,
+            created_at=now,
+            last_used_at=now,
         )
 
     async def _with_session(
@@ -247,7 +264,10 @@ class AppManager:
                 customer.dify.console_email,
                 customer.dify.console_password,
             )
-            self._sessions[customer.customer_id] = _CachedSession(session=session)
+            self._sessions[customer.customer_id] = _CachedSession(
+                session=session,
+                obtained_at=self._clock(),
+            )
             return session
 
     # ------------------------------------------------------------------ #
