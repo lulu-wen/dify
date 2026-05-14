@@ -211,8 +211,9 @@ class AppManager:
             msg = str(e).lower()
             if not any(hint in msg for hint in _AUTH_FAILURE_HINTS):
                 raise
-            # Cookies likely expired; refresh and retry.
-            session = await self._refresh_session(customer, client)
+            # Cookies likely expired; force a fresh login (don't return the
+            # cached-but-failing session).
+            session = await self._refresh_session(customer, client, force=True)
             return await op(session)
 
     async def _get_session(self, customer: CustomerEntry, client: DifyClient) -> ConsoleSession:
@@ -221,11 +222,26 @@ class AppManager:
             return cached.session
         return await self._refresh_session(customer, client)
 
-    async def _refresh_session(self, customer: CustomerEntry, client: DifyClient) -> ConsoleSession:
+    async def _refresh_session(
+        self,
+        customer: CustomerEntry,
+        client: DifyClient,
+        *,
+        force: bool = False,
+    ) -> ConsoleSession:
+        """Acquire or renew the console session.
+
+        Args:
+            force: When False (default), if another concurrent caller has
+                already populated the cache while we were waiting for the
+                lock, reuse it (avoids thundering-herd logins). When True,
+                always perform a fresh login — used by the auth-retry path
+                in :meth:`_with_session`, where the cached session is the
+                one that just failed.
+        """
         async with self._session_locks[customer.customer_id]:
-            # Another concurrent caller may have refreshed already.
             cached = self._sessions.get(customer.customer_id)
-            if cached is not None and self._clock() - cached.obtained_at < 60:
+            if cached is not None and not force:
                 return cached.session
             session = await client.console_login(
                 customer.dify.console_email,
