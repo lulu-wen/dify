@@ -277,11 +277,11 @@ class DifyClient:
 
     async def console_import_app(self, session: ConsoleSession, yaml_content: str) -> str:
         """Create an App from a DSL YAML string. Returns the new ``app_id``."""
+        self._set_session_cookies(session)
         try:
             resp = await self._http.post(
                 "/console/api/apps/imports",
                 headers=_console_headers(session),
-                cookies=_console_cookies(session),
                 json={"mode": "yaml-content", "yaml_content": yaml_content},
             )
         except httpx.RequestError as e:
@@ -297,11 +297,11 @@ class DifyClient:
 
     async def console_create_app_api_key(self, session: ConsoleSession, app_id: str) -> str:
         """Generate a new ``app-*`` token bound to ``app_id``."""
+        self._set_session_cookies(session)
         try:
             resp = await self._http.post(
                 f"/console/api/apps/{app_id}/api-keys",
                 headers=_console_headers(session),
-                cookies=_console_cookies(session),
             )
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify app api-key creation failed: {e}") from e
@@ -314,11 +314,11 @@ class DifyClient:
 
     async def console_delete_app(self, session: ConsoleSession, app_id: str) -> None:
         """Delete an App (used by the GC sweep)."""
+        self._set_session_cookies(session)
         try:
             resp = await self._http.delete(
                 f"/console/api/apps/{app_id}",
                 headers=_console_headers(session),
-                cookies=_console_cookies(session),
             )
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify app delete failed: {e}") from e
@@ -326,6 +326,26 @@ class DifyClient:
         if resp.status_code == 404:
             return
         _raise_for_dify_status(resp)
+
+    def _set_session_cookies(self, session: ConsoleSession) -> None:
+        """Sync the session's cookies onto the underlying ``AsyncClient`` jar.
+
+        httpx deprecated per-request ``cookies=`` kwargs (the behavior is
+        ambiguous when the client also has its own jar). The supported path
+        is: mutate ``client.cookies`` and let httpx auto-include them on the
+        next request.
+
+        We clear both naming variants (bare and ``__Host-``-prefixed) before
+        setting so that switching deployments — or a session that just
+        re-logged into a server with a different cookie convention — does
+        not leak two cookies under different names.
+        """
+        jar = self._http.cookies
+        for name in ("access_token", "__Host-access_token", "csrf_token", "__Host-csrf_token"):
+            if name in jar:
+                jar.delete(name)
+        jar.set(session.access_token_cookie_name, session.access_token, path="/")
+        jar.set(session.csrf_token_cookie_name, session.csrf_token, path="/")
 
 
 def _bearer(token: str) -> dict[str, str]:
@@ -343,18 +363,6 @@ def _console_headers(session: ConsoleSession) -> dict[str, str]:
         "Authorization": f"Bearer {session.access_token}",
         "Content-Type": "application/json",
         "X-CSRF-Token": session.csrf_token,
-    }
-
-
-def _console_cookies(session: ConsoleSession) -> dict[str, str]:
-    """Cookie jar for console API requests; mirrors browser behavior.
-
-    Uses the cookie names the server originally sent (bare or ``__Host-``
-    prefixed) so that Dify's ``_real_cookie_name``-aware extractors find them.
-    """
-    return {
-        session.access_token_cookie_name: session.access_token,
-        session.csrf_token_cookie_name: session.csrf_token,
     }
 
 
