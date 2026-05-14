@@ -32,6 +32,7 @@ v1.x but pinning a Dify version is recommended.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -243,13 +244,22 @@ class DifyClient:
         sets ``access_token`` + ``csrf_token`` cookies. We extract both from
         the response cookie jar (httpx parses ``Set-Cookie`` automatically).
 
+        Note:
+            Dify's ``@decrypt_password_field`` decorator expects the password
+            payload to be base64-encoded by the client (the Web UI does this
+            client-side). Sending plaintext yields a 401 ``Invalid encrypted
+            data`` because the server's base64 decode step fails. See
+            ``api/controllers/console/wraps.py`` and ``api/libs/encryption.py``
+            in the Dify source.
+
         Raises:
             DifyUpstreamError: login failed or cookies missing.
         """
+        encoded_password = base64.b64encode(password.encode("utf-8")).decode("ascii")
         try:
             resp = await self._http.post(
                 "/console/api/login",
-                json={"email": email, "password": password, "language": "en-US"},
+                json={"email": email, "password": encoded_password, "language": "en-US"},
             )
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify console login failed: {e}") from e
