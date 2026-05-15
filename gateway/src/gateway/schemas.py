@@ -49,8 +49,22 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = Field(default=False)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+
+    # Token limit: OpenAI deprecated ``max_tokens`` in favor of ``max_completion_tokens``
+    # for reasoning models (o1, o3, GPT-5 thinking). Both are accepted; ``max_completion_tokens``
+    # takes precedence when both are set. Downstream (vLLM/Dify) only recognises
+    # ``max_tokens``, so the router forwards whichever value was resolved as ``max_tokens``.
     max_tokens: int | None = Field(default=None, gt=0)
-    user: str | None = Field(default=None, description="Stable end-user identifier")
+    max_completion_tokens: int | None = Field(default=None, gt=0)
+
+    # End-user identifier: OpenAI deprecated ``user`` in favor of ``safety_identifier``.
+    # Dify's chat-messages API requires ``user``, so we accept both and forward
+    # whichever was provided (preferring ``safety_identifier`` when both set).
+    user: str | None = Field(default=None, description="Stable end-user identifier (deprecated alias)")
+    safety_identifier: str | None = Field(
+        default=None,
+        description="OpenAI 2025+ replacement for ``user``; preferred when both are provided",
+    )
 
     # Gateway extensions (kept under ``extra_body`` for client SDK compatibility).
     # The OpenAI Python SDK flattens ``extra_body={"foo":...}`` into top-level
@@ -65,6 +79,16 @@ class ChatCompletionRequest(BaseModel):
             "otherwise it falls back to the standard ``model`` field."
         ),
     )
+
+    @property
+    def effective_max_tokens(self) -> int | None:
+        """Resolve the token cap honoring OpenAI's deprecation precedence."""
+        return self.max_completion_tokens if self.max_completion_tokens is not None else self.max_tokens
+
+    @property
+    def effective_user(self) -> str | None:
+        """Resolve the end-user identifier honoring OpenAI's deprecation precedence."""
+        return self.safety_identifier if self.safety_identifier is not None else self.user
 
 
 # ---------- Response (non-streaming) ----------
