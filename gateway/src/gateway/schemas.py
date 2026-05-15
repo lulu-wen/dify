@@ -213,6 +213,72 @@ class ModelList(BaseModel):
     data: list[ModelInfo]
 
 
+# ---------- /v1/embeddings ----------
+
+
+class EmbeddingsRequest(BaseModel):
+    """OpenAI-compatible embeddings request.
+
+    Reference: https://platform.openai.com/docs/api-reference/embeddings/create
+
+    The ``input`` field accepts a single string or a list of strings. OpenAI
+    also accepts list-of-tokens (int) and list-of-list-of-tokens; we do not
+    implement those here — most clients (LangChain, LlamaIndex) only send
+    strings, and the upstream (vLLM) accepts whatever we forward.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(min_length=1)
+    input: str | list[str] = Field(description="A single string or list of strings to embed")
+    encoding_format: Literal["float", "base64"] | None = Field(
+        default=None,
+        description="Defaults to 'float' upstream. Pass through unchanged.",
+    )
+    dimensions: int | None = Field(
+        default=None,
+        gt=0,
+        description="Truncate output dimensions. Only supported by some models.",
+    )
+
+    # OpenAI 2025 deprecation aliases — accept both, prefer new.
+    user: str | None = Field(default=None, description="Stable end-user identifier (deprecated alias)")
+    safety_identifier: str | None = Field(
+        default=None,
+        description="OpenAI 2025+ replacement for ``user``",
+    )
+
+    @property
+    def effective_user(self) -> str | None:
+        return self.safety_identifier if self.safety_identifier is not None else self.user
+
+
+class EmbeddingData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["embedding"] = "embedding"
+    index: int
+    embedding: list[float] | str  # str = base64-encoded when encoding_format="base64"
+
+
+class EmbeddingsUsage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingsResponse(BaseModel):
+    """OpenAI-compatible embeddings response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[EmbeddingData]
+    model: str
+    usage: EmbeddingsUsage = Field(default_factory=EmbeddingsUsage)
+
+
 def make_metadata(
     references: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,

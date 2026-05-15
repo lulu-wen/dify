@@ -28,7 +28,17 @@ router = APIRouter()
 
 @router.get("/v1/models")
 async def list_models(request: Request) -> ModelList:
+    """List every model the customer can invoke — both LLM and embedding.
+
+    OpenAI's ``/v1/models`` is type-agnostic: clients differentiate by id
+    (e.g. ``gpt-4`` vs ``text-embedding-3-large``). We follow the same
+    convention — one flat list, ``owned_by`` per entry.
+    """
     customer: CustomerEntry = request.state.customer
-    return ModelList(
-        data=[ModelInfo(id=m.id, owned_by=m.owner) for m in customer.models]
+    entries: list[ModelInfo] = [
+        ModelInfo(id=m.id, owned_by=m.owner) for m in customer.models
+    ]
+    entries.extend(
+        ModelInfo(id=e.id, owned_by=e.owner) for e in customer.embedding_models
     )
+    return ModelList(data=entries)

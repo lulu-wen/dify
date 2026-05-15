@@ -71,6 +71,39 @@ class DifyConnection(BaseModel):
     dataset_api_key: str = Field(min_length=1)
 
 
+class EmbeddingModelEntry(BaseModel):
+    """An embedding model the customer can call via ``POST /v1/embeddings``.
+
+    Unlike :class:`ModelEntry`, embedding models bypass Dify entirely — the
+    gateway proxies the request straight to an OpenAI-compatible embedding
+    endpoint (typically vLLM serving in ``--task embed`` mode). Dify is
+    irrelevant for pure vectorisation: there's no prompt, no RAG, no agent,
+    no need for App-level orchestration.
+
+    Attributes:
+        id: Customer-facing model id; what the client passes in the
+            ``model`` field of an embeddings request.
+        name: Model name to send downstream (matches the upstream service's
+            ``--served-model-name`` / model registry).
+        owner: Publisher identity surfaced in ``/v1/models`` (OpenAI ``owned_by``
+            semantics). Defaults to the gateway identifier.
+        endpoint_url: OpenAI-compatible base URL, e.g. ``http://vllm-embed:8000/v1``.
+        api_key: Bearer token sent to the endpoint; vLLM ignores it by default
+            but other OpenAI-compatible services may require a real key.
+        dimensions: Native output dimensions (informational; some models
+            support truncation via the request's ``dimensions`` parameter).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    owner: str = Field(default="ai-sdk-gateway", min_length=1)
+    endpoint_url: str = Field(min_length=1)
+    api_key: str = Field(default="EMPTY")
+    dimensions: int | None = Field(default=None, gt=0)
+
+
 class CustomerEntry(BaseModel):
     """A fully resolved customer registry row."""
 
@@ -80,6 +113,7 @@ class CustomerEntry(BaseModel):
     customer_id: str = Field(min_length=1)
     dify: DifyConnection
     models: list[ModelEntry] = Field(min_length=1)
+    embedding_models: list[EmbeddingModelEntry] = Field(default_factory=list)
     knowledge_bases: list[str] = Field(default_factory=list)
 
     @field_validator("models")
@@ -90,12 +124,26 @@ class CustomerEntry(BaseModel):
             raise ValueError("model ids must be unique within a customer")
         return models
 
+    @field_validator("embedding_models")
+    @classmethod
+    def _unique_embedding_model_ids(
+        cls, models: list[EmbeddingModelEntry]
+    ) -> list[EmbeddingModelEntry]:
+        ids = [m.id for m in models]
+        if len(ids) != len(set(ids)):
+            raise ValueError("embedding model ids must be unique within a customer")
+        return models
+
     def find_model(self, model_id: str) -> ModelEntry | None:
-        """Return the model entry matching ``model_id`` or None."""
+        """Return the LLM model entry matching ``model_id`` or None."""
         return next((m for m in self.models if m.id == model_id), None)
 
+    def find_embedding_model(self, model_id: str) -> EmbeddingModelEntry | None:
+        """Return the embedding model entry matching ``model_id`` or None."""
+        return next((m for m in self.embedding_models if m.id == model_id), None)
+
     def default_model(self) -> ModelEntry:
-        """Return the first declared model (used when client omits ``llm_model``)."""
+        """Return the first declared LLM model (fallback for ``llm_model`` omission)."""
         return self.models[0]
 
 

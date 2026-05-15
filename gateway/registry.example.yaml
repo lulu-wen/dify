@@ -38,6 +38,17 @@ customers:
         completion_params:
           temperature: 0.9
           max_tokens: 4096
+    # Embedding models — proxied straight to an OpenAI-compatible endpoint
+    # (typically vLLM in ``--task embed`` mode). No Dify involvement, no
+    # lazy-build: vectorisation is stateless and Dify only matters for
+    # orchestration + RAG.
+    embedding_models:
+      - id: "bge-m3"
+        name: "bge-m3"
+        owner: "BAAI"
+        endpoint_url: "http://vllm-embed:8000/v1"
+        api_key: "EMPTY"          # vLLM doesn't validate; use a real key for other providers
+        dimensions: 1024
     # Optional: knowledge bases (Dataset IDs) to attach to every auto-built App.
     knowledge_bases: []
 
@@ -56,5 +67,12 @@ customers:
         completion_params:
           temperature: 0.5
           max_tokens: 2048
+    embedding_models:
+      - id: "bge-m3"
+        name: "bge-m3"
+        owner: "BAAI"
+        endpoint_url: "http://vllm-embed:8000/v1"
+        api_key: "EMPTY"
+        dimensions: 1024
     knowledge_bases:
       - "kb-uuid-customer-b-alarms"

@@ -19,6 +19,7 @@ from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import chat as chat_router
+from gateway.routers import embeddings as embeddings_router
 from gateway.routers import models as models_router
 
 logger = structlog.get_logger(__name__)
@@ -103,6 +104,7 @@ def create_app(
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
 
     app.include_router(chat_router.router)
+    app.include_router(embeddings_router.router)
     app.include_router(models_router.router)
 
     @app.get("/health")

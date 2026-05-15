@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from gateway.registry import CustomerEntry, CustomerRegistry, DifyConnection, ModelEntry
+from gateway.registry import (
+    CustomerEntry,
+    CustomerRegistry,
+    DifyConnection,
+    EmbeddingModelEntry,
+    ModelEntry,
+)
 
 
 def _make_entry(
@@ -92,6 +98,77 @@ class TestCustomerEntryValidation:
     def test_default_model_is_first(self) -> None:
         entry = _make_entry(model_ids=("first", "second"))
         assert entry.default_model().id == "first"
+
+    def test_embedding_models_default_to_empty_list(self) -> None:
+        """Backward-compat with PR #1 registries: omitting embedding_models
+        is fine (the field defaults to empty list)."""
+        entry = _make_entry()
+        assert entry.embedding_models == []
+        assert entry.find_embedding_model("anything") is None
+
+    def test_embedding_model_lookup(self) -> None:
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="c",
+            dify=DifyConnection(
+                base_url="http://x", console_email="a@b", console_password="p", dataset_api_key="d"
+            ),
+            models=[ModelEntry(id="llm", provider="p", name="n")],
+            embedding_models=[
+                EmbeddingModelEntry(
+                    id="bge-m3",
+                    name="bge-m3",
+                    owner="BAAI",
+                    endpoint_url="http://embed:8000/v1",
+                ),
+            ],
+        )
+        found = entry.find_embedding_model("bge-m3")
+        assert found is not None
+        assert found.endpoint_url == "http://embed:8000/v1"
+        assert entry.find_embedding_model("nope") is None
+
+    def test_duplicate_embedding_model_ids_rejected(self) -> None:
+        with pytest.raises(ValueError, match="embedding model ids must be unique"):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id="c",
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                ),
+                models=[ModelEntry(id="llm", provider="p", name="n")],
+                embedding_models=[
+                    EmbeddingModelEntry(id="dup", name="n", endpoint_url="http://x"),
+                    EmbeddingModelEntry(id="dup", name="n", endpoint_url="http://y"),
+                ],
+            )
+
+
+class TestEmbeddingModelEntry:
+    def test_defaults(self) -> None:
+        e = EmbeddingModelEntry(id="bge-m3", name="bge-m3", endpoint_url="http://embed/v1")
+        assert e.owner == "ai-sdk-gateway"     # falls back to gateway identifier
+        assert e.api_key == "EMPTY"            # vLLM-friendly default
+        assert e.dimensions is None
+
+    def test_owner_can_be_publisher(self) -> None:
+        e = EmbeddingModelEntry(
+            id="bge-m3", name="bge-m3", endpoint_url="http://embed/v1", owner="BAAI",
+        )
+        assert e.owner == "BAAI"
+
+    def test_extra_fields_forbidden(self) -> None:
+        with pytest.raises(ValueError):
+            EmbeddingModelEntry(  # type: ignore[call-arg]
+                id="x", name="n", endpoint_url="http://x", typo_field="oops",
+            )
+
+    def test_dimensions_must_be_positive(self) -> None:
+        with pytest.raises(ValueError):
+            EmbeddingModelEntry(id="x", name="n", endpoint_url="http://x", dimensions=0)
 
     def test_extra_fields_forbidden(self) -> None:
         with pytest.raises(ValueError):
