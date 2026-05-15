@@ -9,8 +9,14 @@ from fastapi import FastAPI
 
 @pytest.mark.asyncio
 async def test_models_endpoint_returns_customer_models(app: FastAPI) -> None:
-    """Models endpoint returns each customer-permitted model with its
-    registry-declared publisher in ``owned_by``."""
+    """Models endpoint surfaces both LLM and embedding entries, each
+    carrying its registry-declared publisher in ``owned_by``.
+
+    The conftest fixture builds:
+      * LLM models ('m1', 'm2') without explicit owner → fall back to the
+        gateway identifier ('ai-sdk-gateway').
+      * Embedding model 'emb1' with explicit owner='TestPublisher'.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.get(
@@ -20,13 +26,15 @@ async def test_models_endpoint_returns_customer_models(app: FastAPI) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["object"] == "list"
-    ids = [m["id"] for m in body["data"]]
-    # The fixture customer was seeded with model_ids=("m1","m2").
-    assert "m1" in ids
-    assert "m2" in ids
-    # Default ``owner`` when not declared in registry is the gateway identifier.
-    # The conftest fixture doesn't set ``owner``, so all entries fall back.
-    assert all(m["owned_by"] == "ai-sdk-gateway" for m in body["data"])
+
+    by_id = {m["id"]: m for m in body["data"]}
+    assert {"m1", "m2", "emb1"} <= by_id.keys()
+
+    # LLM rows fall back to the gateway default (fixture doesn't set ``owner``).
+    assert by_id["m1"]["owned_by"] == "ai-sdk-gateway"
+    assert by_id["m2"]["owned_by"] == "ai-sdk-gateway"
+    # The embedding row carries the explicit publisher from the fixture.
+    assert by_id["emb1"]["owned_by"] == "TestPublisher"
 
 
 @pytest.mark.asyncio
