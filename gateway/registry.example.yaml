@@ -20,12 +20,21 @@ customers:
         # Matches the names registered in Dify's model provider plugin.
         provider: "langgenius/openai_api_compatible/openai_api_compatible"
         name: "qwen3.6-35b"
+        # ``owner`` = publisher identity for /v1/models response (OpenAI
+        # ``owned_by`` semantics). Use the upstream publisher's name, e.g.
+        #   gpt-*     -> "openai"
+        #   Llama-*   -> "meta-llama"
+        #   Qwen*     -> "Qwen"
+        #   bge-*     -> "BAAI"
+        # Omit to default to "ai-sdk-gateway".
+        owner: "Qwen"
         completion_params:
           temperature: 0.3
           max_tokens: 2048
       - id: "qwen3.6-35b-creative"
         provider: "langgenius/openai_api_compatible/openai_api_compatible"
         name: "qwen3.6-35b"
+        owner: "Qwen"
         completion_params:
           temperature: 0.9
           max_tokens: 4096
@@ -43,6 +52,7 @@ customers:
       - id: "qwen3.6-35b"
         provider: "langgenius/openai_api_compatible/openai_api_compatible"
         name: "qwen3.6-35b"
+        owner: "Qwen"
         completion_params:
           temperature: 0.5
           max_tokens: 2048

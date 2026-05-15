@@ -43,6 +43,12 @@ class ModelEntry(BaseModel):
     ``id`` is the customer-facing identifier passed in ``extra_body.llm_model``.
     ``provider``/``name``/``completion_params`` are written into Dify Apps when
     the gateway lazy-builds an App for ``(customer_id, model_id)``.
+
+    ``owner`` follows OpenAI's ``owned_by`` semantics — it identifies the
+    *publisher* of the underlying model (e.g., ``"openai"`` for GPT,
+    ``"meta-llama"`` for Llama, ``"Qwen"`` for Qwen3, ``"BAAI"`` for
+    bge-m3). Defaults to the gateway identifier when an upstream publisher
+    is unknown or not relevant (e.g., customer-specific fine-tuned models).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -50,6 +56,7 @@ class ModelEntry(BaseModel):
     id: str = Field(min_length=1)
     provider: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    owner: str = Field(default="ai-sdk-gateway", min_length=1)
     completion_params: dict[str, Any] = Field(default_factory=dict)
 
 
