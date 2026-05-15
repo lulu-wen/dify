@@ -6,6 +6,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from gateway.routers.models import GATEWAY_OWNER
+
 
 @pytest.mark.asyncio
 async def test_models_endpoint_returns_customer_models(app: FastAPI) -> None:
@@ -22,7 +24,27 @@ async def test_models_endpoint_returns_customer_models(app: FastAPI) -> None:
     # The fixture customer was seeded with model_ids=("m1","m2").
     assert "m1" in ids
     assert "m2" in ids
-    assert all(m["owned_by"] == "test-a" for m in body["data"])
+    # OpenAI ``owned_by`` semantics: who published the model, not who rents it.
+    # Tenant identity is conveyed via the SDK key, not via this field.
+    assert all(m["owned_by"] == GATEWAY_OWNER for m in body["data"])
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_owned_by_is_constant_across_customers(app: FastAPI) -> None:
+    """Regression: ``owned_by`` must NOT leak customer identity. Different
+    customers (in a multi-customer registry) should all see the same publisher
+    string for the gateway-published models they have access to."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer bsa_test_a"},
+        )
+    body = r.json()
+    owners = {m["owned_by"] for m in body["data"]}
+    assert owners == {GATEWAY_OWNER}, (
+        f"Expected single owner '{GATEWAY_OWNER}', got {owners}"
+    )
 
 
 @pytest.mark.asyncio
