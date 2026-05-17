@@ -146,6 +146,47 @@ class TestCustomerEntryValidation:
                 ],
             )
 
+    def test_id_collision_across_llm_and_embedding_rejected(self) -> None:
+        """Codex review-2 [P2]: the customer-facing id namespace is shared
+        across ``models`` and ``embedding_models`` because ``/v1/models``
+        flattens them into one OpenAI list. A registry that declares the
+        same id in both lists must fail at load time, not at request time.
+        """
+        with pytest.raises(ValueError, match="collide across LLM and embedding"):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id="c",
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                ),
+                models=[ModelEntry(id="shared", provider="p", name="n")],
+                embedding_models=[
+                    EmbeddingModelEntry(id="shared", name="n", endpoint_url="http://x"),
+                ],
+            )
+
+    def test_disjoint_llm_and_embedding_ids_accepted(self) -> None:
+        """Sanity: distinct ids across the two lists must still load fine."""
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="c",
+            dify=DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="llm-1", provider="p", name="n")],
+            embedding_models=[
+                EmbeddingModelEntry(id="emb-1", name="n", endpoint_url="http://x"),
+            ],
+        )
+        assert entry.find_model("llm-1") is not None
+        assert entry.find_embedding_model("emb-1") is not None
+
 
 class TestEmbeddingModelEntry:
     def test_defaults(self) -> None:

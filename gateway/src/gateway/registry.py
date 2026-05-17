@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ModelEntry(BaseModel):
@@ -133,6 +133,31 @@ class CustomerEntry(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("embedding model ids must be unique within a customer")
         return models
+
+    @model_validator(mode="after")
+    def _no_id_collisions_across_lists(self) -> "CustomerEntry":
+        """Reject the same ``id`` appearing in both ``models`` and ``embedding_models``.
+
+        ``/v1/models`` flattens both lists into a single OpenAI-shaped list,
+        and the per-customer dispatchers (``find_model`` vs
+        ``find_embedding_model``) assume the id namespace is shared. If the
+        same id pointed at both an LLM and an embedding model, ``/v1/models``
+        would advertise duplicate entries, and a client calling
+        ``model="x"`` against ``/v1/chat/completions`` would silently win
+        over the embedding side (or vice versa) — confusing behaviour that
+        depends on lookup order.
+
+        Forbid the collision at config-load time so it surfaces as a clear
+        validation error, not a runtime mystery.
+        """
+        llm_ids = {m.id for m in self.models}
+        emb_ids = {e.id for e in self.embedding_models}
+        overlap = llm_ids & emb_ids
+        if overlap:
+            raise ValueError(
+                f"model ids collide across LLM and embedding lists: {sorted(overlap)}"
+            )
+        return self
 
     def find_model(self, model_id: str) -> ModelEntry | None:
         """Return the LLM model entry matching ``model_id`` or None."""
