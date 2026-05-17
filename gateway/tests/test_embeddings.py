@@ -216,7 +216,7 @@ async def test_embeddings_chat_model_id_not_treated_as_embedding(app: FastAPI) -
 
 @pytest.mark.asyncio
 async def test_embeddings_upstream_5xx_returns_502(app: FastAPI) -> None:
-    """Upstream returns 5xx → 502 with OpenAI envelope."""
+    """Upstream returns 5xx → 502 with OpenAI envelope (real server failure)."""
     with respx.mock(base_url="http://embed.test") as m:
         m.post("/v1/embeddings").mock(return_value=httpx.Response(503, text="overloaded"))
         transport = httpx.ASGITransport(app=app)
@@ -230,6 +230,40 @@ async def test_embeddings_upstream_5xx_returns_502(app: FastAPI) -> None:
     assert r.status_code == 502
     body = r.json()
     assert body["error"]["code"] == "dify_upstream_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_status", [400, 413, 422])
+async def test_embeddings_upstream_4xx_passes_through(
+    app: FastAPI, upstream_status: int
+) -> None:
+    """Upstream 4xx → pass through the status code as ``invalid_request_error``.
+
+    Codex review-2 [P2] regression: previously every non-2xx became 502
+    ``dify_upstream_error``, which misled clients about who's at fault when
+    their own input was bad (e.g. ``dimensions`` not supported by the
+    upstream model, oversize input). The upstream's original status must be
+    preserved and its message surfaced so the client can fix their request.
+    """
+    body_text = f"upstream complaint at status {upstream_status}"
+    with respx.mock(base_url="http://embed.test") as m:
+        m.post("/v1/embeddings").mock(
+            return_value=httpx.Response(upstream_status, text=body_text)
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={"model": "emb1", "input": "x", "dimensions": 999999},
+            )
+
+    assert r.status_code == upstream_status
+    body = r.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["code"] == "upstream_invalid_request"
+    # Upstream message must reach the client so they can debug their input.
+    assert body_text in body["error"]["message"]
 
 
 @pytest.mark.asyncio

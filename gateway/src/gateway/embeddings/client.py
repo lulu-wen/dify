@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import structlog
 
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 
 logger = structlog.get_logger(__name__)
 
@@ -47,12 +47,11 @@ async def invoke_embeddings(
 
     Raises:
         DifyTimeoutError: Timed out waiting for response.
-        DifyUpstreamError: Non-2xx response or transport failure.
-
-    Note:
-        The exception types reuse the Dify naming for now to share the global
-        ``GatewayError`` handler. A follow-up could introduce
-        ``EmbeddingUpstreamError`` if the distinction matters for metrics.
+        UpstreamClientError: Upstream returned 4xx (the caller's request was
+            rejected for reasons the gateway could not pre-validate, e.g.
+            unsupported ``dimensions`` or oversized input). Preserves the
+            upstream's status code so the client sees the correct 4xx.
+        DifyUpstreamError: Upstream returned 5xx or had a transport failure.
     """
     base = endpoint_url.rstrip("/")
     url = f"{base}/embeddings"
@@ -77,7 +76,18 @@ async def invoke_embeddings(
             url=url,
             body=body_preview,
         )
-        raise DifyUpstreamError(f"Embedding endpoint returned HTTP {resp.status_code}: {body_preview}")
+        # 4xx: client mistake the gateway couldn't pre-validate (e.g. bad
+        # ``dimensions``, oversize input). Pass it through so the caller sees
+        # the real 4xx, not a misleading 502.
+        if 400 <= resp.status_code < 500:
+            raise UpstreamClientError(
+                f"Embedding endpoint rejected request (HTTP {resp.status_code}): {body_preview}",
+                upstream_status=resp.status_code,
+            )
+        # 5xx or other non-success: real upstream failure.
+        raise DifyUpstreamError(
+            f"Embedding endpoint returned HTTP {resp.status_code}: {body_preview}"
+        )
 
     return resp.json()
 
