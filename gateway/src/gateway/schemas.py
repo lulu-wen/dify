@@ -166,12 +166,25 @@ class ChatCompletionResponse(BaseModel):
 
 
 class DeltaMessage(BaseModel):
-    """Incremental delta in a streaming response."""
+    """Incremental delta in a streaming response.
+
+    ``reasoning_content`` matches OpenAI's o1-style streaming surface — when a
+    reasoning model (Qwen3 ``<think>``, DeepSeek-R1, o1-family) emits its
+    thinking trace, those chunks come down with ``delta.reasoning_content``
+    populated and ``content`` left null. Once thinking is done and the model
+    starts producing the user-facing answer, subsequent chunks carry
+    ``delta.content`` and ``reasoning_content`` is left null.
+
+    The gateway maps Dify's ``agent_thought`` SSE event → ``reasoning_content``
+    and Dify's ``message`` event → ``content``. Standard OpenAI clients read
+    both fields off the same ``delta`` so existing SDK code keeps working.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     role: Literal["assistant"] | None = None
     content: str | None = None
+    reasoning_content: str | None = None
 
 
 class ChatChunkChoice(BaseModel):

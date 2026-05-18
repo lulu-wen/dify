@@ -147,3 +147,100 @@ async def test_empty_answer_chunks_skipped() -> None:
     # Only the "real" chunk + final + DONE
     assert len(payloads) == 3
     assert payloads[0]["choices"][0]["delta"]["content"] == "real"  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# R7: agent_thought → reasoning_content
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_thought_event_emits_reasoning_content_chunk() -> None:
+    """A single ``agent_thought`` event with ``thought`` should produce one
+    OpenAI chunk where ``delta.reasoning_content`` carries the thinking
+    trace and ``delta.content`` is absent (matches OpenAI o1 streaming).
+    """
+    dify_stream = [
+        'data: {"event":"agent_thought","id":"t1","position":1,"thought":"Let me think about this..."}',
+        'data: {"event":"message_end","metadata":{}}',
+    ]
+    chunks = [c async for c in dify_to_openai_chunks(_alines(dify_stream), request_id="req-1", model_id="m1")]
+    payloads = _data_payloads(chunks)
+
+    # 1 reasoning chunk + 1 final + DONE
+    assert len(payloads) == 3
+    first = payloads[0]
+    assert first["choices"][0]["delta"]["reasoning_content"] == "Let me think about this..."  # type: ignore[index]
+    # First chunk announces role for the assistant message.
+    assert first["choices"][0]["delta"]["role"] == "assistant"  # type: ignore[index]
+    # OpenAI clients expect content absent (None / not present) during reasoning phase.
+    assert "content" not in first["choices"][0]["delta"]  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_then_message_phases_stream_in_order() -> None:
+    """Reasoning models emit thinking first, then the actual answer. The
+    converter must preserve order: reasoning_content chunks → content chunks
+    → final chunk with finish_reason. This is the exact UX an OpenAI o1
+    client renders as «AI is thinking...» followed by the streamed answer.
+    """
+    dify_stream = [
+        'data: {"event":"agent_thought","thought":"User asks RSRP..."}',
+        'data: {"event":"agent_thought","thought":" so I should explain..."}',
+        'data: {"event":"message","answer":"基站告警 RSRP=-115"}',
+        'data: {"event":"message","answer":" 通常是訊號弱"}',
+        'data: {"event":"message_end","metadata":{}}',
+    ]
+    chunks = [c async for c in dify_to_openai_chunks(_alines(dify_stream), request_id="req-1", model_id="m1")]
+    payloads = _data_payloads(chunks)
+
+    # 2 reasoning + 2 content + 1 final + DONE = 6
+    assert len(payloads) == 6
+    assert payloads[0]["choices"][0]["delta"]["reasoning_content"] == "User asks RSRP..."  # type: ignore[index]
+    assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"  # type: ignore[index]
+    # Subsequent reasoning chunks do NOT repeat the role.
+    assert "role" not in payloads[1]["choices"][0]["delta"]  # type: ignore[index]
+    assert payloads[1]["choices"][0]["delta"]["reasoning_content"] == " so I should explain..."  # type: ignore[index]
+    # Content phase begins; reasoning_content absent from content chunks.
+    assert payloads[2]["choices"][0]["delta"]["content"] == "基站告警 RSRP=-115"  # type: ignore[index]
+    assert "reasoning_content" not in payloads[2]["choices"][0]["delta"]  # type: ignore[index]
+    assert payloads[3]["choices"][0]["delta"]["content"] == " 通常是訊號弱"  # type: ignore[index]
+    # Final + DONE
+    assert payloads[4]["choices"][0]["finish_reason"] == "stop"  # type: ignore[index]
+    assert payloads[5] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_agent_thought_without_thought_field_skipped() -> None:
+    """Tool-using agents emit ``agent_thought`` events where ``thought`` is
+    null and other fields (``observation``, ``tool``) carry payloads. PR #3
+    only surfaces pure reasoning content, so these events must not produce
+    any chunk — would yield an empty ``reasoning_content`` chunk that
+    confuses clients into rendering a blank thinking bubble.
+    """
+    dify_stream = [
+        'data: {"event":"agent_thought","thought":null,"tool":"search","observation":"results"}',
+        'data: {"event":"message","answer":"final"}',
+        'data: {"event":"message_end","metadata":{}}',
+    ]
+    chunks = [c async for c in dify_to_openai_chunks(_alines(dify_stream), request_id="req-1", model_id="m1")]
+    payloads = _data_payloads(chunks)
+    # No reasoning chunk; just 1 content + final + DONE
+    assert len(payloads) == 3
+    assert payloads[0]["choices"][0]["delta"]["content"] == "final"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_empty_thought_skipped_like_empty_answer() -> None:
+    """Mirrors ``test_empty_answer_chunks_skipped``: an empty-string
+    ``thought`` field should not produce a chunk."""
+    dify_stream = [
+        'data: {"event":"agent_thought","thought":""}',
+        'data: {"event":"agent_thought","thought":"real thought"}',
+        'data: {"event":"message_end","metadata":{}}',
+    ]
+    chunks = [c async for c in dify_to_openai_chunks(_alines(dify_stream), request_id="req-1", model_id="m1")]
+    payloads = _data_payloads(chunks)
+    # 1 reasoning + final + DONE
+    assert len(payloads) == 3
+    assert payloads[0]["choices"][0]["delta"]["reasoning_content"] == "real thought"  # type: ignore[index]

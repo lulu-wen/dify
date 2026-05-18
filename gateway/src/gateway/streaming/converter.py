@@ -3,6 +3,9 @@
 Dify's ``POST /v1/chat-messages`` (response_mode=streaming) emits events:
 
 * ``message`` — a chunk of the assistant's answer (``answer`` field is delta).
+* ``agent_thought`` — reasoning model (Qwen3/DeepSeek-R1/o1-family) thinking
+  trace; the ``thought`` field is the incremental content. Routed to OpenAI's
+  ``delta.reasoning_content`` so standard clients can render a "thinking" UI.
 * ``message_end`` — terminal event with ``metadata`` (usage, retriever_resources).
 * ``error`` — Dify reports an error mid-stream.
 * ``ping`` — keep-alive.
@@ -94,6 +97,29 @@ async def dify_to_openai_chunks(
             delta = DeltaMessage(content=answer)
             if not started:
                 # First chunk announces the role per OpenAI convention.
+                delta.role = "assistant"
+                started = True
+            yield _format_chunk(
+                ChatCompletionChunk(
+                    id=request_id,
+                    model=model_id,
+                    choices=[ChatChunkChoice(index=0, delta=delta, finish_reason=None)],
+                )
+            )
+
+        elif event_type == "agent_thought":
+            # Reasoning model thinking trace → OpenAI-style ``reasoning_content``.
+            # Dify emits ``agent_thought`` with several extra fields (observation,
+            # tool, tool_input, ...). For pure reasoning models only ``thought``
+            # is populated; tool-using agents will use the other fields and we
+            # do not surface them in PR #3 (chat-only reasoning is the target).
+            thought = event.get("thought") or ""
+            if not thought:
+                continue
+            delta = DeltaMessage(reasoning_content=thought)
+            if not started:
+                # First chunk announces the role even when it's a reasoning
+                # chunk — clients building UIs need ``role`` to bind the message.
                 delta.role = "assistant"
                 started = True
             yield _format_chunk(
