@@ -292,6 +292,7 @@ PR #2 went through 2 rounds of independent codex review.
 |---|---|---|
 | **Round 1** | 1 × [P1] — test fixture drift in `test_models_endpoint.py` (the `all(...)` assertion broke after the fixture added an embedding with non-default `owner`). | Fixed in commit `56de4890f`. See `review-1-response.md`. |
 | **Round 2** | 0 × [P1], 2 × [P2] — (1) embedding upstream 4xx coerced to 502, (2) cross-list id collision between `models` and `embedding_models` not rejected. | Both fixed in 2 separate follow-up commits. New tests added: 3 parametrized 4xx-passthrough + 2 cross-list collision tests. `pytest gateway/tests/`: **129 PASSED**. See `review-2.md` + `review-2-response.md`. **GATE: PASS**. |
+| **Round 3** | 0 × [P1], 2 × [P2] — (1) round-2 4xx passthrough was too broad: 401/403/404/429 are gateway-side failures, not caller mistakes, (2) 2xx body validation missing — HTML/array body would surface as raw 500. | Both fixed (precise `_REQUEST_SHAPE_STATUSES = {400,413,422}` set + JSON shape validation). 6 new tests (4 non-shape 4xx parametrize + 2 body shape). `pytest gateway/tests/`: **135 PASSED**. See `review-3.md` + `review-3-response.md`. **GATE: PASS**. |
 
 **Process lesson** (already saved as a feedback memory after round 1):
 > AST validity ≠ test correctness. Run `pytest` before pushing for codex review;
