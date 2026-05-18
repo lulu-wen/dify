@@ -267,6 +267,90 @@ async def test_embeddings_upstream_4xx_passes_through(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_status", [401, 403, 404, 429])
+async def test_embeddings_upstream_non_shape_4xx_becomes_502(
+    app: FastAPI, upstream_status: int
+) -> None:
+    """Codex review-3 [P2]: non-shape 4xx (401/403/404/429) come from the
+    gateway's upstream side — bad/expired API key, upstream throttling,
+    upstream doesn't know this served model — and must NOT surface to the
+    caller as their own ``invalid_request_error``. They must look like an
+    upstream failure (502 ``dify_upstream_error``) so a caller with a
+    perfectly valid SDK key doesn't get blamed for the gateway's own
+    upstream credential / config / rate-limit issues.
+    """
+    with respx.mock(base_url="http://embed.test") as m:
+        m.post("/v1/embeddings").mock(
+            return_value=httpx.Response(upstream_status, text=f"upstream {upstream_status}")
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={"model": "emb1", "input": "x"},
+            )
+
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "dify_upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_embeddings_upstream_non_json_body_becomes_502(app: FastAPI) -> None:
+    """Codex review-3 [P2]: an upstream proxy (or a misconfigured reverse
+    proxy) can return HTTP 200 with an HTML error page. ``resp.json()``
+    would raise ``JSONDecodeError`` and propagate to the SDK caller as an
+    internal 500, breaking the OpenAI envelope contract. Must be reshaped
+    into a 502 upstream-error envelope.
+    """
+    with respx.mock(base_url="http://embed.test") as m:
+        m.post("/v1/embeddings").mock(
+            return_value=httpx.Response(
+                200,
+                text="<html><body>Bad Gateway</body></html>",
+                headers={"content-type": "text/html"},
+            )
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={"model": "emb1", "input": "x"},
+            )
+
+    assert r.status_code == 502
+    body = r.json()
+    assert body["error"]["code"] == "dify_upstream_error"
+    assert "non-JSON" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_embeddings_upstream_non_object_json_becomes_502(app: FastAPI) -> None:
+    """Codex review-3 [P2]: even valid JSON can be the wrong shape — e.g.
+    a misconfigured upstream returning an array or ``null``. Writing into
+    such a body (router does ``upstream_response['model'] = body.model``)
+    would TypeError and surface as 500. Must be 502 instead.
+    """
+    with respx.mock(base_url="http://embed.test") as m:
+        m.post("/v1/embeddings").mock(
+            return_value=httpx.Response(200, json=["this", "is", "an", "array"])
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={"model": "emb1", "input": "x"},
+            )
+
+    assert r.status_code == 502
+    body = r.json()
+    assert body["error"]["code"] == "dify_upstream_error"
+    assert "non-object JSON" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_embeddings_upstream_timeout_returns_504(app: FastAPI) -> None:
     with respx.mock(base_url="http://embed.test") as m:
         m.post("/v1/embeddings").mock(side_effect=httpx.TimeoutException("read timeout"))
