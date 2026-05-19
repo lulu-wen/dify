@@ -189,7 +189,10 @@ async def delete_file(file_id: str, request: Request) -> Any:
     isn't globally addressable — it lives under one dataset. Without this,
     we'd need to fetch every dataset and scan, which doesn't scale.
 
-    Idempotent: 404 from Dify is treated as already-deleted.
+    Idempotent contract (PR #3 R3 + codex review-5 P2): 404 from Dify
+    means already-deleted → 200. Shared-mode pre-flight preserves the
+    same: a missing dataset returns 200 (cleanup loop friendly), a
+    foreign dataset returns 404 (don't acknowledge customer B's data).
     """
     dataset_id = request.query_params.get("dataset_id")
     if not dataset_id:
@@ -199,8 +202,33 @@ async def delete_file(file_id: str, request: Request) -> Any:
 
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
 
-    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+    if strategy.is_shared:
+        # Inline the verify so a missing dataset is treated as already-
+        # deleted (matches Dify's own 404-on-document semantics + PR #3
+        # delete_document idempotency).
+        try:
+            meta = await dify_client.get_dataset(
+                dataset_api_key=customer.dify.dataset_api_key,
+                dataset_id=dataset_id,
+            )
+        except UpstreamClientError as exc:
+            if exc.status_code == 404:
+                logger.info(
+                    "files.deleted",
+                    dataset_id=dataset_id,
+                    document_id=file_id,
+                    status="dataset-missing",
+                )
+                return JSONResponse(content={"id": file_id, "deleted": True})
+            raise
+        if not strategy.dataset_belongs_to(
+            customer.customer_id, meta.get("name", "")
+        ):
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found", param="dataset_id"
+            )
 
     await dify_client.delete_document(
         dataset_api_key=customer.dify.dataset_api_key,

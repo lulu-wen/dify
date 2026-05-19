@@ -1097,6 +1097,86 @@ class TestReview3Fix_SharedCustomerIdLengthBudget:
         assert entry.customer_id == long_id
 
 
+class TestReview5Fix_IdempotentSharedDelete:
+    """Codex review-5 P2: shared-mode DELETE must preserve the idempotent
+    contract for already-missing datasets / files. Cross-customer DELETE
+    still 404s (don't pretend customer B's data was deleted), but the
+    missing-UUID case matches dedicated mode's behaviour.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shared_delete_missing_dataset_returns_idempotent_success(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """A stale dataset UUID (already gone) → 200 ``deleted: true``,
+        matching dedicated mode + the DELETE endpoint's documented
+        idempotent contract."""
+        from gateway.errors import UpstreamClientError
+
+        fake_dify.dataset_error = UpstreamClientError(
+            "Dify rejected request (HTTP 404): dataset not found",
+            upstream_status=404,
+        )
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.delete(
+                "/v1/datasets/already-gone",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        assert r.status_code == 200
+        assert r.json() == {"id": "already-gone", "deleted": True}
+        # Crucially: the actual delete must NOT have fired (no point —
+        # Dify already returned 404 on the get).
+        assert fake_dify.calls["dataset_delete"] == []
+
+    @pytest.mark.asyncio
+    async def test_shared_delete_foreign_dataset_still_returns_404(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Regression: foreign UUID must still 404. The review-5 fix
+        only relaxes the *missing* case, not the *foreign* case."""
+        fake_dify.dataset_get_response = {
+            "id": "ds-uuid-B",
+            "name": "tenant-b__kb-1",
+        }
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.delete(
+                "/v1/datasets/ds-uuid-B",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "dataset_not_found"
+        assert fake_dify.calls["dataset_delete"] == []
+
+    @pytest.mark.asyncio
+    async def test_shared_delete_file_missing_dataset_returns_idempotent_success(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Same pattern for ``DELETE /v1/files/{id}``: dataset gone →
+        200, matching delete_document's idempotent contract."""
+        from gateway.errors import UpstreamClientError
+
+        fake_dify.dataset_error = UpstreamClientError(
+            "Dify rejected request (HTTP 404): dataset not found",
+            upstream_status=404,
+        )
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.delete(
+                "/v1/files/doc-1?dataset_id=already-gone",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        assert r.status_code == 200
+        assert r.json() == {"id": "doc-1", "deleted": True}
+        assert fake_dify.calls["doc_delete"] == []
+
+
 class TestReviewFix_DedicatedRejectsSharedEmbedding:
     """Codex review-1 P2: dedicated mode must NOT accept
     ``shared_embedding_model`` (it would be ignored at request time, but

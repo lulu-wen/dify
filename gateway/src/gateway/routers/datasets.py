@@ -458,27 +458,52 @@ async def retrieve_dataset(
 async def delete_dataset(dataset_id: str, request: Request) -> Any:
     """Delete a dataset by Dify UUID.
 
-    Idempotent: returns 200 whether or not the dataset existed (Dify 404 →
-    treated as already-deleted in the client). Shared-mode (PR #4 R3):
-    cross-customer delete returns 404 ``dataset_not_found`` to avoid
-    revealing the dataset belongs to someone else.
+    Idempotent contract (PR #3 R2 + codex review-5 P2): returns 200 whether
+    or not the dataset existed. The Dify client treats its own 404 as
+    success on the actual delete call, and the shared-mode pre-flight
+    here must preserve the same semantics:
+
+    - **Missing UUID** (Dify get_dataset 404): treat as already deleted →
+      200 ``{"deleted": True}``. Lets cleanup loops call DELETE on stale
+      IDs without distinguishing dedicated vs shared customers.
+    - **Foreign UUID** (Dify 200 + name not owned): reject with 404
+      ``dataset_not_found``. This DOES leak existence-vs-not via the
+      delete envelope, but the alternative — silently 200ing on foreign
+      datasets — would let a malicious customer believe they deleted
+      somebody else's data. The existence-leak surface here is no worse
+      than other shared-mode operations.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
     strategy = isolation_strategy_for(customer)
 
     if strategy.is_shared:
-        # Verify ownership before delete. If the dataset doesn't exist in
-        # Dify, the get_dataset call inside _verify will surface a 404
-        # naturally (UpstreamClientError 404 from PR #3 review-3). For a
-        # cross-customer dataset, we raise UnknownDatasetError ourselves.
+        # Inline the verify so we can distinguish missing (200 idempotent)
+        # from foreign (404 reject). The shared _verify_dataset_ownership
+        # helper collapses both into UnknownDatasetError, which would
+        # break the idempotent contract for already-missing datasets.
         try:
-            await _verify_dataset_ownership(
-                dify_client, customer, strategy, dataset_id
+            meta = await dify_client.get_dataset(
+                dataset_api_key=customer.dify.dataset_api_key,
+                dataset_id=dataset_id,
             )
-        except UnknownDatasetError:
+        except UpstreamClientError as exc:
+            if exc.status_code == 404:
+                # Already gone — honour the idempotent DELETE contract.
+                logger.info(
+                    "datasets.deleted",
+                    dataset_id=dataset_id,
+                    mode="shared",
+                    status="already-missing",
+                )
+                return JSONResponse(content={"id": dataset_id, "deleted": True})
             raise
-        # else fall through to delete
+        if not strategy.dataset_belongs_to(
+            customer.customer_id, meta.get("name", "")
+        ):
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found", param="dataset_id"
+            )
 
     await dify_client.delete_dataset(
         dataset_api_key=customer.dify.dataset_api_key,
