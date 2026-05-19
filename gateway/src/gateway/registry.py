@@ -30,8 +30,9 @@ Invariants:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -60,8 +61,47 @@ class ModelEntry(BaseModel):
     completion_params: dict[str, Any] = Field(default_factory=dict)
 
 
+class SharedEmbeddingModel(BaseModel):
+    """Workspace-global embedding model used when ``DifyConnection.mode == "shared"``.
+
+    PR #4 R5: in shared mode the customer's Dify is **one workspace serving
+    many customers**, and Dify's embedding plugin is workspace-scoped. So
+    every dataset created in that workspace MUST bind to the same embedding
+    model regardless of which customer triggered the creation. This config
+    lives on ``DifyConnection`` rather than on individual ``EmbeddingModelEntry``
+    rows because it is genuinely workspace-level (one value per Dify
+    deployment, not per customer).
+
+    Per-customer ``embedding_models`` (for direct ``POST /v1/embeddings``)
+    keep working as before — only the dataset binding path is constrained.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1, description="Embedding model name Dify recognises (served-model-name)")
+    provider: str = Field(
+        min_length=1,
+        description="Dify plugin provider id, e.g. langgenius/openai_api_compatible/openai_api_compatible",
+    )
+
+
 class DifyConnection(BaseModel):
-    """Connection details for the customer's Dify deployment."""
+    """Connection details for the customer's Dify deployment.
+
+    The ``mode`` flag (PR #4 R1) controls how the gateway isolates customers:
+
+    - ``dedicated`` (default, PR #1-#3 behaviour): each customer has their own
+      Dify deployment. The workspace IS the tenant boundary, so the gateway
+      relies on Dify's own data isolation — no need for App / Dataset name
+      prefixing.
+
+    - ``shared`` (PR #4): multiple customers point at the same Dify base_url
+      and dataset_api_key. The gateway applies soft isolation by prefixing
+      App and Dataset names with ``customer_id`` and filtering list responses.
+      **Not** suitable for paid production (the workspace-level Postgres / S3 /
+      credentials are still shared — see Notion overview §4.3 for the full
+      isolation analysis).
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -69,6 +109,37 @@ class DifyConnection(BaseModel):
     console_email: str = Field(min_length=1)
     console_password: str = Field(min_length=1)
     dataset_api_key: str = Field(min_length=1)
+    mode: Literal["dedicated", "shared"] = Field(
+        default="dedicated",
+        description=(
+            "Isolation mode. `dedicated` (per-customer Dify, default) keeps "
+            "PR #1-#3 behaviour. `shared` (one Dify, many customers) enables "
+            "App + Dataset name prefixing + list filtering. See PR #4 spec."
+        ),
+    )
+    shared_embedding_model: SharedEmbeddingModel | None = Field(
+        default=None,
+        description=(
+            "Required when mode='shared': the workspace-global embedding "
+            "model dataset creation must bind to. Ignored in dedicated mode."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _shared_mode_requires_embedding(self) -> DifyConnection:
+        """Shared mode must declare the workspace's embedding model.
+
+        Without this, the gateway would have no way to honour Dify's
+        workspace-level embedding constraint at dataset-create time.
+        Reject the config up front instead of failing on the first dataset
+        creation.
+        """
+        if self.mode == "shared" and self.shared_embedding_model is None:
+            raise ValueError(
+                "dify.shared_embedding_model is required when dify.mode='shared' "
+                "(workspace-global embedding model is needed for dataset creation)"
+            )
+        return self
 
 
 class EmbeddingModelEntry(BaseModel):
@@ -194,13 +265,67 @@ class CustomerRegistry:
 
     @classmethod
     def from_entries(cls, entries: list[CustomerEntry]) -> CustomerRegistry:
-        """Build a registry from a list of entries (raises on duplicate SDK keys)."""
+        """Build a registry from a list of entries.
+
+        Raises:
+            ValueError: duplicate sdk_key, OR customers sharing the same
+                Dify ``base_url`` but disagreeing on ``mode`` /
+                ``shared_embedding_model`` (PR #4 R1).
+        """
         by_key: dict[str, CustomerEntry] = {}
         for entry in entries:
             if entry.sdk_key in by_key:
                 raise ValueError(f"duplicate sdk_key in registry: {entry.sdk_key}")
             by_key[entry.sdk_key] = entry
+        cls._check_dify_consistency(by_key.values())
         return cls(by_key)
+
+    @staticmethod
+    def _check_dify_consistency(entries: Any) -> None:
+        """Customers pointing at the same Dify must agree on isolation mode.
+
+        PR #4 R1: if customer A is on ``dedicated`` and customer B is on
+        ``shared`` but both point at the same ``base_url``, the gateway
+        ends up in an inconsistent state — A creates datasets with raw
+        names while B prefixes them, and a name collision is possible.
+        Similarly the workspace-level ``shared_embedding_model`` must be
+        identical for all customers on the same Dify.
+
+        Fail loud at registry load so the issue is caught in CI / dev,
+        not at the first runtime dataset operation.
+        """
+        groups: dict[str, list[CustomerEntry]] = defaultdict(list)
+        for e in entries:
+            groups[e.dify.base_url].append(e)
+
+        for base_url, members in groups.items():
+            modes = {m.dify.mode for m in members}
+            if len(modes) > 1:
+                ids = sorted(m.customer_id for m in members)
+                raise ValueError(
+                    f"customers sharing dify base_url '{base_url}' disagree on "
+                    f"isolation mode: {sorted(modes)} (customers: {ids}). "
+                    "All customers on the same Dify must use the same mode."
+                )
+
+            # Single mode across the group — also check shared_embedding_model
+            # agrees when mode='shared' (we already validated each entry sets
+            # it when shared, but two customers could disagree on which one).
+            shared_models = {
+                (
+                    m.dify.shared_embedding_model.name,
+                    m.dify.shared_embedding_model.provider,
+                )
+                for m in members
+                if m.dify.shared_embedding_model is not None
+            }
+            if len(shared_models) > 1:
+                ids = sorted(m.customer_id for m in members)
+                raise ValueError(
+                    f"customers sharing dify base_url '{base_url}' disagree on "
+                    f"shared_embedding_model: {sorted(shared_models)} "
+                    f"(customers: {ids}). The workspace has one embedding model."
+                )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CustomerRegistry:
