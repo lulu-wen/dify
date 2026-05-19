@@ -292,6 +292,77 @@ class EmbeddingsResponse(BaseModel):
     usage: EmbeddingsUsage = Field(default_factory=EmbeddingsUsage)
 
 
+# ---------- /v1/datasets ----------
+
+
+class DatasetCreateRequest(BaseModel):
+    """Body of ``POST /v1/datasets``.
+
+    Customer-facing surface is intentionally smaller than Dify's
+    ``DatasetCreatePayload`` — only the fields a client should set are
+    accepted. Gateway resolves ``embedding_model_provider`` from the
+    registry; clients pass just ``embedding_model`` (and may omit it
+    entirely to use the customer's default).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=40)
+    description: str = Field(default="", max_length=400)
+    indexing_technique: Literal["high_quality", "economy"] = Field(
+        default="high_quality",
+        description=(
+            "``high_quality`` runs the documents through an embedding model "
+            "and stores vectors in Qdrant — required for semantic retrieval. "
+            "``economy`` is keyword-only and much cheaper but worse recall."
+        ),
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description=(
+            "Customer-facing embedding model id (must match an entry in the "
+            "customer's ``embedding_models`` registry). If omitted, the "
+            "gateway falls back to the customer's first registered embedding "
+            "model. If neither is present, the request is rejected."
+        ),
+    )
+
+
+class Dataset(BaseModel):
+    """A dataset entry as surfaced to the SDK client.
+
+    Mirrors Dify's ``dataset_detail_fields`` output but with the noisy
+    internal fields (provider plugin ids, indexing settings, partial
+    member list, ...) stripped. We use ``extra="allow"`` so the customer
+    can still see any extra Dify fields if they need to.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    name: str
+    description: str | None = None
+    indexing_technique: str | None = None
+    embedding_model: str | None = None
+    embedding_model_provider: str | None = None
+    document_count: int = 0
+    word_count: int = 0
+    created_at: int | None = None
+
+
+class DatasetList(BaseModel):
+    """Response envelope for ``GET /v1/datasets``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[Dataset]
+    has_more: bool = False
+    total: int = 0
+    page: int = 1
+    limit: int = 20
+
+
 def make_metadata(
     references: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,

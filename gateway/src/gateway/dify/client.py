@@ -234,6 +234,149 @@ class DifyClient:
             await cm.__aexit__(None, None, None)
 
     # ------------------------------------------------------------------ #
+    # Service API: Datasets (knowledge base CRUD)                        #
+    # ------------------------------------------------------------------ #
+    #
+    # Datasets use a different auth key than chat-messages: the customer's
+    # ``dataset_api_key`` from their Dify deployment (set per-customer in
+    # the registry's ``DifyConnection``). The wire protocol is the same
+    # ``Authorization: Bearer <key>`` pattern, just a different key value.
+    # Dataset IDs in URLs are Dify-issued UUIDs.
+
+    async def create_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets`` — create a new dataset.
+
+        ``payload`` shape (subset of Dify's ``DatasetCreatePayload``):
+            * ``name`` (required)
+            * ``description``
+            * ``indexing_technique`` ("high_quality" | "economy")
+            * ``embedding_model``, ``embedding_model_provider``
+            * ``permission``, ``provider``, ``retrieval_model``, ...
+
+        The gateway router fills in ``embedding_model_provider`` based on
+        the customer registry; callers should pass the resolved payload.
+        """
+        try:
+            resp = await self._http.post(
+                "/v1/datasets",
+                headers=_bearer(dataset_api_key),
+                json=dict(payload),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify create-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify create-dataset failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    async def list_datasets(
+        self,
+        *,
+        dataset_api_key: str,
+        page: int = 1,
+        limit: int = 20,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets`` — list datasets visible to the API key.
+
+        Returns the raw Dify envelope:
+        ``{"data": [...], "has_more": bool, "limit": int, "total": int, "page": int}``.
+        The gateway router reshapes this into the OpenAI-style response.
+        """
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if keyword:
+            params["keyword"] = keyword
+        try:
+            resp = await self._http.get(
+                "/v1/datasets",
+                headers=_bearer(dataset_api_key),
+                params=params,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify list-datasets timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify list-datasets failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    async def get_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets/{uuid}`` — fetch a single dataset's metadata."""
+        try:
+            resp = await self._http.get(
+                f"/v1/datasets/{dataset_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify get-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify get-dataset failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    async def delete_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+    ) -> None:
+        """``DELETE /v1/datasets/{uuid}`` — remove a dataset.
+
+        Idempotent in the GC sense: a 404 from Dify is treated as success
+        (the dataset is already gone), matching the chat-app delete pattern.
+        """
+        try:
+            resp = await self._http.delete(
+                f"/v1/datasets/{dataset_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify delete-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify delete-dataset failed: {e}") from e
+        if resp.status_code == 404:
+            return
+        _raise_for_dify_status(resp)
+
+    async def retrieve_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets/{uuid}/retrieve`` — pure-retrieval (hit-testing).
+
+        ``payload`` shape:
+            * ``query`` (required)
+            * ``retrieval_model`` (optional override)
+            * ``external_retrieval_model``
+
+        Returns ``{"query": {...}, "records": [{segment, score, ...}]}``.
+        """
+        try:
+            resp = await self._http.post(
+                f"/v1/datasets/{dataset_id}/retrieve",
+                headers=_bearer(dataset_api_key),
+                json=dict(payload),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify dataset-retrieve timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify dataset-retrieve failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    # ------------------------------------------------------------------ #
     # Console API (App management)                                       #
     # ------------------------------------------------------------------ #
 

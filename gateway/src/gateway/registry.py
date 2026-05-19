@@ -88,10 +88,18 @@ class EmbeddingModelEntry(BaseModel):
         owner: Publisher identity surfaced in ``/v1/models`` (OpenAI ``owned_by``
             semantics). Defaults to the gateway identifier.
         endpoint_url: OpenAI-compatible base URL, e.g. ``http://vllm-embed:8000/v1``.
+            Used by ``POST /v1/embeddings`` to proxy directly to the upstream.
         api_key: Bearer token sent to the endpoint; vLLM ignores it by default
             but other OpenAI-compatible services may require a real key.
         dimensions: Native output dimensions (informational; some models
             support truncation via the request's ``dimensions`` parameter).
+        provider: Dify plugin provider id (e.g.
+            ``langgenius/openai_api_compatible/openai_api_compatible``) used
+            when the gateway creates a dataset bound to this embedding model
+            (PR #3 R2 + R5). Optional — if unset, ``POST /v1/datasets`` will
+            send only ``embedding_model`` to Dify and let Dify resolve the
+            provider, which works when the customer's Dify has exactly one
+            embedding plugin installed.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -102,6 +110,7 @@ class EmbeddingModelEntry(BaseModel):
     endpoint_url: str = Field(min_length=1)
     api_key: str = Field(default="EMPTY")
     dimensions: int | None = Field(default=None, gt=0)
+    provider: str | None = Field(default=None, min_length=1)
 
 
 class CustomerEntry(BaseModel):

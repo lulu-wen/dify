@@ -86,6 +86,32 @@ class FakeDifyClient:
         self.import_app_ids = ["app-id-1", "app-id-2", "app-id-3"]
         self.api_key_tokens = ["app-key-1", "app-key-2", "app-key-3"]
 
+        # Dataset (PR #3 R2/R4/R5) scriptable responses. Tests assign whatever
+        # shape they want to assert on; defaults are deliberately minimal so a
+        # test that doesn't override these still exercises the schema.
+        self.dataset_create_response: dict[str, Any] = {
+            "id": "ds-uuid-1",
+            "name": "default-ds",
+            "description": "",
+            "indexing_technique": "high_quality",
+            "embedding_model": "upstream-emb1",
+            "embedding_model_provider": None,
+            "document_count": 0,
+            "word_count": 0,
+            "created_at": 1700000000,
+        }
+        self.dataset_list_response: dict[str, Any] = {
+            "data": [],
+            "has_more": False,
+            "limit": 20,
+            "total": 0,
+            "page": 1,
+        }
+        self.dataset_get_response: dict[str, Any] | None = None
+        self.dataset_retrieve_response: dict[str, Any] = {"query": {}, "records": []}
+        # Set to an exception instance to simulate a Dify failure on a given op.
+        self.dataset_error: BaseException | None = None
+
         self.calls: dict[str, list[Any]] = {
             "blocking": [],
             "streaming": [],
@@ -93,6 +119,11 @@ class FakeDifyClient:
             "import": [],
             "api_key": [],
             "delete": [],
+            "dataset_create": [],
+            "dataset_list": [],
+            "dataset_get": [],
+            "dataset_delete": [],
+            "dataset_retrieve": [],
         }
 
     async def chat_messages_blocking(self, **kwargs: Any) -> dict[str, Any]:
@@ -126,6 +157,39 @@ class FakeDifyClient:
 
     async def console_delete_app(self, session: ConsoleSession, app_id: str) -> None:
         self.calls["delete"].append((session, app_id))
+
+    # ----- PR #3 dataset methods -----
+
+    async def create_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_create"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_create_response
+
+    async def list_datasets(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_list"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_list_response
+
+    async def get_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_get"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        if self.dataset_get_response is not None:
+            return self.dataset_get_response
+        return self.dataset_create_response
+
+    async def delete_dataset(self, **kwargs: Any) -> None:
+        self.calls["dataset_delete"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+
+    async def retrieve_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_retrieve"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_retrieve_response
 
     async def aclose(self) -> None:
         return None
