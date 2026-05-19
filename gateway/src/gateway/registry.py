@@ -30,6 +30,7 @@ Invariants:
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal
@@ -201,20 +202,17 @@ class CustomerEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     sdk_key: str = Field(min_length=1)
-    # ``customer_id`` is used as a literal prefix for App and Dataset names
-    # in shared mode (PR #4). To keep ``startswith("{customer_id}__")``
-    # unambiguous, the slug must NOT contain a double-underscore — otherwise
-    # customer "acme" would falsely match datasets owned by "acme__beta"
-    # (codex review-1 P1). The pattern also rejects spaces, slashes and
-    # other separators that could trip path or URL parsing later.
     customer_id: str = Field(
         min_length=1,
         max_length=64,
-        pattern=r"^[a-z0-9][a-z0-9-]*$",
         description=(
-            "Lowercase alphanumeric + hyphen slug. No underscores "
-            "(reserved as a shared-mode prefix separator). Must start "
-            "with a letter or digit."
+            "Per-customer identifier. In shared mode it is additionally "
+            "constrained to a lowercase / hyphen slug (no underscores) "
+            "because the gateway uses it as a literal prefix for App / "
+            "Dataset names. See ``_shared_mode_customer_id_is_slug`` for "
+            "the validator that enforces the slug rule. Dedicated mode "
+            "(PR #1-#3 default) accepts any string within the length cap "
+            "so existing deployments don't break (codex review-4 P2)."
         ),
     )
     dify: DifyConnection
@@ -245,6 +243,37 @@ class CustomerEntry(BaseModel):
     # ever bumps the limit, both constants need updating together (the
     # tests in test_shared_mode.py pin this expectation).
     _DIFY_DATASET_NAME_LIMIT: int = 40
+    # Shared-mode customer_id constraint: lowercase ASCII + digits +
+    # hyphens, must start with letter or digit. The literal "__" sequence
+    # used in ``{customer_id}__{name}`` is then unambiguous (codex
+    # review-1 P1). Dedicated mode does NOT enforce this — backward
+    # compat with existing PR #1-#3 registries that may use uppercase /
+    # underscores (codex review-4 P2).
+    _SHARED_CUSTOMER_ID_PATTERN: re.Pattern[str] = re.compile(
+        r"^[a-z0-9][a-z0-9-]*$"
+    )
+
+    @model_validator(mode="after")
+    def _shared_mode_customer_id_is_slug(self) -> CustomerEntry:
+        """Enforce slug pattern on customer_id ONLY when mode='shared'.
+
+        Codex review-1 P1 required this for shared mode (so the prefix
+        ``{customer_id}__`` can't be substring-attacked). Codex review-4
+        P2 caught that a Field-level pattern would also break PR #1-#3
+        deployments using IDs like ``Customer_A`` or ``acme_prod`` in
+        dedicated mode. Restrict the slug rule to shared mode.
+        """
+        if self.dify.mode == "shared" and not self._SHARED_CUSTOMER_ID_PATTERN.match(
+            self.customer_id
+        ):
+            raise ValueError(
+                f"customer_id '{self.customer_id}' is not a valid shared-mode "
+                "slug. Shared mode requires lowercase ASCII letters, digits, "
+                "and hyphens only (must start with a letter or digit). Underscores "
+                "are reserved as the shared-mode prefix separator. Dedicated mode "
+                "has no such restriction; switch dify.mode if you want flexibility."
+            )
+        return self
 
     @model_validator(mode="after")
     def _shared_mode_customer_id_fits_name_budget(self) -> CustomerEntry:

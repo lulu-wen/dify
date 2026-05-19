@@ -588,70 +588,95 @@ async def test_shared_delete_file_cross_customer_returns_404(
 
 
 class TestReviewFix_CustomerIdSlug:
-    """Codex review-1 P1: customer_id must enforce slug pattern.
-
-    Without it, ``acme`` could match datasets owned by ``acme__beta``
-    because both start with ``acme__``. Slug pattern (no underscores)
-    makes the prefix unambiguous.
+    """Codex review-1 P1 + review-4 P2: customer_id slug pattern is
+    enforced ONLY in shared mode. Dedicated mode (PR #1-#3 default)
+    accepts any string within the length cap so existing deployments
+    don't break on the PR #4 upgrade.
     """
 
-    def test_customer_id_with_underscore_rejected(self) -> None:
-        with pytest.raises(ValueError):
+    def _shared_conn(self) -> DifyConnection:
+        return DifyConnection(
+            base_url="http://x",
+            console_email="a@b",
+            console_password="p",
+            dataset_api_key="d",
+            mode="shared",
+            shared_embedding_model=SharedEmbeddingModel(name="bge-m3", provider="prov"),
+        )
+
+    def _dedicated_conn(self) -> DifyConnection:
+        return DifyConnection(
+            base_url="http://x",
+            console_email="a@b",
+            console_password="p",
+            dataset_api_key="d",
+        )
+
+    # ---- Shared mode: pattern enforced ----
+
+    def test_shared_customer_id_with_underscore_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a valid shared-mode slug"):
             CustomerEntry(
                 sdk_key="bsa_x",
-                customer_id="acme_beta",  # underscore not allowed
-                dify=DifyConnection(
-                    base_url="http://x",
-                    console_email="a@b",
-                    console_password="p",
-                    dataset_api_key="d",
-                ),
+                customer_id="acme_beta",
+                dify=self._shared_conn(),
                 models=[ModelEntry(id="m", provider="p", name="n")],
             )
 
-    def test_customer_id_with_double_underscore_rejected(self) -> None:
+    def test_shared_customer_id_with_double_underscore_rejected(self) -> None:
         """The exact attack codex flagged: ``acme__beta`` would
-        substring-match ``acme`` as owner."""
-        with pytest.raises(ValueError):
+        substring-match ``acme`` as owner under shared-mode prefix logic."""
+        with pytest.raises(ValueError, match="not a valid shared-mode slug"):
             CustomerEntry(
                 sdk_key="bsa_x",
                 customer_id="acme__beta",
-                dify=DifyConnection(
-                    base_url="http://x",
-                    console_email="a@b",
-                    console_password="p",
-                    dataset_api_key="d",
-                ),
+                dify=self._shared_conn(),
                 models=[ModelEntry(id="m", provider="p", name="n")],
             )
 
-    def test_customer_id_uppercase_rejected(self) -> None:
-        with pytest.raises(ValueError):
+    def test_shared_customer_id_uppercase_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a valid shared-mode slug"):
             CustomerEntry(
                 sdk_key="bsa_x",
                 customer_id="Acme",
-                dify=DifyConnection(
-                    base_url="http://x",
-                    console_email="a@b",
-                    console_password="p",
-                    dataset_api_key="d",
-                ),
+                dify=self._shared_conn(),
                 models=[ModelEntry(id="m", provider="p", name="n")],
             )
 
-    def test_customer_id_hyphen_lowercase_accepted(self) -> None:
+    def test_shared_customer_id_hyphen_lowercase_accepted(self) -> None:
         entry = CustomerEntry(
             sdk_key="bsa_x",
             customer_id="tenant-a-1",
-            dify=DifyConnection(
-                base_url="http://x",
-                console_email="a@b",
-                console_password="p",
-                dataset_api_key="d",
-            ),
+            dify=self._shared_conn(),
             models=[ModelEntry(id="m", provider="p", name="n")],
         )
         assert entry.customer_id == "tenant-a-1"
+
+    # ---- Dedicated mode: pattern NOT enforced (review-4 P2 regression) ----
+
+    def test_dedicated_customer_id_with_underscore_accepted(self) -> None:
+        """Codex review-4 P2: PR #1-#3 deployments may have customer_ids
+        like ``acme_prod`` (underscore) from before PR #4. The slug rule
+        must NOT apply in dedicated mode — only when shared mode is opted
+        in via ``dify.mode: shared``."""
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="acme_prod",  # underscore — fine in dedicated mode
+            dify=self._dedicated_conn(),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == "acme_prod"
+
+    def test_dedicated_customer_id_uppercase_accepted(self) -> None:
+        """Same backward-compat principle: ``Customer_A`` from a PR #1-#3
+        registry must keep loading."""
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="Customer_A",
+            dify=self._dedicated_conn(),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == "Customer_A"
 
 
 class TestReviewFix_DatasetNotFoundNormalization:
