@@ -37,6 +37,7 @@ from gateway.errors import (
     InvalidRequestError,
     UnknownDatasetError,
     UnknownModelError,
+    UpstreamClientError,
 )
 from gateway.mode import IsolationStrategy, isolation_strategy_for
 from gateway.registry import CustomerEntry, EmbeddingModelEntry
@@ -94,8 +95,17 @@ def resolve_embedding_for_dataset(
     # ``embedding_models`` are still usable for direct /v1/embeddings calls,
     # but they cannot bind a dataset — Dify only has one embedding plugin
     # active per workspace.
-    shared = customer.dify.shared_embedding_model
-    if shared is not None:
+    #
+    # Codex review-1 P2: gate on the explicit ``mode`` flag, not on the
+    # presence of ``shared_embedding_model``. A dedicated-mode customer
+    # that accidentally set the field (registry validator now rejects this,
+    # but defence in depth) should NOT silently switch to shared resolution.
+    if customer.dify.mode == "shared":
+        # Registry validator enforces shared_embedding_model is present
+        # when mode='shared', so this assertion is documentation, not
+        # runtime defence.
+        assert customer.dify.shared_embedding_model is not None
+        shared = customer.dify.shared_embedding_model
         if requested_id is not None and requested_id != shared.name:
             raise InvalidRequestError(
                 (
@@ -168,16 +178,33 @@ async def _verify_dataset_ownership(
     ``UnknownDatasetError`` (404) if it belongs to someone else.
 
     The 404 is deliberate (not 403): a 403 would leak the existence of the
-    other customer's dataset. The customer sees the same envelope whether
-    the dataset is missing or just inaccessible.
+    other customer's dataset. To finish the job, **codex review-1 P1**:
+    the ``get_dataset`` call itself can surface Dify's own 404 as
+    ``UpstreamClientError`` (code ``upstream_invalid_request``). In
+    shared mode, normalize that too so the response is indistinguishable
+    from the foreign-dataset case (both ``dataset_not_found``).
 
     Returns the Dify response so the caller can reuse it (e.g. for the
     happy-path get_dataset response — avoids fetching twice).
     """
-    dify_meta = await dify_client.get_dataset(
-        dataset_api_key=customer.dify.dataset_api_key,
-        dataset_id=dataset_id,
-    )
+    try:
+        dify_meta = await dify_client.get_dataset(
+            dataset_api_key=customer.dify.dataset_api_key,
+            dataset_id=dataset_id,
+        )
+    except UpstreamClientError as exc:
+        # In shared mode, a missing UUID and a foreign UUID must look the
+        # same to the caller — distinguishable error codes would let an
+        # attacker probe for which UUIDs exist in other tenants. Dedicated
+        # mode preserves the original upstream code (still informative for
+        # the only customer who can see it).
+        if strategy.is_shared and exc.status_code == 404:
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found",
+                param="dataset_id",
+            ) from exc
+        raise
+
     if strategy.is_shared:
         dify_name = dify_meta.get("name", "")
         if not strategy.dataset_belongs_to(customer.customer_id, dify_name):
@@ -242,17 +269,18 @@ async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
 async def list_datasets(request: Request) -> Any:
     """List datasets visible to the customer.
 
-    Forwards ``page`` / ``limit`` / ``keyword`` query params to Dify.
+    Forwards ``page`` / ``limit`` / ``keyword`` query params.
     Defaults: page=1, limit=20 (matches Dify's defaults).
 
-    Shared-mode (PR #4 R3): the gateway filters Dify's response to only
-    include datasets owned by this customer (name starts with the
-    ``{customer_id}__`` prefix). The reported ``total`` reflects the
-    filtered count, not Dify's workspace total — this means pagination is
-    approximate in shared mode (a request for page=2 may return fewer
-    items than ``limit`` because other customers' datasets were filtered
-    out). True paginated isolation would require fetching all pages and
-    paging client-side; PR #4 trades that for simplicity.
+    Shared-mode (PR #4 R3 + review-1 P2): naive per-page filtering would
+    leak workspace state to the caller (datasets on Dify page 5 would be
+    invisible when the customer asks for page 1, and ``has_more=true``
+    from Dify would reveal other tenants have data). Instead, the gateway
+    walks Dify's pagination, accumulates only this customer's datasets,
+    and **paginates client-side** so ``page``, ``limit``, ``total``, and
+    ``has_more`` describe the filtered view only. The cost is O(workspace
+    size) per list call — acceptable for shared mode's intended use
+    (demo / PoC / small-N teams), not for thousands-of-customer prod.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
@@ -262,33 +290,81 @@ async def list_datasets(request: Request) -> Any:
     limit = _int_query(request, "limit", default=20, minimum=1, maximum=100)
     keyword = request.query_params.get("keyword") or None
 
+    if strategy.is_shared:
+        owned = await _collect_owned_datasets(
+            dify_client, customer, strategy, keyword
+        )
+        total = len(owned)
+        start = (page - 1) * limit
+        end = start + limit
+        page_items = owned[start:end]
+        envelope = DatasetList(
+            data=[Dataset(**_to_dataset(d, customer, strategy)) for d in page_items],
+            has_more=end < total,
+            total=total,
+            page=page,
+            limit=limit,
+        )
+        return JSONResponse(content=envelope.model_dump(exclude_none=True))
+
+    # Dedicated mode: workspace is the customer's — forward pagination directly.
     dify_resp = await dify_client.list_datasets(
         dataset_api_key=customer.dify.dataset_api_key,
         page=page,
         limit=limit,
         keyword=keyword,
     )
-
     raw_data = dify_resp.get("data") or []
-    if strategy.is_shared:
-        # Filter to this customer's datasets only (soft isolation).
-        raw_data = [
-            d
-            for d in raw_data
-            if strategy.dataset_belongs_to(customer.customer_id, d.get("name", ""))
-        ]
-
     entries = [_to_dataset(d, customer, strategy) for d in raw_data]
     envelope = DatasetList(
         data=[Dataset(**e) for e in entries],
         has_more=bool(dify_resp.get("has_more", False)),
-        # In shared mode the filtered count is more useful than Dify's
-        # workspace-wide count (which would leak other customers' counts).
-        total=len(entries) if strategy.is_shared else int(dify_resp.get("total", 0)),
+        total=int(dify_resp.get("total", 0)),
         page=int(dify_resp.get("page", page)),
         limit=int(dify_resp.get("limit", limit)),
     )
     return JSONResponse(content=envelope.model_dump(exclude_none=True))
+
+
+_DIFY_LIST_PAGE_SIZE = 100  # Dify's documented max per-page
+_DIFY_LIST_MAX_PAGES = 100  # safety cap (10k datasets workspace-wide)
+
+
+async def _collect_owned_datasets(
+    dify_client: DifyClient,
+    customer: CustomerEntry,
+    strategy: IsolationStrategy,
+    keyword: str | None,
+) -> list[dict[str, Any]]:
+    """Walk Dify pagination and return only the datasets this customer owns.
+
+    Used by ``list_datasets`` in shared mode (codex review-1 P2). Loops
+    until Dify reports ``has_more=False`` or the per-call safety cap is
+    hit. Keyword is forwarded so any server-side filtering applies before
+    we drag pages over the network.
+    """
+    owned: list[dict[str, Any]] = []
+    for dify_page in range(1, _DIFY_LIST_MAX_PAGES + 1):
+        resp = await dify_client.list_datasets(
+            dataset_api_key=customer.dify.dataset_api_key,
+            page=dify_page,
+            limit=_DIFY_LIST_PAGE_SIZE,
+            keyword=keyword,
+        )
+        data = resp.get("data") or []
+        for d in data:
+            if strategy.dataset_belongs_to(customer.customer_id, d.get("name", "")):
+                owned.append(d)
+        if not resp.get("has_more"):
+            break
+    else:
+        # Safety cap hit — log so the operator notices a runaway workspace.
+        logger.warning(
+            "datasets.shared_list.cap_hit",
+            customer_id=customer.customer_id,
+            cap=_DIFY_LIST_MAX_PAGES * _DIFY_LIST_PAGE_SIZE,
+        )
+    return owned
 
 
 @router.get("/v1/datasets/{dataset_id}")

@@ -126,18 +126,29 @@ class DifyConnection(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _shared_mode_requires_embedding(self) -> DifyConnection:
-        """Shared mode must declare the workspace's embedding model.
+    def _embedding_matches_mode(self) -> DifyConnection:
+        """Shared mode must declare ``shared_embedding_model``; dedicated must not.
 
-        Without this, the gateway would have no way to honour Dify's
-        workspace-level embedding constraint at dataset-create time.
-        Reject the config up front instead of failing on the first dataset
-        creation.
+        Two failure modes this catches:
+
+        - mode='shared' without the field → gateway has no way to honour
+          Dify's workspace-level embedding constraint at dataset-create
+          time. Reject up front.
+        - mode='dedicated' WITH the field → the field is meaningless in
+          dedicated mode, and an operator setting it suggests they meant
+          to use shared mode. Refuse the ambiguous config so the operator
+          notices the typo (codex review-1 P2: defence in depth against
+          ``resolve_embedding_for_dataset`` picking up a stray field).
         """
         if self.mode == "shared" and self.shared_embedding_model is None:
             raise ValueError(
                 "dify.shared_embedding_model is required when dify.mode='shared' "
                 "(workspace-global embedding model is needed for dataset creation)"
+            )
+        if self.mode == "dedicated" and self.shared_embedding_model is not None:
+            raise ValueError(
+                "dify.shared_embedding_model must not be set when dify.mode='dedicated' "
+                "(the field is only meaningful in shared mode; remove it or change mode)"
             )
         return self
 
@@ -190,7 +201,22 @@ class CustomerEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     sdk_key: str = Field(min_length=1)
-    customer_id: str = Field(min_length=1)
+    # ``customer_id`` is used as a literal prefix for App and Dataset names
+    # in shared mode (PR #4). To keep ``startswith("{customer_id}__")``
+    # unambiguous, the slug must NOT contain a double-underscore — otherwise
+    # customer "acme" would falsely match datasets owned by "acme__beta"
+    # (codex review-1 P1). The pattern also rejects spaces, slashes and
+    # other separators that could trip path or URL parsing later.
+    customer_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+        description=(
+            "Lowercase alphanumeric + hyphen slug. No underscores "
+            "(reserved as a shared-mode prefix separator). Must start "
+            "with a letter or digit."
+        ),
+    )
     dify: DifyConnection
     models: list[ModelEntry] = Field(min_length=1)
     embedding_models: list[EmbeddingModelEntry] = Field(default_factory=list)

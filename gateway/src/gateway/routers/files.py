@@ -30,7 +30,7 @@ from fastapi import File as FastapiFile
 from fastapi.responses import JSONResponse
 
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError, UnknownDatasetError
+from gateway.errors import InvalidRequestError, UnknownDatasetError, UpstreamClientError
 from gateway.mode import isolation_strategy_for
 from gateway.registry import CustomerEntry
 from gateway.schemas import File, FileList
@@ -204,10 +204,21 @@ async def _verify_dataset_ownership_for_files(
     strategy = isolation_strategy_for(customer)
     if not strategy.is_shared:
         return
-    meta = await dify_client.get_dataset(
-        dataset_api_key=customer.dify.dataset_api_key,
-        dataset_id=dataset_id,
-    )
+    try:
+        meta = await dify_client.get_dataset(
+            dataset_api_key=customer.dify.dataset_api_key,
+            dataset_id=dataset_id,
+        )
+    except UpstreamClientError as exc:
+        # Codex review-1 P1: normalize missing-vs-foreign to the same
+        # envelope so callers can't probe other tenants' UUIDs by error
+        # code. See datasets.py `_verify_dataset_ownership` for context.
+        if exc.status_code == 404:
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found",
+                param="dataset_id",
+            ) from exc
+        raise
     dify_name = meta.get("name", "")
     if not strategy.dataset_belongs_to(customer.customer_id, dify_name):
         raise UnknownDatasetError(

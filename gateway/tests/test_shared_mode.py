@@ -579,6 +579,269 @@ async def test_shared_delete_file_cross_customer_returns_404(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Review #1 regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestReviewFix_CustomerIdSlug:
+    """Codex review-1 P1: customer_id must enforce slug pattern.
+
+    Without it, ``acme`` could match datasets owned by ``acme__beta``
+    because both start with ``acme__``. Slug pattern (no underscores)
+    makes the prefix unambiguous.
+    """
+
+    def test_customer_id_with_underscore_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id="acme_beta",  # underscore not allowed
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                ),
+                models=[ModelEntry(id="m", provider="p", name="n")],
+            )
+
+    def test_customer_id_with_double_underscore_rejected(self) -> None:
+        """The exact attack codex flagged: ``acme__beta`` would
+        substring-match ``acme`` as owner."""
+        with pytest.raises(ValueError):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id="acme__beta",
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                ),
+                models=[ModelEntry(id="m", provider="p", name="n")],
+            )
+
+    def test_customer_id_uppercase_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id="Acme",
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                ),
+                models=[ModelEntry(id="m", provider="p", name="n")],
+            )
+
+    def test_customer_id_hyphen_lowercase_accepted(self) -> None:
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="tenant-a-1",
+            dify=DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == "tenant-a-1"
+
+
+class TestReviewFix_DatasetNotFoundNormalization:
+    """Codex review-1 P1: missing UUID and foreign UUID must produce the
+    same error envelope so a caller can't distinguish them by code."""
+
+    @pytest.mark.asyncio
+    async def test_shared_get_missing_uuid_returns_dataset_not_found(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Dify returns 404 → gateway must rewrite to ``dataset_not_found``
+        (same code as the foreign-UUID case)."""
+        from gateway.errors import UpstreamClientError
+
+        fake_dify.dataset_error = UpstreamClientError(
+            "Dify rejected request (HTTP 404): dataset not found",
+            upstream_status=404,
+        )
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets/totally-fake-uuid",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+        assert r.status_code == 404
+        body = r.json()
+        # Critical: same code as foreign-UUID case (test_shared_get_cross_customer_returns_404)
+        assert body["error"]["code"] == "dataset_not_found"
+
+    @pytest.mark.asyncio
+    async def test_shared_file_upload_missing_dataset_returns_dataset_not_found(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Same normalization in the files ownership helper."""
+        from gateway.errors import UpstreamClientError
+
+        fake_dify.dataset_error = UpstreamClientError(
+            "Dify rejected request (HTTP 404): dataset not found",
+            upstream_status=404,
+        )
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+                data={"dataset_id": "missing-uuid"},
+            )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "dataset_not_found"
+        assert fake_dify.calls["doc_upload"] == []
+
+    @pytest.mark.asyncio
+    async def test_dedicated_get_missing_uuid_keeps_upstream_envelope(
+        self, app: FastAPI, fake_dify: FakeDifyClient
+    ) -> None:
+        """Regression: in dedicated mode, the 404 from Dify must surface
+        as its original ``upstream_invalid_request`` (no normalization).
+        Dedicated customers only see their own datasets anyway, so leaking
+        existence-vs-not is moot."""
+        from gateway.errors import UpstreamClientError
+
+        fake_dify.dataset_error = UpstreamClientError(
+            "Dify rejected request (HTTP 404): dataset not found",
+            upstream_status=404,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets/missing",
+                headers={"Authorization": "Bearer bsa_test_a"},
+            )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "upstream_invalid_request"
+
+
+class TestReviewFix_SharedListPagination:
+    """Codex review-1 P2: shared list must walk all Dify pages and
+    paginate client-side so customers see consistent results regardless
+    of where their datasets fall in Dify's workspace-wide pagination."""
+
+    @pytest.mark.asyncio
+    async def test_shared_list_walks_multiple_dify_pages(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Tenant A's datasets live on Dify's page 2; tenant A asking for
+        gateway page=1, limit=20 should still see them."""
+        page_1 = {
+            "data": [
+                # All page 1 items belong to tenant-b
+                {"id": f"u-b-{i}", "name": f"tenant-b__kb-{i}"}
+                for i in range(100)
+            ],
+            "has_more": True,
+            "total": 150,
+            "limit": 100,
+            "page": 1,
+        }
+        page_2 = {
+            "data": [
+                # Mixed: 30 tenant-a + 20 tenant-b
+                *[{"id": f"u-a-{i}", "name": f"tenant-a__kb-{i}"} for i in range(30)],
+                *[{"id": f"u-b-x-{i}", "name": f"tenant-b__extra-{i}"} for i in range(20)],
+            ],
+            "has_more": False,
+            "total": 150,
+            "limit": 100,
+            "page": 2,
+        }
+        pages = [page_1, page_2]
+
+        async def list_datasets_fake(**kwargs: object) -> dict[str, object]:
+            page = int(kwargs.get("page", 1))  # type: ignore[arg-type]
+            fake_dify.calls["dataset_list"].append(kwargs)
+            return pages[page - 1] if page <= len(pages) else {
+                "data": [], "has_more": False, "total": 0, "limit": 100, "page": page,
+            }
+
+        fake_dify.list_datasets = list_datasets_fake  # type: ignore[assignment]
+
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets?page=1&limit=20",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        assert r.status_code == 200
+        body = r.json()
+        # 30 tenant-a datasets total, page 1 with limit 20 → 20 items, has_more=True
+        assert body["total"] == 30
+        assert len(body["data"]) == 20
+        assert body["has_more"] is True
+        # Names stripped, ids are tenant-a's only
+        assert all(d["id"].startswith("u-a-") for d in body["data"])
+
+    @pytest.mark.asyncio
+    async def test_shared_list_second_page_shows_remaining(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """page=2 with limit=20 should return the remaining 10 datasets."""
+        pages = [
+            {
+                "data": [{"id": f"u-a-{i}", "name": f"tenant-a__kb-{i}"} for i in range(25)],
+                "has_more": False,
+                "total": 25,
+                "limit": 100,
+                "page": 1,
+            }
+        ]
+
+        async def list_datasets_fake(**kwargs: object) -> dict[str, object]:
+            page = int(kwargs.get("page", 1))  # type: ignore[arg-type]
+            fake_dify.calls["dataset_list"].append(kwargs)
+            return pages[page - 1] if page <= len(pages) else {
+                "data": [], "has_more": False, "total": 0, "limit": 100, "page": page,
+            }
+
+        fake_dify.list_datasets = list_datasets_fake  # type: ignore[assignment]
+
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets?page=2&limit=20",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        body = r.json()
+        assert body["total"] == 25
+        assert len(body["data"]) == 5  # 25 - 20
+        assert body["has_more"] is False
+
+
+class TestReviewFix_DedicatedRejectsSharedEmbedding:
+    """Codex review-1 P2: dedicated mode must NOT accept
+    ``shared_embedding_model`` (it would be ignored at request time, but
+    the operator should know the field is wrong)."""
+
+    def test_dedicated_with_shared_embedding_rejected(self) -> None:
+        with pytest.raises(ValueError, match=r"must not be set when dify.mode='dedicated'"):
+            DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+                shared_embedding_model=SharedEmbeddingModel(name="bge-m3", provider="x"),
+            )
+
+
 @pytest.mark.asyncio
 async def test_dedicated_mode_no_prefix_no_filter(
     app: FastAPI, fake_dify: FakeDifyClient
