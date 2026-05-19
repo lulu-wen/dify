@@ -67,9 +67,18 @@ def resolve_embedding_for_dataset(
         3. No registered embedding models at all — 400 with a clear
            remediation message.
 
+    The selected entry **must** have ``provider`` set (codex review-2 P2):
+    Dify only honours the explicit ``embedding_model`` when both ``model``
+    and ``provider`` are supplied; otherwise it silently falls back to the
+    workspace default. Letting that happen would create a dataset indexed
+    with the wrong embedding model — a debugging nightmare since retrieval
+    just returns no hits. Reject up front instead.
+
     Raises:
         UnknownModelError: client asked for an id the customer cannot use.
-        InvalidRequestError: customer has no embedding models configured.
+        InvalidRequestError: customer has no embedding models configured,
+            OR the selected entry has no ``provider`` (cannot be safely
+            bound to a Dify dataset).
     """
     if requested_id is not None:
         entry = customer.find_embedding_model(requested_id)
@@ -78,18 +87,30 @@ def resolve_embedding_for_dataset(
                 f"embedding model '{requested_id}' is not enabled for this customer",
                 param="embedding_model",
             )
-        return entry
+    else:
+        if not customer.embedding_models:
+            raise InvalidRequestError(
+                (
+                    "no embedding model configured for this customer; "
+                    "pass `embedding_model` explicitly or register a default in "
+                    "the customer's `embedding_models` registry section"
+                ),
+                param="embedding_model",
+            )
+        entry = customer.embedding_models[0]
 
-    if not customer.embedding_models:
+    if entry.provider is None:
         raise InvalidRequestError(
             (
-                "no embedding model configured for this customer; "
-                "pass `embedding_model` explicitly or register a default in "
-                "the customer's `embedding_models` registry section"
+                f"embedding model '{entry.id}' is missing the `provider` field; "
+                "datasets need both `embedding_model` and `embedding_model_provider` "
+                "to bind reliably (Dify silently falls back to the workspace default "
+                "otherwise). Set `provider` on the registry entry "
+                "(e.g. \"langgenius/openai_api_compatible/openai_api_compatible\")"
             ),
             param="embedding_model",
         )
-    return customer.embedding_models[0]
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +131,14 @@ async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
 
     embedding = resolve_embedding_for_dataset(customer, body.embedding_model)
 
+    # ``resolve_embedding_for_dataset`` guarantees ``provider`` is non-None.
     payload: dict[str, Any] = {
         "name": body.name,
         "description": body.description,
         "indexing_technique": body.indexing_technique,
         "embedding_model": embedding.name,
+        "embedding_model_provider": embedding.provider,
     }
-    if embedding.provider is not None:
-        payload["embedding_model_provider"] = embedding.provider
 
     dify_resp = await dify_client.create_dataset(
         dataset_api_key=customer.dify.dataset_api_key,
@@ -329,8 +350,8 @@ def _int_query(
         return default
     try:
         value = int(raw)
-    except ValueError:
-        raise InvalidRequestError(f"{name} must be an integer", param=name)
+    except ValueError as exc:
+        raise InvalidRequestError(f"{name} must be an integer", param=name) from exc
     if value < minimum:
         raise InvalidRequestError(f"{name} must be >= {minimum}", param=name)
     if maximum is not None and value > maximum:

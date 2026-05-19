@@ -17,15 +17,13 @@ populated ``embedding_models`` config build a one-off registry.
 
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from gateway.config import Settings
 from gateway.dify.client import DifyClient
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 from gateway.main import create_app
 from gateway.registry import (
     CustomerEntry,
@@ -44,9 +42,10 @@ def _customer(
 ) -> CustomerEntry:
     """Build a one-off customer with a tunable embedding_models list.
 
-    Default mirrors the shared fixture's ``emb1`` but tests can pass
-    ``embedding_models=[]`` to exercise the no-default branch or pass an
-    entry with ``provider`` set to verify the Dify payload includes it.
+    Default mirrors the shared fixture's ``emb1`` (with ``provider`` set,
+    which is required for dataset creation per review-2 P2). Tests pass
+    custom ``embedding_models`` to exercise edge cases (empty list,
+    missing provider, multiple entries).
     """
     if embedding_models is None:
         embedding_models = [
@@ -57,6 +56,7 @@ def _customer(
                 endpoint_url="http://embed.test/v1",
                 api_key="EMPTY",
                 dimensions=1024,
+                provider="langgenius/openai_api_compatible/openai_api_compatible",
             )
         ]
     return CustomerEntry(
@@ -82,7 +82,7 @@ def _app_with_customer(customer: CustomerEntry, fake: FakeDifyClient) -> FastAPI
         return fake  # type: ignore[return-value]
 
     application.state.dify_client_factory = factory
-    application.state.app_manager._client_factory = factory  # noqa: SLF001
+    application.state.app_manager._client_factory = factory
     return application
 
 
@@ -128,8 +128,12 @@ async def test_create_dataset_with_explicit_embedding_model(
     assert payload["indexing_technique"] == "high_quality"
     # Resolved embedding ``name`` (upstream-served name), not the customer-facing id.
     assert payload["embedding_model"] == "upstream-emb1"
-    # No provider on default fixture — must be omitted from Dify payload.
-    assert "embedding_model_provider" not in payload
+    # Provider is now required (review-2 P2) — Dify needs BOTH model+provider
+    # to bind reliably; otherwise it silently falls back to workspace default.
+    assert (
+        payload["embedding_model_provider"]
+        == "langgenius/openai_api_compatible/openai_api_compatible"
+    )
 
 
 @pytest.mark.asyncio
@@ -292,6 +296,7 @@ async def test_create_dataset_fallback_to_default_embedding(
                 name="upstream-bge",
                 owner="BAAI",
                 endpoint_url="http://embed.test/v1",
+                provider="langgenius/openai_api_compatible/openai_api_compatible",
             )
         ]
     )
@@ -330,6 +335,48 @@ async def test_create_dataset_unknown_embedding_returns_404(
     assert body["error"]["code"] == "model_not_found"
     assert body["error"]["param"] == "embedding_model"
     # Gateway must NOT have reached Dify at all if the resolution failed first.
+    assert fake_dify.calls["dataset_create"] == []
+
+
+@pytest.mark.asyncio
+async def test_create_dataset_provider_missing_returns_400(
+    fake_dify: FakeDifyClient,
+) -> None:
+    """Codex review-2 P2: when a registered embedding entry omits the
+    ``provider`` field, the gateway MUST refuse to create a dataset bound
+    to it. Without ``embedding_model_provider`` in the Dify payload, Dify
+    silently falls back to the workspace-default embedding model — the
+    dataset gets indexed with the WRONG model and retrieval just returns
+    nothing useful. Hard-fail at create time with a clear remediation."""
+    customer = _customer(
+        embedding_models=[
+            EmbeddingModelEntry(
+                id="emb-noprovider",
+                name="upstream-x",
+                owner="X",
+                endpoint_url="http://embed.test/v1",
+                # provider intentionally omitted
+            )
+        ]
+    )
+    app = _app_with_customer(customer, fake_dify)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"name": "x", "embedding_model": "emb-noprovider"},
+        )
+
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["param"] == "embedding_model"
+    # Message must name the failing entry id AND tell ops how to fix it.
+    assert "emb-noprovider" in body["error"]["message"]
+    assert "provider" in body["error"]["message"]
+    # Critical: no Dify call must have been made.
     assert fake_dify.calls["dataset_create"] == []
 
 
@@ -432,6 +479,51 @@ async def test_dify_5xx_during_create_returns_502(
         )
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "dify_upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_dify_409_duplicate_name_passes_through(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Codex review-1 P2: when Dify rejects a dataset create with 409
+    (duplicate name), the SDK caller must see 409 — not a misleading 502.
+    The previous behaviour made every duplicate-name retry look like a
+    gateway outage. Now the upstream message surfaces in
+    ``error.message`` so the caller can show «name already taken» UI."""
+    fake_dify.dataset_error = UpstreamClientError(
+        "Dify rejected request (HTTP 409): name already in use",
+        upstream_status=409,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"name": "duplicate-kb", "embedding_model": "emb1"},
+        )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "name already in use" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_dify_404_on_get_passes_through(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Wrong dataset UUID → Dify 404 → client sees 404, not 502."""
+    fake_dify.dataset_error = UpstreamClientError(
+        "Dify rejected request (HTTP 404): dataset not found",
+        upstream_status=404,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.get(
+            "/v1/datasets/nonexistent-uuid",
+            headers={"Authorization": "Bearer bsa_test_a"},
+        )
+    assert r.status_code == 404
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 @pytest.mark.asyncio

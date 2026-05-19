@@ -83,6 +83,15 @@ async def dify_to_openai_chunks(
     finish_reason: str = "stop"
     conversation_id: str | None = None
 
+    # Codex review-1 P2: Dify's ``agent_thought`` payload carries the
+    # **cumulative** ``thought`` text — re-emitted in full when the agent
+    # appends new reasoning. OpenAI clients concatenate ``delta.reasoning_content``,
+    # so forwarding the whole thought each time would produce ``"foofoobar"``
+    # for two events with thoughts ``"foo"`` then ``"foobar"``. Track the last
+    # seen thought per id (Dify gives a stable ``id`` per MessageAgentThought)
+    # and emit only the new suffix.
+    last_thought_by_id: dict[str, str] = {}
+
     async for raw in dify_lines:
         event = parse_dify_sse_line(raw)
         if event is None:
@@ -116,7 +125,31 @@ async def dify_to_openai_chunks(
             thought = event.get("thought") or ""
             if not thought:
                 continue
-            delta = DeltaMessage(reasoning_content=thought)
+            # Dify re-sends the cumulative thought on every update; emit only
+            # the new suffix relative to the last value we saw for this id.
+            # Missing id (older Dify, malformed event) → treat as standalone
+            # and skip dedup so we don't drop content.
+            thought_id = event.get("id")
+            if isinstance(thought_id, str) and thought_id:
+                prev = last_thought_by_id.get(thought_id, "")
+                if thought == prev:
+                    # No new content; ignore the redundant event.
+                    continue
+                if thought.startswith(prev):
+                    delta_text = thought[len(prev):]
+                else:
+                    # Upstream rewrote the thought (rare; e.g. tool result
+                    # replaced earlier draft). Fall back to emitting the full
+                    # new value — duplication beats silent loss.
+                    delta_text = thought
+                last_thought_by_id[thought_id] = thought
+            else:
+                delta_text = thought
+
+            if not delta_text:
+                continue
+
+            delta = DeltaMessage(reasoning_content=delta_text)
             if not started:
                 # First chunk announces the role even when it's a reasoning
                 # chunk — clients building UIs need ``role`` to bind the message.

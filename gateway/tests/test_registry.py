@@ -211,7 +211,13 @@ class TestEmbeddingModelEntry:
         with pytest.raises(ValueError):
             EmbeddingModelEntry(id="x", name="n", endpoint_url="http://x", dimensions=0)
 
-    def test_extra_fields_forbidden(self) -> None:
+    def test_customer_entry_extra_fields_forbidden(self) -> None:
+        """CustomerEntry (not EmbeddingModelEntry) ``extra="forbid"`` check.
+
+        Renamed from ``test_extra_fields_forbidden`` to avoid shadowing the
+        EmbeddingModelEntry version above — pytest only ran the second one
+        before this rename (codex review-2 caught it via ruff F811).
+        """
         with pytest.raises(ValueError):
             CustomerEntry(  # type: ignore[call-arg]
                 sdk_key="bsa_x",

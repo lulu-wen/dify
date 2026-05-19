@@ -25,7 +25,6 @@ from fastapi import FastAPI
 from gateway.errors import DifyTimeoutError, DifyUpstreamError
 from tests.conftest import FakeDifyClient
 
-
 # ---------------------------------------------------------------------------
 # Upload (POST /v1/files multipart)
 # ---------------------------------------------------------------------------
@@ -68,6 +67,47 @@ async def test_upload_file_happy_path(
     assert sent["content"] == file_bytes  # exact bytes, no corruption
     assert sent["content_type"].startswith("text/plain")
     assert sent["indexing_technique"] == "high_quality"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_unwraps_dify_document_envelope(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Codex review-1 P1: Dify v1.x wraps create-by-file response as
+    ``{"document": {...}, "batch": "..."}``. Earlier code passed the
+    outer envelope to ``_to_file`` so clients got ``id=""`` / ``name=""``
+    and couldn't poll or delete the file they just uploaded.
+
+    The fix unwraps the document payload first; this test pins both shapes
+    (wrapped + unwrapped) so a future regression breaks loudly.
+    """
+    # Simulate the real Dify response shape (wrapped + batch sibling).
+    fake_dify.file_upload_response = {
+        "document": {
+            "id": "doc-real-uuid",
+            "name": "manual.pdf",
+            "indexing_status": "waiting",
+            "word_count": 0,
+            "created_at": 1700000000,
+        },
+        "batch": "batch-id-1",
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/files",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            files={"file": ("manual.pdf", io.BytesIO(b"%PDF-1.4 hi"), "application/pdf")},
+            data={"dataset_id": "ds-uuid-1"},
+        )
+
+    assert r.status_code == 200
+    body = r.json()
+    # The critical assertions: client gets the actual document id + name,
+    # NOT empty strings from the outer envelope.
+    assert body["id"] == "doc-real-uuid"
+    assert body["name"] == "manual.pdf"
+    assert body["object"] == "file"
 
 
 @pytest.mark.asyncio

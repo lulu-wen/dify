@@ -10,7 +10,7 @@ import pytest
 import respx
 
 from gateway.dify.client import ConsoleSession, DifyClient
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 
 
 @pytest.fixture
@@ -69,6 +69,159 @@ async def test_chat_messages_blocking_raises_on_timeout(client: DifyClient) -> N
     with respx.mock(base_url="http://dify.test") as m:
         m.post("/v1/chat-messages").mock(side_effect=httpx.TimeoutException("read timeout"))
         with pytest.raises(DifyTimeoutError):
+            await client.chat_messages_blocking(app_key="app-x", query="q", user="u")
+
+
+# ---------------------------------------------------------------------------
+# Dataset / document Service API — 4xx passthrough (codex review-1 P2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 413, 415, 422])
+async def test_dataset_create_4xx_raises_upstream_client_error(
+    client: DifyClient, status: int
+) -> None:
+    """Dify 4xx on dataset operations must surface as ``UpstreamClientError``
+    so the SDK caller sees the original 4xx (their request was bad), not a
+    misleading 502 (gateway is broken).
+
+    Codex review-1 P2 introduced the passthrough; codex review-3 P2
+    widened it to cover **403** (Dify uses this for per-dataset-disabled
+    and per-tenant-quota refusals) and **415** (UnsupportedFileTypeError
+    on create-by-file). Both are client-actionable.
+    """
+    with respx.mock(base_url="http://dify.test") as m:
+        m.post("/v1/datasets").mock(
+            return_value=httpx.Response(status, json={"message": f"dify said {status}"})
+        )
+        with pytest.raises(UpstreamClientError) as exc_info:
+            await client.create_dataset(
+                dataset_api_key="ds-key",
+                payload={"name": "kb"},
+            )
+    # ``status_code`` is overridden at instance level to preserve the
+    # upstream status; verify it survived.
+    assert exc_info.value.status_code == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 429])
+async def test_dataset_create_non_shape_4xx_still_502(
+    client: DifyClient, status: int
+) -> None:
+    """401 (bad dataset_api_key in registry) and 429 (upstream rate-limited
+    the gateway) describe gateway-side problems the SDK caller can't fix.
+    They must NOT mislead the caller into thinking their own request was
+    wrong — keep them as ``DifyUpstreamError`` so the envelope is 502.
+
+    This is the same philosophy as PR #2 review-3 for the embeddings
+    client, with one carve-out: codex review-3 noted that 403 in Dify's
+    dataset Service API means «this dataset is disabled / quota refused»
+    which IS client-actionable, so 403 moved into the client-error set.
+    """
+    with respx.mock(base_url="http://dify.test") as m:
+        m.post("/v1/datasets").mock(
+            return_value=httpx.Response(status, json={"message": "auth fail"})
+        )
+        with pytest.raises(DifyUpstreamError):
+            await client.create_dataset(
+                dataset_api_key="ds-key",
+                payload={"name": "kb"},
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_document_by_file_415_raises_upstream_client_error(
+    client: DifyClient,
+) -> None:
+    """Codex review-3 P2: Dify raises ``UnsupportedFileTypeError`` (HTTP
+    415) when the uploaded file's extension/MIME isn't in the allow-list.
+    That's a client mistake (they uploaded .exe or a non-text format the
+    embedding pipeline can't process); pass the 415 through so the SDK
+    can show the user a 'try a different file' message."""
+    with respx.mock(base_url="http://dify.test") as m:
+        m.post("/v1/datasets/ds-uuid/document/create-by-file").mock(
+            return_value=httpx.Response(415, text="unsupported file type")
+        )
+        with pytest.raises(UpstreamClientError) as exc_info:
+            await client.create_document_by_file(
+                dataset_api_key="ds-key",
+                dataset_id="ds-uuid",
+                filename="malware.exe",
+                content=b"MZ\x90\x00",
+                content_type="application/x-msdownload",
+            )
+    assert exc_info.value.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_dataset_403_disabled_raises_upstream_client_error(
+    client: DifyClient,
+) -> None:
+    """Codex review-3 P2: Dify returns 403 for archived/disabled datasets
+    and per-tenant quota refusals on dataset ops. Caller can act on this
+    (use a different dataset, request a quota bump), so it must surface
+    as 403 ``upstream_invalid_request``, not 502."""
+    with respx.mock(base_url="http://dify.test") as m:
+        m.delete("/v1/datasets/ds-uuid/documents/doc-uuid").mock(
+            return_value=httpx.Response(403, json={"message": "dataset disabled"})
+        )
+        with pytest.raises(UpstreamClientError) as exc_info:
+            await client.delete_document(
+                dataset_api_key="ds-key",
+                dataset_id="ds-uuid",
+                document_id="doc-uuid",
+            )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_dataset_get_404_raises_upstream_client_error(
+    client: DifyClient,
+) -> None:
+    """A client passing a wrong dataset UUID gets a 404 from Dify that
+    surfaces to the SDK caller as 404 ``upstream_invalid_request``, not 502."""
+    with respx.mock(base_url="http://dify.test") as m:
+        m.get("/v1/datasets/abc-uuid").mock(
+            return_value=httpx.Response(404, json={"message": "dataset not found"})
+        )
+        with pytest.raises(UpstreamClientError) as exc_info:
+            await client.get_dataset(dataset_api_key="ds-key", dataset_id="abc-uuid")
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_document_by_file_413_raises_upstream_client_error(
+    client: DifyClient,
+) -> None:
+    """413 (payload too large) is a client mistake — they uploaded a file
+    bigger than Dify's per-customer limit. Must surface as 413 so the
+    client knows to chunk."""
+    with respx.mock(base_url="http://dify.test") as m:
+        m.post("/v1/datasets/ds-uuid/document/create-by-file").mock(
+            return_value=httpx.Response(413, text="file too large")
+        )
+        with pytest.raises(UpstreamClientError) as exc_info:
+            await client.create_document_by_file(
+                dataset_api_key="ds-key",
+                dataset_id="ds-uuid",
+                filename="big.pdf",
+                content=b"x" * 100,
+                content_type="application/pdf",
+            )
+    assert exc_info.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_chat_blocking_4xx_still_502_unchanged(client: DifyClient) -> None:
+    """Sanity: the dataset 4xx fix must NOT bleed into the chat path. Chat
+    has different semantics — a 4xx from Dify chat-messages typically means
+    the app_key is wrong (gateway misconfig), not a client mistake. Keep
+    it as DifyUpstreamError (502)."""
+    with respx.mock(base_url="http://dify.test") as m:
+        m.post("/v1/chat-messages").mock(return_value=httpx.Response(404, text="app not found"))
+        with pytest.raises(DifyUpstreamError):
             await client.chat_messages_blocking(app_key="app-x", query="q", user="u")
 
 

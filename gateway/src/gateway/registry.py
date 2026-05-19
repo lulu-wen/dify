@@ -144,7 +144,7 @@ class CustomerEntry(BaseModel):
         return models
 
     @model_validator(mode="after")
-    def _no_id_collisions_across_lists(self) -> "CustomerEntry":
+    def _no_id_collisions_across_lists(self) -> CustomerEntry:
         """Reject the same ``id`` appearing in both ``models`` and ``embedding_models``.
 
         ``/v1/models`` flattens both lists into a single OpenAI-shaped list,
@@ -193,7 +193,7 @@ class CustomerRegistry:
         self._by_sdk_key = by_sdk_key
 
     @classmethod
-    def from_entries(cls, entries: list[CustomerEntry]) -> "CustomerRegistry":
+    def from_entries(cls, entries: list[CustomerEntry]) -> CustomerRegistry:
         """Build a registry from a list of entries (raises on duplicate SDK keys)."""
         by_key: dict[str, CustomerEntry] = {}
         for entry in entries:
@@ -203,7 +203,7 @@ class CustomerRegistry:
         return cls(by_key)
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "CustomerRegistry":
+    def from_yaml(cls, path: str | Path) -> CustomerRegistry:
         """Load and validate a registry YAML file.
 
         Raises:
