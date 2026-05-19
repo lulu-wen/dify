@@ -45,12 +45,25 @@ import structlog
 from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 
 # Dify Service API 4xx statuses that describe a *client* mistake on the
-# dataset / document path (wrong UUID, duplicate name, oversized file, bad
-# schema). These should pass through to the SDK caller as 4xx envelopes,
-# not 502s. 401/403/429 stay as upstream errors (those are gateway-side
-# credential/rate-limit issues, not the caller's fault) — same philosophy
-# as the embeddings client (PR #2 review-3).
-_DATASET_CLIENT_STATUSES: frozenset[int] = frozenset({400, 404, 409, 413, 422})
+# dataset / document path. Surface these as ``UpstreamClientError`` so the
+# SDK caller sees the original 4xx — not a misleading 502 about gateway
+# health. 401 / 429 still go through ``DifyUpstreamError`` because those
+# describe gateway-side problems (wrong dataset_api_key in registry,
+# gateway hitting the upstream rate limit) the SDK caller can't fix.
+#
+# What each status means in the dataset / document context:
+#   400 — invalid request shape (missing field, bad type)
+#   403 — per-dataset disabled / per-tenant quota refused this operation
+#         (codex review-3 P2 — Dify uses 403 for archived datasets and
+#         disabled-API checks, both of which the caller can act on)
+#   404 — dataset UUID / document id doesn't exist (wrong id)
+#   409 — duplicate dataset name (name conflict)
+#   413 — file payload too large (per-tenant or system limit)
+#   415 — unsupported file type during create-by-file (codex review-3 P2)
+#   422 — schema validation failed
+_DATASET_CLIENT_STATUSES: frozenset[int] = frozenset(
+    {400, 403, 404, 409, 413, 415, 422}
+)
 
 logger = structlog.get_logger(__name__)
 
