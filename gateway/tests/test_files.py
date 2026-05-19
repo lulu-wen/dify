@@ -25,7 +25,6 @@ from fastapi import FastAPI
 from gateway.errors import DifyTimeoutError, DifyUpstreamError
 from tests.conftest import FakeDifyClient
 
-
 # ---------------------------------------------------------------------------
 # Upload (POST /v1/files multipart)
 # ---------------------------------------------------------------------------

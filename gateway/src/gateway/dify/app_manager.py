@@ -31,8 +31,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 import structlog
 
@@ -161,7 +161,7 @@ class AppManager:
             self._gc_task.cancel()
             try:
                 await self._gc_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._gc_task = None
 
@@ -282,7 +282,7 @@ class AppManager:
                 return
             try:
                 await self._gc_sweep()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("app_manager.gc_failed")
 
     async def _gc_sweep(self) -> None:
@@ -316,7 +316,7 @@ class AppManager:
 
                     await self._with_session(customer, client, delete)
                     deleted = True
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # GC must never crash the loop. Log and proceed to evict
                     # the cache entry anyway so the next request re-builds.
                     logger.warning(

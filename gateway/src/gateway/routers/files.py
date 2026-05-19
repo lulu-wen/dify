@@ -22,10 +22,11 @@ Multipart-upload memory note:
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import structlog
-from fastapi import APIRouter, File as FastapiFile, Form, Request, UploadFile
+from fastapi import APIRouter, Form, Request, UploadFile
+from fastapi import File as FastapiFile
 from fastapi.responses import JSONResponse
 
 from gateway.dify.client import DifyClient
@@ -41,12 +42,21 @@ router = APIRouter()
 @router.post("/v1/files")
 async def upload_file(
     request: Request,
-    file: UploadFile = FastapiFile(..., description="Document binary to ingest into the dataset"),
-    dataset_id: str = Form(..., description="Dify dataset UUID to ingest the document into"),
-    indexing_technique: Literal["high_quality", "economy"] = Form(
-        default="high_quality",
-        description="Override the dataset's default indexing technique for this document.",
-    ),
+    # PEP 593 ``Annotated[...]`` pattern: FastAPI dependency factory calls
+    # (``File(...)``, ``Form(...)``) live in metadata, not in the default,
+    # so ruff B008 (function-call-in-default-argument) is silenced.
+    file: Annotated[
+        UploadFile,
+        FastapiFile(..., description="Document binary to ingest into the dataset"),
+    ],
+    dataset_id: Annotated[
+        str,
+        Form(..., description="Dify dataset UUID to ingest the document into"),
+    ],
+    indexing_technique: Annotated[
+        Literal["high_quality", "economy"],
+        Form(description="Override the dataset's default indexing technique for this document."),
+    ] = "high_quality",
 ) -> Any:
     """Upload a document into a knowledge-base dataset.
 
@@ -212,8 +222,8 @@ def _int_query(
         return default
     try:
         value = int(raw)
-    except ValueError:
-        raise InvalidRequestError(f"{name} must be an integer", param=name)
+    except ValueError as exc:
+        raise InvalidRequestError(f"{name} must be an integer", param=name) from exc
     if value < minimum:
         raise InvalidRequestError(f"{name} must be >= {minimum}", param=name)
     if maximum is not None and value > maximum:

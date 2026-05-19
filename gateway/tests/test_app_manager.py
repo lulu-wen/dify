@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -202,7 +200,7 @@ async def test_gc_evicts_idle_entries(
 
     # Advance past TTL and run a sweep.
     now[0] += 120.0
-    await manager._gc_sweep()  # noqa: SLF001 (test-only)
+    await manager._gc_sweep()
 
     assert len(manager.cached_apps()) == 0
     assert len(fake_client.delete_calls) == 1
@@ -226,7 +224,7 @@ async def test_gc_keeps_recently_used_entries(
 
     await manager.get_app_key(customer, "m1")
     now[0] += 30.0  # within TTL
-    await manager._gc_sweep()  # noqa: SLF001
+    await manager._gc_sweep()
 
     assert len(manager.cached_apps()) == 1
     assert fake_client.delete_calls == []
@@ -255,5 +253,5 @@ async def test_gc_swallows_delete_errors(
     await manager.get_app_key(customer, "m1")
     now[0] += 120.0
     # Should NOT raise.
-    await manager._gc_sweep()  # noqa: SLF001
+    await manager._gc_sweep()
     assert len(manager.cached_apps()) == 0

@@ -109,7 +109,7 @@ class DifyClient:
     def base_url(self) -> str:
         return self._base_url
 
-    async def __aenter__(self) -> "DifyClient":
+    async def __aenter__(self) -> DifyClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -221,7 +221,7 @@ class DifyClient:
         if not resp.is_success:
             try:
                 await resp.aread()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass  # body unreadable; fall through to status-only error
             try:
                 _raise_for_dify_status(resp)
@@ -666,7 +666,7 @@ def _raise_for_dify_status(
     body_preview: str = ""
     try:
         body_preview = resp.text[:_ERR_BODY_TRUNCATE]
-    except Exception:  # noqa: BLE001
+    except Exception:
         # ``resp.text`` may raise on streaming responses; fall through.
         body_preview = "<body unreadable>"
 

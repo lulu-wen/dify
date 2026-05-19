@@ -16,7 +16,6 @@ Conversation handling:
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any
 
 import structlog
@@ -182,7 +181,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                 # the response has already started streaming.
                 try:
                     await stream_cm.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("chat.stream_close_failed")
 
         return StreamingResponse(
