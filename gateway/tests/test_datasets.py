@@ -25,7 +25,7 @@ from fastapi import FastAPI
 
 from gateway.config import Settings
 from gateway.dify.client import DifyClient
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 from gateway.main import create_app
 from gateway.registry import (
     CustomerEntry,
@@ -432,6 +432,51 @@ async def test_dify_5xx_during_create_returns_502(
         )
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "dify_upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_dify_409_duplicate_name_passes_through(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Codex review-1 P2: when Dify rejects a dataset create with 409
+    (duplicate name), the SDK caller must see 409 — not a misleading 502.
+    The previous behaviour made every duplicate-name retry look like a
+    gateway outage. Now the upstream message surfaces in
+    ``error.message`` so the caller can show «name already taken» UI."""
+    fake_dify.dataset_error = UpstreamClientError(
+        "Dify rejected request (HTTP 409): name already in use",
+        upstream_status=409,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"name": "duplicate-kb", "embedding_model": "emb1"},
+        )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "name already in use" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_dify_404_on_get_passes_through(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Wrong dataset UUID → Dify 404 → client sees 404, not 502."""
+    fake_dify.dataset_error = UpstreamClientError(
+        "Dify rejected request (HTTP 404): dataset not found",
+        upstream_status=404,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.get(
+            "/v1/datasets/nonexistent-uuid",
+            headers={"Authorization": "Bearer bsa_test_a"},
+        )
+    assert r.status_code == 404
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 @pytest.mark.asyncio

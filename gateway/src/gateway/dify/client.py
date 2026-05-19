@@ -42,7 +42,15 @@ from typing import Any
 import httpx
 import structlog
 
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
+
+# Dify Service API 4xx statuses that describe a *client* mistake on the
+# dataset / document path (wrong UUID, duplicate name, oversized file, bad
+# schema). These should pass through to the SDK caller as 4xx envelopes,
+# not 502s. 401/403/429 stay as upstream errors (those are gateway-side
+# credential/rate-limit issues, not the caller's fault) — same philosophy
+# as the embeddings client (PR #2 review-3).
+_DATASET_CLIENT_STATUSES: frozenset[int] = frozenset({400, 404, 409, 413, 422})
 
 logger = structlog.get_logger(__name__)
 
@@ -272,7 +280,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify create-dataset timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify create-dataset failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     async def list_datasets(
@@ -302,7 +310,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify list-datasets timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify list-datasets failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     async def get_dataset(
@@ -321,7 +329,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify get-dataset timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify get-dataset failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     async def delete_dataset(
@@ -346,7 +354,7 @@ class DifyClient:
             raise DifyUpstreamError(f"Dify delete-dataset failed: {e}") from e
         if resp.status_code == 404:
             return
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
 
     async def create_document_by_file(
         self,
@@ -395,7 +403,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify create-by-file timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify create-by-file failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     async def list_documents(
@@ -421,7 +429,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify list-documents timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify list-documents failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     async def delete_document(
@@ -447,7 +455,7 @@ class DifyClient:
             raise DifyUpstreamError(f"Dify delete-document failed: {e}") from e
         if resp.status_code == 404:
             return
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
 
     async def retrieve_dataset(
         self,
@@ -475,7 +483,7 @@ class DifyClient:
             raise DifyTimeoutError("Dify dataset-retrieve timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify dataset-retrieve failed: {e}") from e
-        _raise_for_dify_status(resp)
+        _raise_for_dify_status(resp, pass_client_errors=True)
         return resp.json()
 
     # ------------------------------------------------------------------ #
@@ -638,8 +646,20 @@ def _read_cookie_with_name(
     return None, base_name
 
 
-def _raise_for_dify_status(resp: httpx.Response) -> None:
-    """Translate non-2xx HTTP responses into gateway domain errors."""
+def _raise_for_dify_status(
+    resp: httpx.Response,
+    *,
+    pass_client_errors: bool = False,
+) -> None:
+    """Translate non-2xx HTTP responses into gateway domain errors.
+
+    ``pass_client_errors=True`` (used by dataset / document methods) preserves
+    expected client-shape 4xx (``_DATASET_CLIENT_STATUSES`` — wrong UUID,
+    duplicate name, oversized file, schema error) as ``UpstreamClientError``,
+    so the SDK caller sees the right 4xx instead of a misleading 502.
+    Other 4xx (401/403/429) and 5xx still surface as ``DifyUpstreamError``;
+    those are gateway-side credential / rate-limit / outage signals.
+    """
     if resp.is_success:
         return
 
@@ -657,6 +677,12 @@ def _raise_for_dify_status(resp: httpx.Response) -> None:
         url=str(resp.request.url),
         body=body_preview,
     )
+
+    if pass_client_errors and resp.status_code in _DATASET_CLIENT_STATUSES:
+        raise UpstreamClientError(
+            f"Dify rejected request (HTTP {resp.status_code}): {body_preview}",
+            upstream_status=resp.status_code,
+        )
 
     raise DifyUpstreamError(
         f"Dify returned HTTP {resp.status_code}: {body_preview}",
