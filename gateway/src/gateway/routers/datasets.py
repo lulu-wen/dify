@@ -33,7 +33,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError, UnknownModelError
+from gateway.errors import (
+    InvalidRequestError,
+    UnknownDatasetError,
+    UnknownModelError,
+)
+from gateway.mode import IsolationStrategy, isolation_strategy_for
 from gateway.registry import CustomerEntry, EmbeddingModelEntry
 from gateway.schemas import (
     Dataset,
@@ -56,49 +61,55 @@ router = APIRouter()
 
 def resolve_embedding_for_dataset(
     customer: CustomerEntry, requested_id: str | None
-) -> EmbeddingModelEntry:
-    """Pick which embedding model the new dataset should bind to.
+) -> tuple[str, str]:
+    """Pick the ``(model_name, model_provider)`` pair the dataset binds to.
 
-    Resolution order:
-        1. Client supplied an explicit ``embedding_model`` id — must exist
-           in the customer's registered ``embedding_models``. Otherwise 404.
-        2. No id supplied — fall back to the customer's first registered
-           embedding model (the "default").
-        3. No registered embedding models at all — 400 with a clear
-           remediation message.
+    Resolution depends on the customer's isolation mode (PR #4 R5):
 
-    The selected entry **must** have ``provider`` set (codex review-2 P2):
-    Dify only honours the explicit ``embedding_model`` when both ``model``
-    and ``provider`` are supplied; otherwise it silently falls back to the
-    workspace default. Letting that happen would create a dataset indexed
-    with the wrong embedding model — a debugging nightmare since retrieval
-    just returns no hits. Reject up front instead.
+    **Shared mode**: the Dify workspace has exactly one embedding plugin
+    active and every customer's dataset must bind to it (workspace-level
+    constraint). The pair comes from ``customer.dify.shared_embedding_model``.
+    If the client passes an explicit ``embedding_model`` that doesn't
+    match the workspace's name, the request is rejected with 400 — better
+    than letting Dify silently fall back to the workspace default.
+
+    **Dedicated mode**: the original PR #3 R5 behaviour. Pick from the
+    customer's registered ``embedding_models``: explicit id wins, otherwise
+    use the first registered entry. The entry must have ``provider`` set
+    (PR #3 review-2 P2).
+
+    Returns:
+        ``(embedding_model_name, embedding_model_provider)`` tuple ready
+        to drop into the Dify dataset-create payload.
 
     Raises:
-        UnknownModelError: client asked for an id the customer cannot use.
-        InvalidRequestError: customer has no embedding models configured,
-            OR the selected entry has no ``provider`` (cannot be safely
-            bound to a Dify dataset).
+        UnknownModelError: client asked for an id the customer cannot use
+            (dedicated mode only).
+        InvalidRequestError: dedicated-mode customer has no embedding
+            models configured / selected entry has no provider, OR
+            shared-mode client passed an embedding_model that doesn't
+            match the workspace's required model.
     """
-    if requested_id is not None:
-        entry = customer.find_embedding_model(requested_id)
-        if entry is None:
-            raise UnknownModelError(
-                f"embedding model '{requested_id}' is not enabled for this customer",
-                param="embedding_model",
-            )
-    else:
-        if not customer.embedding_models:
+    # Shared mode: workspace-global embedding model wins. Per-customer
+    # ``embedding_models`` are still usable for direct /v1/embeddings calls,
+    # but they cannot bind a dataset — Dify only has one embedding plugin
+    # active per workspace.
+    shared = customer.dify.shared_embedding_model
+    if shared is not None:
+        if requested_id is not None and requested_id != shared.name:
             raise InvalidRequestError(
                 (
-                    "no embedding model configured for this customer; "
-                    "pass `embedding_model` explicitly or register a default in "
-                    "the customer's `embedding_models` registry section"
+                    f"shared-mode workspace requires embedding_model="
+                    f"'{shared.name}' for dataset creation; received '{requested_id}'. "
+                    "Per-customer embedding_models can still be used directly via "
+                    "POST /v1/embeddings, but datasets bind to the workspace-global model."
                 ),
                 param="embedding_model",
             )
-        entry = customer.embedding_models[0]
+        return shared.name, shared.provider
 
+    # Dedicated mode (PR #3 R5 behaviour) — pick from the customer's list.
+    entry = _resolve_dedicated_embedding(customer, requested_id)
     if entry.provider is None:
         raise InvalidRequestError(
             (
@@ -110,7 +121,71 @@ def resolve_embedding_for_dataset(
             ),
             param="embedding_model",
         )
-    return entry
+    return entry.name, entry.provider
+
+
+def _resolve_dedicated_embedding(
+    customer: CustomerEntry, requested_id: str | None
+) -> EmbeddingModelEntry:
+    """Pick an EmbeddingModelEntry for dedicated mode (PR #3 R5 logic)."""
+    if requested_id is not None:
+        entry = customer.find_embedding_model(requested_id)
+        if entry is None:
+            raise UnknownModelError(
+                f"embedding model '{requested_id}' is not enabled for this customer",
+                param="embedding_model",
+            )
+        return entry
+    if not customer.embedding_models:
+        raise InvalidRequestError(
+            (
+                "no embedding model configured for this customer; "
+                "pass `embedding_model` explicitly or register a default in "
+                "the customer's `embedding_models` registry section"
+            ),
+            param="embedding_model",
+        )
+    return customer.embedding_models[0]
+
+
+# ---------------------------------------------------------------------------
+# R3/R4 — cross-customer ownership verification (shared mode)
+# ---------------------------------------------------------------------------
+
+
+async def _verify_dataset_ownership(
+    dify_client: DifyClient,
+    customer: CustomerEntry,
+    strategy: IsolationStrategy,
+    dataset_id: str,
+) -> dict[str, Any]:
+    """Fetch a dataset and ensure it belongs to this customer.
+
+    In dedicated mode the workspace IS the customer's, so anything visible
+    via the customer's ``dataset_api_key`` belongs to them; we skip the
+    ownership check to save a Dify roundtrip. In shared mode we fetch the
+    dataset, inspect its name against the customer's prefix, and raise
+    ``UnknownDatasetError`` (404) if it belongs to someone else.
+
+    The 404 is deliberate (not 403): a 403 would leak the existence of the
+    other customer's dataset. The customer sees the same envelope whether
+    the dataset is missing or just inaccessible.
+
+    Returns the Dify response so the caller can reuse it (e.g. for the
+    happy-path get_dataset response — avoids fetching twice).
+    """
+    dify_meta = await dify_client.get_dataset(
+        dataset_api_key=customer.dify.dataset_api_key,
+        dataset_id=dataset_id,
+    )
+    if strategy.is_shared:
+        dify_name = dify_meta.get("name", "")
+        if not strategy.dataset_belongs_to(customer.customer_id, dify_name):
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found",
+                param="dataset_id",
+            )
+    return dify_meta
 
 
 # ---------------------------------------------------------------------------
@@ -125,19 +200,26 @@ async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
     The embedding model is **locked in at creation time** (Dify behaviour);
     documents added later are all vectorised with the same model. To switch
     embedding models, delete this dataset and create a new one.
+
+    Shared-mode (PR #4 R3): the dataset name is prefixed with
+    ``{customer_id}__`` before sending to Dify, so two customers asking for
+    name "kb" build distinct Dify datasets. The response strips the prefix
+    so the client sees the name they sent.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
 
-    embedding = resolve_embedding_for_dataset(customer, body.embedding_model)
+    embedding_name, embedding_provider = resolve_embedding_for_dataset(
+        customer, body.embedding_model
+    )
 
-    # ``resolve_embedding_for_dataset`` guarantees ``provider`` is non-None.
     payload: dict[str, Any] = {
-        "name": body.name,
+        "name": strategy.dataset_name_to_dify(customer.customer_id, body.name),
         "description": body.description,
         "indexing_technique": body.indexing_technique,
-        "embedding_model": embedding.name,
-        "embedding_model_provider": embedding.provider,
+        "embedding_model": embedding_name,
+        "embedding_model_provider": embedding_provider,
     }
 
     dify_resp = await dify_client.create_dataset(
@@ -148,11 +230,12 @@ async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
     logger.info(
         "datasets.created",
         dataset_id=dify_resp.get("id"),
-        embedding_model=embedding.id,
+        embedding_model=embedding_name,
         indexing_technique=body.indexing_technique,
+        mode=customer.dify.mode,
     )
 
-    return JSONResponse(content=_to_dataset(dify_resp))
+    return JSONResponse(content=_to_dataset(dify_resp, customer, strategy))
 
 
 @router.get("/v1/datasets")
@@ -161,9 +244,19 @@ async def list_datasets(request: Request) -> Any:
 
     Forwards ``page`` / ``limit`` / ``keyword`` query params to Dify.
     Defaults: page=1, limit=20 (matches Dify's defaults).
+
+    Shared-mode (PR #4 R3): the gateway filters Dify's response to only
+    include datasets owned by this customer (name starts with the
+    ``{customer_id}__`` prefix). The reported ``total`` reflects the
+    filtered count, not Dify's workspace total — this means pagination is
+    approximate in shared mode (a request for page=2 may return fewer
+    items than ``limit`` because other customers' datasets were filtered
+    out). True paginated isolation would require fetching all pages and
+    paging client-side; PR #4 trades that for simplicity.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
 
     page = _int_query(request, "page", default=1, minimum=1)
     limit = _int_query(request, "limit", default=20, minimum=1, maximum=100)
@@ -176,11 +269,22 @@ async def list_datasets(request: Request) -> Any:
         keyword=keyword,
     )
 
-    entries = [_to_dataset(d) for d in (dify_resp.get("data") or [])]
+    raw_data = dify_resp.get("data") or []
+    if strategy.is_shared:
+        # Filter to this customer's datasets only (soft isolation).
+        raw_data = [
+            d
+            for d in raw_data
+            if strategy.dataset_belongs_to(customer.customer_id, d.get("name", ""))
+        ]
+
+    entries = [_to_dataset(d, customer, strategy) for d in raw_data]
     envelope = DatasetList(
         data=[Dataset(**e) for e in entries],
         has_more=bool(dify_resp.get("has_more", False)),
-        total=int(dify_resp.get("total", 0)),
+        # In shared mode the filtered count is more useful than Dify's
+        # workspace-wide count (which would leak other customers' counts).
+        total=len(entries) if strategy.is_shared else int(dify_resp.get("total", 0)),
         page=int(dify_resp.get("page", page)),
         limit=int(dify_resp.get("limit", limit)),
     )
@@ -189,15 +293,20 @@ async def list_datasets(request: Request) -> Any:
 
 @router.get("/v1/datasets/{dataset_id}")
 async def get_dataset(dataset_id: str, request: Request) -> Any:
-    """Fetch a single dataset's metadata by Dify UUID."""
+    """Fetch a single dataset's metadata by Dify UUID.
+
+    Shared-mode (PR #4 R3): if the dataset belongs to a different customer,
+    returns 404 ``dataset_not_found`` — same envelope as a real miss, so
+    callers can't distinguish «exists but not yours» from «doesn't exist».
+    """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
 
-    dify_resp = await dify_client.get_dataset(
-        dataset_api_key=customer.dify.dataset_api_key,
-        dataset_id=dataset_id,
+    dify_resp = await _verify_dataset_ownership(
+        dify_client, customer, strategy, dataset_id
     )
-    return JSONResponse(content=_to_dataset(dify_resp))
+    return JSONResponse(content=_to_dataset(dify_resp, customer, strategy))
 
 
 @router.post("/v1/datasets/{dataset_id}/retrieve")
@@ -206,20 +315,17 @@ async def retrieve_dataset(
 ) -> Any:
     """Pure-retrieval channel (hit-testing) — return top-k chunks for a query.
 
-    No LLM call, no RAG augmentation. The customer can use this to build a
-    search-only UI, run their own ranking pipeline, or evaluate retrieval
-    quality. Output shape mirrors OpenAI's list-style envelope.
-
-    Retrieval-model handling:
-        * If the client provides ``top_k`` / ``score_threshold`` /
-          ``search_method``, the gateway builds a full ``retrieval_model``
-          payload (Dify requires several mandatory sub-fields together).
-        * If all are omitted, the gateway sends NO ``retrieval_model`` and
-          Dify uses the dataset's bake-in default — typically what the
-          customer wants when they trust their dataset's pre-tuned settings.
+    Shared-mode: ownership check first; cross-customer access → 404.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
+
+    if strategy.is_shared:
+        # One extra Dify call in shared mode to verify ownership before
+        # forwarding the retrieve. Dedicated mode skips this (workspace IS
+        # the customer, no cross-tenant possible).
+        await _verify_dataset_ownership(dify_client, customer, strategy, dataset_id)
 
     payload: dict[str, Any] = {"query": body.query}
     retrieval_model = _build_retrieval_model(body)
@@ -249,19 +355,33 @@ async def retrieve_dataset(
 async def delete_dataset(dataset_id: str, request: Request) -> Any:
     """Delete a dataset by Dify UUID.
 
-    Idempotent: returns 204 whether or not the dataset existed (Dify 404 →
-    treated as already-deleted in the client). This matches the semantics
-    of ``DELETE`` in OpenAI's spec and avoids forcing clients to handle 404
-    separately from a normal cleanup loop.
+    Idempotent: returns 200 whether or not the dataset existed (Dify 404 →
+    treated as already-deleted in the client). Shared-mode (PR #4 R3):
+    cross-customer delete returns 404 ``dataset_not_found`` to avoid
+    revealing the dataset belongs to someone else.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
+
+    if strategy.is_shared:
+        # Verify ownership before delete. If the dataset doesn't exist in
+        # Dify, the get_dataset call inside _verify will surface a 404
+        # naturally (UpstreamClientError 404 from PR #3 review-3). For a
+        # cross-customer dataset, we raise UnknownDatasetError ourselves.
+        try:
+            await _verify_dataset_ownership(
+                dify_client, customer, strategy, dataset_id
+            )
+        except UnknownDatasetError:
+            raise
+        # else fall through to delete
 
     await dify_client.delete_dataset(
         dataset_api_key=customer.dify.dataset_api_key,
         dataset_id=dataset_id,
     )
-    logger.info("datasets.deleted", dataset_id=dataset_id)
+    logger.info("datasets.deleted", dataset_id=dataset_id, mode=customer.dify.mode)
     return JSONResponse(content={"id": dataset_id, "deleted": True})
 
 
@@ -270,17 +390,26 @@ async def delete_dataset(dataset_id: str, request: Request) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _to_dataset(raw: dict[str, Any]) -> dict[str, Any]:
+def _to_dataset(
+    raw: dict[str, Any],
+    customer: CustomerEntry,
+    strategy: IsolationStrategy,
+) -> dict[str, Any]:
     """Shape a Dify dataset object into the gateway's surfaced fields.
 
-    Dify returns a much larger payload (permission, plugin ids, partial
-    member list, ...). We keep only what the customer needs and let
-    ``extra="allow"`` on ``Dataset`` pass through anything extra a client
-    explicitly asks for.
+    In shared mode the Dify ``name`` carries the ``{customer_id}__`` prefix
+    used for soft isolation; we strip it before returning so the client
+    sees the same name they sent on create. If the dataset somehow lacks
+    the prefix (shouldn't happen for own datasets, but defensive), we fall
+    back to the raw name rather than dropping the entry.
     """
+    dify_name = raw.get("name", "")
+    customer_facing_name = (
+        strategy.dataset_name_from_dify(customer.customer_id, dify_name) or dify_name
+    )
     return {
         "id": raw.get("id", ""),
-        "name": raw.get("name", ""),
+        "name": customer_facing_name,
         "description": raw.get("description") or "",
         "indexing_technique": raw.get("indexing_technique"),
         "embedding_model": raw.get("embedding_model"),

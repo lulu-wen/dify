@@ -30,7 +30,8 @@ from fastapi import File as FastapiFile
 from fastapi.responses import JSONResponse
 
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError
+from gateway.errors import InvalidRequestError, UnknownDatasetError
+from gateway.mode import isolation_strategy_for
 from gateway.registry import CustomerEntry
 from gateway.schemas import File, FileList
 
@@ -73,6 +74,11 @@ async def upload_file(
     content = await file.read()
     if not content:
         raise InvalidRequestError("uploaded file is empty", param="file")
+
+    # PR #4 R4: in shared mode, verify the dataset belongs to this customer
+    # before letting the file land in it. Otherwise customer A could push
+    # files into customer B's dataset by guessing/learning the UUID.
+    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
 
     dify_resp = await dify_client.create_document_by_file(
         dataset_api_key=customer.dify.dataset_api_key,
@@ -120,6 +126,8 @@ async def list_files(request: Request) -> Any:
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
 
+    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
     page = _int_query(request, "page", default=1, minimum=1)
     limit = _int_query(request, "limit", default=20, minimum=1, maximum=100)
     keyword = request.query_params.get("keyword") or None
@@ -162,6 +170,8 @@ async def delete_file(file_id: str, request: Request) -> Any:
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
 
+    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
     await dify_client.delete_document(
         dataset_api_key=customer.dify.dataset_api_key,
         dataset_id=dataset_id,
@@ -174,6 +184,36 @@ async def delete_file(file_id: str, request: Request) -> Any:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _verify_dataset_ownership_for_files(
+    dify_client: DifyClient,
+    customer: CustomerEntry,
+    dataset_id: str,
+) -> None:
+    """In shared mode, ensure the dataset belongs to this customer (PR #4 R4).
+
+    Files are scoped to a dataset, so file-level isolation reduces to
+    dataset-level: if the caller owns the dataset, they can act on its
+    files. Cross-customer access → 404 dataset_not_found (same envelope
+    as a real miss, no existence leak).
+
+    Dedicated mode skips this check (the customer's Dify only has their
+    own datasets, by construction).
+    """
+    strategy = isolation_strategy_for(customer)
+    if not strategy.is_shared:
+        return
+    meta = await dify_client.get_dataset(
+        dataset_api_key=customer.dify.dataset_api_key,
+        dataset_id=dataset_id,
+    )
+    dify_name = meta.get("name", "")
+    if not strategy.dataset_belongs_to(customer.customer_id, dify_name):
+        raise UnknownDatasetError(
+            f"dataset '{dataset_id}' not found",
+            param="dataset_id",
+        )
 
 
 def _to_file(raw: dict[str, Any]) -> dict[str, Any]:
