@@ -71,14 +71,16 @@ async def upload_file(
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
 
+    # PR #4 R4 + review-2 P2: verify the dataset belongs to this customer
+    # BEFORE reading the file body. Otherwise an attacker who learned a
+    # foreign dataset UUID could push large uploads through the gateway,
+    # forcing it to spool the bytes to disk / memory only to 404 afterward.
+    # Move the check up so a wrong dataset_id is rejected before any I/O.
+    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
     content = await file.read()
     if not content:
         raise InvalidRequestError("uploaded file is empty", param="file")
-
-    # PR #4 R4: in shared mode, verify the dataset belongs to this customer
-    # before letting the file land in it. Otherwise customer A could push
-    # files into customer B's dataset by guessing/learning the UUID.
-    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
 
     dify_resp = await dify_client.create_document_by_file(
         dataset_api_key=customer.dify.dataset_api_key,

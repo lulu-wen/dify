@@ -31,9 +31,12 @@ from gateway.registry import CustomerEntry
 # convention in the PR #4 spec). The customer_id slug pattern already
 # forbids "__" so this round-trips losslessly.
 _DATASET_PREFIX_SEP = "__"
-# Hyphen for App names because Dify enforces a sane app-name charset (no
-# underscores allowed historically), and ``-`` is universally safe.
-_APP_PREFIX_SEP = "-"
+# Colon separator for App names — preserves the legacy
+# ``auto:{customer_id}:{model_id}`` shape that PR #1-#3 deployments already
+# have in Dify. Changing the separator would orphan existing Apps (their
+# names live in Dify; GC uses cached app_id, not lookup-by-name). Keeping
+# colon means PR #4 wires the strategy without any production migration.
+_APP_PREFIX_SEP = ":"
 
 
 class IsolationStrategy(Protocol):
@@ -46,9 +49,11 @@ class IsolationStrategy(Protocol):
     def app_name(self, customer_id: str, model_id: str) -> str:
         """Compute the Dify App name for ``(customer_id, model_id)``.
 
-        Dedicated mode: ``model_id`` (no prefix; the workspace is the
-        customer). Shared mode: ``"{customer_id}-{model_id}"`` so two
-        customers asking for the same model build distinct Apps.
+        Both strategies return ``"{customer_id}:{model_id}"`` — the legacy
+        format PR #1-#3 already wrote into Dify. The strategy abstraction
+        is wired in so future modes can override (e.g. a region-scoped
+        mode could add a region prefix); changing today's format would
+        orphan existing Apps in Dify.
         """
 
     def dataset_name_to_dify(self, customer_id: str, name: str) -> str:
@@ -81,7 +86,10 @@ class DedicatedStrategy:
         return False
 
     def app_name(self, customer_id: str, model_id: str) -> str:
-        return model_id
+        # Customer_id is technically redundant in dedicated mode (one Dify
+        # per customer), but keeping it in the App name preserves PR #1-#3
+        # naming so existing deployments don't end up with orphan Apps.
+        return f"{customer_id}{_APP_PREFIX_SEP}{model_id}"
 
     def dataset_name_to_dify(self, customer_id: str, name: str) -> str:
         return name

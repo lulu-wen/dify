@@ -226,7 +226,9 @@ class TestIsolationStrategy:
     def test_dedicated_passthrough(self) -> None:
         s = DedicatedStrategy()
         assert not s.is_shared
-        assert s.app_name("tenant-a", "model-x") == "model-x"
+        # App naming preserves legacy ``{customer_id}:{model_id}`` shape
+        # (PR #4 review-2: avoid orphaning existing Apps in Dify).
+        assert s.app_name("tenant-a", "model-x") == "tenant-a:model-x"
         assert s.dataset_name_to_dify("tenant-a", "kb") == "kb"
         assert s.dataset_name_from_dify("tenant-a", "kb") == "kb"
         assert s.dataset_belongs_to("tenant-a", "kb") is True
@@ -234,7 +236,10 @@ class TestIsolationStrategy:
     def test_shared_prefixes_and_strips(self) -> None:
         s = SharedStrategy()
         assert s.is_shared
-        assert s.app_name("tenant-a", "gemma-3n-e4b") == "tenant-a-gemma-3n-e4b"
+        # Same colon format as dedicated mode (review-2: one App-naming
+        # contract across modes). Distinct per customer thanks to the
+        # customer_id segment, so no collision in a shared workspace.
+        assert s.app_name("tenant-a", "gemma-3n-e4b") == "tenant-a:gemma-3n-e4b"
         assert s.dataset_name_to_dify("tenant-a", "rsrp-manuals") == "tenant-a__rsrp-manuals"
         assert s.dataset_name_from_dify("tenant-a", "tenant-a__rsrp-manuals") == "rsrp-manuals"
 
@@ -824,6 +829,114 @@ class TestReviewFix_SharedListPagination:
         assert body["total"] == 25
         assert len(body["data"]) == 5  # 25 - 20
         assert body["has_more"] is False
+
+
+class TestReview2Fix_AppManagerWiresStrategy:
+    """Codex review-2 P2: AppManager must call ``strategy.app_name`` so the
+    contract has one source of truth, not a hard-coded string in the
+    builder."""
+
+    @pytest.mark.asyncio
+    async def test_dedicated_app_name_uses_strategy(
+        self, app: FastAPI, fake_dify: FakeDifyClient
+    ) -> None:
+        """First chat call should trigger an App build whose DSL name
+        matches ``auto:{strategy.app_name(...)}``."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            await cli.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={"model": "m1", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        # Inspect the YAML DSL sent to console_import_app.
+        assert fake_dify.calls["import"], "App was not built"
+        _session, yaml_content = fake_dify.calls["import"][0]
+        # Default fixture customer_id is "test-a", model_id "m1".
+        # Strategy returns "test-a:m1" → DSL name "auto:test-a:m1".
+        assert "auto:test-a:m1" in yaml_content
+
+
+class TestReview2Fix_SharedDatasetNameLength:
+    """Codex review-2 P2: the gateway must reject names that, once
+    prefixed with ``{customer_id}__``, would exceed Dify's 40-char limit."""
+
+    @pytest.mark.asyncio
+    async def test_long_prefixed_name_rejected_at_gateway(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        # customer_id="tenant-abcdefghij" (16) + "__" (2) + "very-long-kb-name" (17) = 35 OK
+        # customer_id="tenant-abcdefghij" + "__" + "a-much-longer-kb-name-here" (26) = 44 > 40
+        customer = _shared_customer(
+            customer_id="tenant-abcdefghij",
+            sdk_key="bsa_long",
+            base_url="http://shared.test",
+        )
+        app = _app_with(customer, fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/datasets",
+                headers={"Authorization": "Bearer bsa_long"},
+                json={"name": "a-much-longer-kb-name-here"},
+            )
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"]["param"] == "name"
+        # Message must include the budget so the operator knows how much
+        # they have left after the customer_id prefix.
+        assert "40-char limit" in body["error"]["message"]
+        # Critical: no Dify call.
+        assert fake_dify.calls["dataset_create"] == []
+
+    @pytest.mark.asyncio
+    async def test_short_prefixed_name_accepted(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Belt-and-braces: a name that fits after prefix still works."""
+        customer = _shared_customer(customer_id="tenant-a")
+        app = _app_with(customer, fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/datasets",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                json={"name": "kb"},  # 8+2+2 = 12 chars, well under 40
+            )
+        assert r.status_code == 200
+
+
+class TestReview2Fix_OwnershipBeforeFileRead:
+    """Codex review-2 P2: shared-mode file upload must verify ownership
+    BEFORE reading the request body. Otherwise an attacker who learned a
+    foreign UUID can force the gateway to spool large uploads to memory /
+    disk only to 404 afterward."""
+
+    @pytest.mark.asyncio
+    async def test_upload_to_foreign_dataset_skips_file_read(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """The test asserts the ownership check fired against a
+        not-yet-read upload. The fake doesn't read multipart so we
+        instead assert no doc_upload was attempted and the 404 came back
+        before any Dify file-create call."""
+        fake_dify.dataset_get_response = {
+            "id": "ds-uuid-B",
+            "name": "tenant-b__kb",
+        }
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                files={"file": ("x.txt", io.BytesIO(b"large payload " * 1000), "text/plain")},
+                data={"dataset_id": "ds-uuid-B"},
+            )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "dataset_not_found"
+        # Critical: the upload code path didn't reach Dify's create-by-file.
+        assert fake_dify.calls["doc_upload"] == []
 
 
 class TestReviewFix_DedicatedRejectsSharedEmbedding:

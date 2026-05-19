@@ -220,6 +220,15 @@ async def _verify_dataset_ownership(
 # ---------------------------------------------------------------------------
 
 
+# Dify's ``Dataset.name`` is capped at 40 chars (matches the customer-facing
+# ``DatasetCreateRequest.name`` ``max_length``). In shared mode the gateway
+# prefixes with ``{customer_id}__`` before sending, so the combined length
+# can overflow even when the customer's input was valid. Reject at the
+# gateway with a clear message instead of letting Dify 4xx with a less
+# helpful one (codex review-2 P2).
+_DIFY_DATASET_NAME_MAX = 40
+
+
 @router.post("/v1/datasets")
 async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
     """Create a new dataset bound to a chosen embedding model.
@@ -241,8 +250,26 @@ async def create_dataset(request: Request, body: DatasetCreateRequest) -> Any:
         customer, body.embedding_model
     )
 
+    dify_name = strategy.dataset_name_to_dify(customer.customer_id, body.name)
+    # Codex review-2 P2: a long customer_id + name can exceed Dify's 40-char
+    # dataset-name limit after prefixing. Catch at the gateway so the
+    # caller gets a clear «name too long for shared mode» message instead
+    # of a generic upstream 4xx after the round-trip.
+    if len(dify_name) > _DIFY_DATASET_NAME_MAX:
+        budget = _DIFY_DATASET_NAME_MAX - (len(dify_name) - len(body.name))
+        raise InvalidRequestError(
+            (
+                f"dataset name '{body.name}' exceeds Dify's {_DIFY_DATASET_NAME_MAX}-char "
+                f"limit once prefixed for shared mode "
+                f"(customer_id='{customer.customer_id}' uses "
+                f"{len(dify_name) - len(body.name)} chars of the budget; "
+                f"max remaining for the name is {max(budget, 0)})"
+            ),
+            param="name",
+        )
+
     payload: dict[str, Any] = {
-        "name": strategy.dataset_name_to_dify(customer.customer_id, body.name),
+        "name": dify_name,
         "description": body.description,
         "indexing_technique": body.indexing_technique,
         "embedding_model": embedding_name,
