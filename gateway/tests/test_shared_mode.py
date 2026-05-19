@@ -1238,42 +1238,49 @@ class TestReview6Fix_SharedEmbeddingResolveByCustomerId:
         assert "bge-m3" in msg  # the workspace's required name
 
 
-class TestReview6Fix_DuplicateCustomerIdInSharedGroup:
-    """Codex review-6 P2: shared-mode isolation prefix is just
-    `customer_id`. Two customers on the same Dify with the same
-    customer_id (different SDK keys) → same prefix → can see each
-    other's data. Reject at load."""
+class TestReview7Fix_GlobalCustomerIdUniqueness:
+    """Codex review-7 P2: customer_id must be globally unique across the
+    whole registry — not just within a base_url group (review-6 stopped
+    short). AppManager's app cache is keyed by ``(customer_id, model_id)``
+    alone, console sessions by ``customer_id``, GC by
+    ``find_by_customer_id``. Duplicates ANYWHERE would route one
+    deployment's cached App key / session to the other.
 
-    def test_shared_duplicate_customer_id_same_base_url_rejected(self) -> None:
-        """Same base_url + same customer_id + different sdk_keys →
-        registry must refuse to load."""
+    Review-6 had narrower tests asserting that cross-base_url duplicates
+    were OK and that dedicated-mode same-base_url duplicates were OK.
+    Both were wrong — codex caught them in review-7. Replaced with the
+    correct invariant.
+    """
+
+    def test_globally_duplicate_customer_id_rejected(self) -> None:
+        """Two customers with same customer_id anywhere → reject."""
         a = _shared_customer(customer_id="tenant-a", sdk_key="bsa_a")
-        b = _shared_customer(customer_id="tenant-a", sdk_key="bsa_b")  # same id
-        with pytest.raises(ValueError, match="duplicate customer_ids"):
+        b = _shared_customer(customer_id="tenant-a", sdk_key="bsa_b")
+        with pytest.raises(ValueError, match="duplicate customer_id"):
             CustomerRegistry.from_entries([a, b])
 
-    def test_shared_same_customer_id_different_base_url_allowed(self) -> None:
-        """Two separate Difys can each have a 'tenant-a' customer —
-        prefixes apply per-workspace, so no collision."""
+    def test_duplicate_customer_id_different_base_url_rejected(self) -> None:
+        """Even across different Dify deployments — AppManager cache /
+        session keys don't include base_url, so the duplicate would
+        cross-pollute."""
         a = _shared_customer(
             customer_id="tenant-a", sdk_key="bsa_a", base_url="http://dify-1.test"
         )
         b = _shared_customer(
             customer_id="tenant-a", sdk_key="bsa_b", base_url="http://dify-2.test"
         )
-        reg = CustomerRegistry.from_entries([a, b])
-        assert len(reg) == 2
+        with pytest.raises(ValueError, match="duplicate customer_id"):
+            CustomerRegistry.from_entries([a, b])
 
-    def test_dedicated_duplicate_customer_id_same_base_url_allowed(self) -> None:
-        """In dedicated mode there's no prefix derivation, so duplicate
-        customer_ids on the same base_url are weird-but-not-dangerous.
-        The check is shared-mode only."""
-        # Both dedicated, same base_url, same customer_id
+    def test_dedicated_duplicate_customer_id_also_rejected(self) -> None:
+        """Same global rule applies in dedicated mode — review-6's
+        carve-out for dedicated mode was wrong (cache collision applies
+        there too)."""
         a = CustomerEntry(
             sdk_key="bsa_a",
             customer_id="tenant-a",
             dify=DifyConnection(
-                base_url="http://dedi.test",
+                base_url="http://dedi-1.test",
                 console_email="a@b",
                 console_password="p",
                 dataset_api_key="d",
@@ -1284,14 +1291,21 @@ class TestReview6Fix_DuplicateCustomerIdInSharedGroup:
             sdk_key="bsa_b",
             customer_id="tenant-a",
             dify=DifyConnection(
-                base_url="http://dedi.test",
+                base_url="http://dedi-2.test",
                 console_email="a@b",
                 console_password="p",
                 dataset_api_key="d",
             ),
             models=[ModelEntry(id="m", provider="p", name="n")],
         )
-        # No raise — dedicated mode doesn't have the prefix collision.
+        with pytest.raises(ValueError, match="duplicate customer_id"):
+            CustomerRegistry.from_entries([a, b])
+
+    def test_distinct_customer_ids_accepted(self) -> None:
+        """Sanity: distinct customer_ids on the same base_url + shared
+        mode (the originally documented configuration) still works."""
+        a = _shared_customer(customer_id="tenant-a", sdk_key="bsa_a")
+        b = _shared_customer(customer_id="tenant-b", sdk_key="bsa_b")
         reg = CustomerRegistry.from_entries([a, b])
         assert len(reg) == 2
 

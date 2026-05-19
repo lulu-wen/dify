@@ -354,14 +354,32 @@ class CustomerRegistry:
         """Build a registry from a list of entries.
 
         Raises:
-            ValueError: duplicate sdk_key, OR customers sharing the same
+            ValueError: duplicate sdk_key; duplicate customer_id (must be
+                globally unique — see below); customers sharing the same
                 Dify ``base_url`` but disagreeing on ``mode`` /
                 ``shared_embedding_model`` (PR #4 R1).
         """
         by_key: dict[str, CustomerEntry] = {}
+        seen_customer_ids: set[str] = set()
         for entry in entries:
             if entry.sdk_key in by_key:
                 raise ValueError(f"duplicate sdk_key in registry: {entry.sdk_key}")
+            # Codex review-7 P2: customer_id MUST be globally unique. Cache
+            # keys throughout the gateway (AppManager apps by
+            # ``(customer_id, model_id)``, console sessions by
+            # ``customer_id``, GC's ``find_by_customer_id``) all use
+            # customer_id as the sole identifier. Duplicates — even across
+            # different Dify base_urls — would cause one deployment's
+            # cached App key / session to be served to the other.
+            if entry.customer_id in seen_customer_ids:
+                raise ValueError(
+                    f"duplicate customer_id in registry: '{entry.customer_id}'. "
+                    f"customer_id must be globally unique because gateway "
+                    f"caches (AppManager apps, console sessions, GC lookup) "
+                    f"are keyed by customer_id alone; duplicates would target "
+                    f"the wrong Dify deployment."
+                )
+            seen_customer_ids.add(entry.customer_id)
             by_key[entry.sdk_key] = entry
         cls._check_dify_consistency(by_key.values())
         return cls(by_key)
@@ -419,24 +437,14 @@ class CustomerRegistry:
                     f"(customers: {ids}). The workspace has one embedding model."
                 )
 
-            # Codex review-6 P2: in shared mode the isolation prefix is
-            # derived solely from customer_id. Two entries on the same Dify
-            # using the same customer_id would generate identical
-            # ``{customer_id}__`` prefixes and see each other's datasets —
-            # the soft-isolation guarantee collapses. Reject at load.
-            if next(iter(modes)) == "shared":
-                customer_ids = [m.customer_id for m in members]
-                duplicates = sorted(
-                    {cid for cid in customer_ids if customer_ids.count(cid) > 1}
-                )
-                if duplicates:
-                    raise ValueError(
-                        f"shared customers on dify base_url '{base_url}' have "
-                        f"duplicate customer_ids: {duplicates}. Each shared "
-                        f"customer needs a unique customer_id because the "
-                        f"isolation prefix is derived from it. Use distinct "
-                        f"customer_ids (sdk_keys can differ either way)."
-                    )
+            # Codex review-6 P2 + review-7 P2: duplicate customer_id within
+            # a shared group would collapse the {customer_id}__ prefix
+            # isolation. ``from_entries`` now enforces global customer_id
+            # uniqueness up front (the gateway's cache keys assume it
+            # everywhere), so by the time control reaches here the
+            # per-group invariant is already guaranteed. Kept the comment
+            # so the soft-isolation rationale stays discoverable in the
+            # consistency check.
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> CustomerRegistry:
