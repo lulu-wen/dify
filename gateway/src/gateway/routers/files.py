@@ -73,17 +73,25 @@ async def upload_file(
         indexing_technique=indexing_technique,
     )
 
+    # Dify v1.x wraps create-by-file as ``{"document": {...}, "batch": "..."}``;
+    # older / non-standard versions return the document fields at the top
+    # level. Unwrap so downstream code always sees the document payload
+    # (otherwise client gets id="", name="" — codex review-1 P1).
+    document_payload = _unwrap_document(dify_resp)
+
     logger.info(
         "files.uploaded",
         dataset_id=dataset_id,
         filename=file.filename,
         size_bytes=len(content),
-        document_id=_doc_id_from_response(dify_resp),
+        document_id=document_payload.get("id"),
     )
 
     # Round-trip through the schema so ``object: "file"`` is added and the
     # client sees an envelope identical to entries in ``GET /v1/files``.
-    return JSONResponse(content=File(**_to_file(dify_resp)).model_dump(exclude_none=True))
+    return JSONResponse(
+        content=File(**_to_file(document_payload)).model_dump(exclude_none=True)
+    )
 
 
 @router.get("/v1/files")
@@ -174,15 +182,19 @@ def _to_file(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _doc_id_from_response(raw: dict[str, Any]) -> str | None:
-    """Dify wraps create-by-file responses in different shapes across versions.
+def _unwrap_document(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return the document payload from a create-by-file response.
 
-    v1.x usually returns ``{"document": {...}, "batch": "..."}`` but some
-    versions return the document fields directly. Try both.
+    Dify v1.x wraps the payload as ``{"document": {...}, "batch": "..."}``;
+    older versions return the document fields directly. Codex review-1 P1
+    flagged the unwrap was missing — the previous code passed the outer
+    envelope to ``_to_file`` and clients got ``id=""`` even though the
+    document was created.
     """
-    if isinstance(raw.get("document"), dict):
-        return raw["document"].get("id")
-    return raw.get("id")
+    inner = raw.get("document")
+    if isinstance(inner, dict):
+        return inner
+    return raw
 
 
 def _int_query(
