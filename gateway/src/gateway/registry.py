@@ -419,6 +419,25 @@ class CustomerRegistry:
                     f"(customers: {ids}). The workspace has one embedding model."
                 )
 
+            # Codex review-6 P2: in shared mode the isolation prefix is
+            # derived solely from customer_id. Two entries on the same Dify
+            # using the same customer_id would generate identical
+            # ``{customer_id}__`` prefixes and see each other's datasets —
+            # the soft-isolation guarantee collapses. Reject at load.
+            if next(iter(modes)) == "shared":
+                customer_ids = [m.customer_id for m in members]
+                duplicates = sorted(
+                    {cid for cid in customer_ids if customer_ids.count(cid) > 1}
+                )
+                if duplicates:
+                    raise ValueError(
+                        f"shared customers on dify base_url '{base_url}' have "
+                        f"duplicate customer_ids: {duplicates}. Each shared "
+                        f"customer needs a unique customer_id because the "
+                        f"isolation prefix is derived from it. Use distinct "
+                        f"customer_ids (sdk_keys can differ either way)."
+                    )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> CustomerRegistry:
         """Load and validate a registry YAML file.

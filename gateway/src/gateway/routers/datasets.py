@@ -106,13 +106,29 @@ def resolve_embedding_for_dataset(
         # runtime defence.
         assert customer.dify.shared_embedding_model is not None
         shared = customer.dify.shared_embedding_model
-        if requested_id is not None and requested_id != shared.name:
+        if requested_id is None:
+            return shared.name, shared.provider
+        # Codex review-6 P2: ``DatasetCreateRequest.embedding_model`` is
+        # a *customer-facing* id (the one ``/v1/models`` advertises). The
+        # customer may pass the id of an entry in their ``embedding_models``
+        # registry section — resolve it first and check the underlying
+        # ``name`` matches the workspace's shared model. Direct pass of
+        # ``shared.name`` also accepted (some operators read it from Dify).
+        entry = customer.find_embedding_model(requested_id)
+        resolved_name = entry.name if entry is not None else requested_id
+        if resolved_name != shared.name:
             raise InvalidRequestError(
                 (
-                    f"shared-mode workspace requires embedding_model="
-                    f"'{shared.name}' for dataset creation; received '{requested_id}'. "
-                    "Per-customer embedding_models can still be used directly via "
-                    "POST /v1/embeddings, but datasets bind to the workspace-global model."
+                    f"shared-mode workspace requires embedding_model that "
+                    f"resolves to '{shared.name}'; received '{requested_id}'"
+                    + (
+                        f" (registered as '{entry.name}')"
+                        if entry is not None
+                        else " (not in customer registry either)"
+                    )
+                    + ". Per-customer embedding_models can still be used "
+                    "directly via POST /v1/embeddings, but datasets bind to "
+                    "the workspace-global model."
                 ),
                 param="embedding_model",
             )

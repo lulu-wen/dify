@@ -961,28 +961,16 @@ class TestReview2Fix_OwnershipBeforeFileRead:
 
 
 class TestReview3Fix_UploadDatasetIdInQuery:
-    """Codex review-3 P2: dataset_id must live in the query string so the
-    ownership check runs BEFORE the multipart body is parsed. With the
-    earlier Form-based design, FastAPI would auto-parse multipart up
-    front to bind the parameter, defeating the cheap-fail goal."""
+    """Codex review-3 P2: ``dataset_id`` SHOULD live in the query for
+    shared-mode pre-flight; review-6 P1 then narrowed this to «query is
+    required in shared mode only, dedicated still accepts form» so PR #3
+    backward compat is preserved.
 
-    @pytest.mark.asyncio
-    async def test_upload_with_form_only_dataset_id_is_rejected(
-        self, app: FastAPI
-    ) -> None:
-        """Sending dataset_id as a form field (PR #4 review-2 shape)
-        without the query param → 400 ``dataset_id is required``."""
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
-            r = await cli.post(
-                "/v1/files",
-                headers={"Authorization": "Bearer bsa_test_a"},
-                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-                data={"dataset_id": "ds-uuid-1"},  # wrong place now
-            )
-        assert r.status_code == 400
-        body = r.json()
-        assert body["error"]["param"] == "dataset_id"
+    (The original review-3 test that asserted form-only is rejected in
+    dedicated mode was removed: that behaviour was the regression
+    review-6 fixed. Coverage of «dedicated accepts form» now lives in
+    ``TestReview6Fix_FileUploadBackwardCompat``.)
+    """
 
     @pytest.mark.asyncio
     async def test_upload_query_indexing_technique_forwarded(
@@ -1095,6 +1083,217 @@ class TestReview3Fix_SharedCustomerIdLengthBudget:
             models=[ModelEntry(id="m", provider="p", name="n")],
         )
         assert entry.customer_id == long_id
+
+
+class TestReview6Fix_FileUploadBackwardCompat:
+    """Codex review-6 P1: PR #3 R3 contract was multipart-form `dataset_id`.
+    PR #4 review-3 broke that by moving to query-only. Restore form-field
+    fallback for dedicated mode (no security cost) while keeping shared
+    mode strictly query-only (the cheap-fail pre-flight matters)."""
+
+    @pytest.mark.asyncio
+    async def test_dedicated_upload_with_form_dataset_id_accepted(
+        self, app: FastAPI, fake_dify: FakeDifyClient
+    ) -> None:
+        """PR #3 contract: dedicated-mode client sends `dataset_id` in the
+        multipart form. Must still work after PR #4 — the round-3 move
+        to query was a backward-compat break codex flagged."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files",  # NO query params
+                headers={"Authorization": "Bearer bsa_test_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+                data={"dataset_id": "ds-uuid-1", "indexing_technique": "high_quality"},
+            )
+        assert r.status_code == 200
+        sent = fake_dify.calls["doc_upload"][0]
+        assert sent["dataset_id"] == "ds-uuid-1"
+        assert sent["indexing_technique"] == "high_quality"
+
+    @pytest.mark.asyncio
+    async def test_dedicated_upload_with_query_dataset_id_accepted(
+        self, app: FastAPI, fake_dify: FakeDifyClient
+    ) -> None:
+        """Sanity: dedicated mode accepts BOTH query and form (forward
+        compat with new clients writing to PR #4 conventions)."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files?dataset_id=ds-uuid-1",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+            )
+        assert r.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_shared_upload_form_only_dataset_id_rejected(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Shared mode must NOT fall back to form — the whole point of
+        moving to query was to enable ownership pre-flight before body
+        parse. Form-only dataset_id in shared mode → 400 with explicit
+        message naming the shared-mode requirement."""
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files",  # NO query
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+                data={"dataset_id": "ds-uuid-A"},
+            )
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"]["param"] == "dataset_id"
+        assert "shared mode" in body["error"]["message"]
+
+
+class TestReview6Fix_SharedEmbeddingResolveByCustomerId:
+    """Codex review-6 P2: shared-mode embedding resolution must accept
+    customer-facing IDs (the ones `/v1/models` advertises) — not only the
+    Dify served name. Previously the resolver compared `requested_id`
+    directly to `shared.name`, rejecting valid customer-facing aliases."""
+
+    @pytest.mark.asyncio
+    async def test_shared_create_accepts_customer_facing_embedding_id(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Customer's `embedding_models` registry maps `id='bge-m3-public'`
+        to `name='bge-m3'` (the Dify served name). Shared workspace's
+        `shared_embedding_model.name` is also `'bge-m3'`. The customer
+        passes their public id; gateway resolves and accepts."""
+        customer = _shared_customer(
+            customer_id="tenant-a",
+            sdk_key="bsa_tenant_a",
+            shared_emb=SharedEmbeddingModel(
+                name="bge-m3",
+                provider="langgenius/openai_api_compatible/openai_api_compatible",
+            ),
+        )
+        # Override embedding_models to have a customer-facing alias that
+        # resolves to the workspace's name.
+        customer_with_alias = customer.model_copy(
+            update={
+                "embedding_models": [
+                    EmbeddingModelEntry(
+                        id="bge-m3-public",  # customer-facing alias
+                        name="bge-m3",  # actually the workspace's name
+                        owner="BAAI",
+                        endpoint_url="http://embed.test/v1",
+                        provider="langgenius/openai_api_compatible/openai_api_compatible",
+                    )
+                ]
+            }
+        )
+        app = _app_with(customer_with_alias, fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/datasets",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                # Customer passes their public alias, NOT the Dify name.
+                json={"name": "kb", "embedding_model": "bge-m3-public"},
+            )
+        assert r.status_code == 200
+        payload = fake_dify.calls["dataset_create"][0]["payload"]
+        # Wire-level sees the resolved Dify name.
+        assert payload["embedding_model"] == "bge-m3"
+
+    @pytest.mark.asyncio
+    async def test_shared_create_mismatched_customer_alias_rejected(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Customer's alias resolves to a different name than the
+        workspace's shared model — 400 with both the customer's alias
+        AND the resolved name in the message for debuggability."""
+        customer = _shared_customer(
+            shared_emb=SharedEmbeddingModel(name="bge-m3", provider="prov"),
+        )
+        customer_with_bad_alias = customer.model_copy(
+            update={
+                "embedding_models": [
+                    EmbeddingModelEntry(
+                        id="text-embed-large",
+                        name="text-embedding-3-large",  # NOT the workspace's
+                        owner="OpenAI",
+                        endpoint_url="http://embed.test/v1",
+                        provider="prov",
+                    )
+                ]
+            }
+        )
+        app = _app_with(customer_with_bad_alias, fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/datasets",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+                json={"name": "kb", "embedding_model": "text-embed-large"},
+            )
+        assert r.status_code == 400
+        msg = r.json()["error"]["message"]
+        assert "text-embed-large" in msg
+        assert "text-embedding-3-large" in msg  # the resolved name
+        assert "bge-m3" in msg  # the workspace's required name
+
+
+class TestReview6Fix_DuplicateCustomerIdInSharedGroup:
+    """Codex review-6 P2: shared-mode isolation prefix is just
+    `customer_id`. Two customers on the same Dify with the same
+    customer_id (different SDK keys) → same prefix → can see each
+    other's data. Reject at load."""
+
+    def test_shared_duplicate_customer_id_same_base_url_rejected(self) -> None:
+        """Same base_url + same customer_id + different sdk_keys →
+        registry must refuse to load."""
+        a = _shared_customer(customer_id="tenant-a", sdk_key="bsa_a")
+        b = _shared_customer(customer_id="tenant-a", sdk_key="bsa_b")  # same id
+        with pytest.raises(ValueError, match="duplicate customer_ids"):
+            CustomerRegistry.from_entries([a, b])
+
+    def test_shared_same_customer_id_different_base_url_allowed(self) -> None:
+        """Two separate Difys can each have a 'tenant-a' customer —
+        prefixes apply per-workspace, so no collision."""
+        a = _shared_customer(
+            customer_id="tenant-a", sdk_key="bsa_a", base_url="http://dify-1.test"
+        )
+        b = _shared_customer(
+            customer_id="tenant-a", sdk_key="bsa_b", base_url="http://dify-2.test"
+        )
+        reg = CustomerRegistry.from_entries([a, b])
+        assert len(reg) == 2
+
+    def test_dedicated_duplicate_customer_id_same_base_url_allowed(self) -> None:
+        """In dedicated mode there's no prefix derivation, so duplicate
+        customer_ids on the same base_url are weird-but-not-dangerous.
+        The check is shared-mode only."""
+        # Both dedicated, same base_url, same customer_id
+        a = CustomerEntry(
+            sdk_key="bsa_a",
+            customer_id="tenant-a",
+            dify=DifyConnection(
+                base_url="http://dedi.test",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        b = CustomerEntry(
+            sdk_key="bsa_b",
+            customer_id="tenant-a",
+            dify=DifyConnection(
+                base_url="http://dedi.test",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        # No raise — dedicated mode doesn't have the prefix collision.
+        reg = CustomerRegistry.from_entries([a, b])
+        assert len(reg) == 2
 
 
 class TestReview5Fix_IdempotentSharedDelete:

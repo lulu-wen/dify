@@ -56,36 +56,66 @@ async def upload_file(request: Request) -> Any:
     carries the document id and a current ``indexing_status`` that the
     client can poll via ``GET /v1/files`` if needed.
 
-    Codex review-3 P2: ``dataset_id`` is read from the **query string**
-    (not the multipart body) so the ownership check can run BEFORE the
-    request body is touched. Earlier versions used a ``Form()`` parameter
-    which forced FastAPI to spool the multipart body up-front, defeating
-    the cheap-fail goal of the ownership gate. The body is now only
-    parsed via ``await request.form()`` *after* ownership is verified.
+    Wire format (codex review-3 P2 + review-6 P1 backward compat):
 
-    Wire format:
-        POST /v1/files?dataset_id=<uuid>[&indexing_technique=...]
-        Content-Type: multipart/form-data
-        body: file=<binary>
+    - ``dataset_id`` (required): query param ``?dataset_id=<uuid>`` OR
+      multipart form field (PR #3 R3 contract). Shared mode REQUIRES the
+      query form so ownership can be verified before the multipart body
+      is parsed; dedicated mode accepts either (no pre-flight cost there,
+      so backward compat with PR #3 clients matters more than the
+      cheap-fail goal).
+    - ``indexing_technique`` (optional): query param or form field.
+      Defaults to ``high_quality``.
+    - ``file`` (required): multipart form field with the binary.
+
+    Why hybrid: existing PR #3 / OpenAI-SDK ``extra_body`` clients send
+    ``dataset_id`` in the form. Shared-mode pre-flight only works with
+    query, so we enforce query in that mode (security) but accept form
+    in dedicated (backward compat).
     """
-    dataset_id = request.query_params.get("dataset_id")
-    if not dataset_id:
-        raise InvalidRequestError(
-            "dataset_id query parameter is required", param="dataset_id"
-        )
-
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
 
-    # PR #4 R4 + review-2/3 P2: verify ownership BEFORE any multipart
-    # parsing. ``request.form()`` triggers Starlette's multipart parser
-    # which spools to disk for large uploads; we want a foreign-UUID
-    # rejection to happen before the parser does any work.
-    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+    dataset_id = request.query_params.get("dataset_id")
 
-    indexing_technique = (
-        request.query_params.get("indexing_technique") or "high_quality"
-    )
+    if strategy.is_shared:
+        # Shared mode: dataset_id MUST be in query. Otherwise FastAPI
+        # would have to parse the multipart body to find it, and the
+        # ownership check loses its cheap-fail property (review-3 P2).
+        if not dataset_id:
+            raise InvalidRequestError(
+                "dataset_id query parameter is required in shared mode "
+                "(needed for ownership verification before parsing the body)",
+                param="dataset_id",
+            )
+        # Verify ownership BEFORE parsing the body.
+        await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
+    # indexing_technique from query (preferred) — falls back to form below.
+    indexing_technique: str | None = request.query_params.get("indexing_technique")
+
+    # Parse the multipart body. In shared mode the ownership pre-flight
+    # already ran; in dedicated mode there's no pre-flight (workspace IS
+    # the customer), so reading the body here costs nothing extra.
+    form = await request.form()
+
+    if not dataset_id:
+        # Dedicated-mode fallback: dataset_id in the form (PR #3 contract).
+        # Codex review-6 P1: existing clients with `data={"dataset_id":...}`
+        # must keep working. Shared mode already required query above, so
+        # this branch is only reachable in dedicated mode.
+        form_dataset_id = form.get("dataset_id")
+        if not form_dataset_id:
+            raise InvalidRequestError(
+                "dataset_id is required (query parameter or form field)",
+                param="dataset_id",
+            )
+        dataset_id = str(form_dataset_id)
+
+    if not indexing_technique:
+        form_indexing = form.get("indexing_technique")
+        indexing_technique = str(form_indexing) if form_indexing else "high_quality"
     if indexing_technique not in _VALID_INDEXING_TECHNIQUES:
         raise InvalidRequestError(
             f"indexing_technique must be 'high_quality' or 'economy', "
@@ -93,8 +123,6 @@ async def upload_file(request: Request) -> Any:
             param="indexing_technique",
         )
 
-    # Now safe to parse the body — ownership check passed.
-    form = await request.form()
     file = form.get("file")
     if not isinstance(file, UploadFile):
         raise InvalidRequestError(
