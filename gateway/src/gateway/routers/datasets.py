@@ -334,9 +334,29 @@ async def list_datasets(request: Request) -> Any:
     keyword = request.query_params.get("keyword") or None
 
     if strategy.is_shared:
+        # Codex review-8 P2: never forward ``keyword`` to Dify in shared
+        # mode — Dify stores names with the ``{customer_id}__`` prefix,
+        # so the customer-facing keyword (which should match the public
+        # name) would either over-match (every dataset contains the
+        # customer_id substring) or under-match (the prefix gets in the
+        # way). Fetch all owned, strip prefix, then apply keyword on the
+        # public name ourselves.
         owned = await _collect_owned_datasets(
-            dify_client, customer, strategy, keyword
+            dify_client, customer, strategy, keyword=None
         )
+        if keyword:
+            keyword_lower = keyword.lower()
+            owned = [
+                d
+                for d in owned
+                if keyword_lower
+                in (
+                    strategy.dataset_name_from_dify(
+                        customer.customer_id, d.get("name", "")
+                    )
+                    or ""
+                ).lower()
+            ]
         total = len(owned)
         start = (page - 1) * limit
         end = start + limit

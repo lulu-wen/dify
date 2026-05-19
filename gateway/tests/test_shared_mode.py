@@ -1238,6 +1238,135 @@ class TestReview6Fix_SharedEmbeddingResolveByCustomerId:
         assert "bge-m3" in msg  # the workspace's required name
 
 
+class TestReview8Fix_SharedKeywordOnPublicName:
+    """Codex review-8 P2: shared-mode list filtering by ``keyword`` must
+    match the customer-facing (post-strip) name — not the prefixed Dify
+    name. Otherwise ``keyword=tenant-a`` (the caller's own id) would
+    match every owned dataset because they all start with ``tenant-a__``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_keyword_matches_only_public_name(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Caller has 3 datasets: ``rsrp-handbook``, ``alarm-codes``,
+        ``rsrp-faq``. Search ``keyword=rsrp`` → only the two with
+        ``rsrp`` in the public name."""
+        async def list_datasets_fake(**kwargs: object) -> dict[str, object]:
+            fake_dify.calls["dataset_list"].append(kwargs)
+            return {
+                "data": [
+                    {"id": "u1", "name": "tenant-a__rsrp-handbook"},
+                    {"id": "u2", "name": "tenant-a__alarm-codes"},
+                    {"id": "u3", "name": "tenant-a__rsrp-faq"},
+                ],
+                "has_more": False,
+                "total": 3,
+                "limit": 100,
+                "page": 1,
+            }
+
+        fake_dify.list_datasets = list_datasets_fake  # type: ignore[assignment]
+
+        app = _app_with(_shared_customer(customer_id="tenant-a"), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets?keyword=rsrp",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        body = r.json()
+        assert body["total"] == 2
+        names = sorted(d["name"] for d in body["data"])
+        assert names == ["rsrp-faq", "rsrp-handbook"]
+
+    @pytest.mark.asyncio
+    async def test_keyword_matching_customer_id_does_not_match_all(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """The exact attack codex described: customer searches for their
+        own id and should NOT match every dataset (none of the public
+        names actually contain it)."""
+        async def list_datasets_fake(**kwargs: object) -> dict[str, object]:
+            fake_dify.calls["dataset_list"].append(kwargs)
+            return {
+                "data": [
+                    {"id": "u1", "name": "tenant-a__handbook"},
+                    {"id": "u2", "name": "tenant-a__alarms"},
+                ],
+                "has_more": False,
+                "total": 2,
+                "limit": 100,
+                "page": 1,
+            }
+
+        fake_dify.list_datasets = list_datasets_fake  # type: ignore[assignment]
+
+        app = _app_with(_shared_customer(customer_id="tenant-a"), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.get(
+                "/v1/datasets?keyword=tenant-a",  # the customer_id itself
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        body = r.json()
+        # Public names are "handbook" and "alarms" — neither contains
+        # "tenant-a", so the filtered list is empty.
+        assert body["total"] == 0
+        assert body["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_shared_list_does_not_forward_keyword_to_dify(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Critical implementation property: keyword forwarded to Dify
+        would match prefixed names and over-include. The gateway must
+        pass ``keyword=None`` upstream and filter locally."""
+        async def list_datasets_fake(**kwargs: object) -> dict[str, object]:
+            fake_dify.calls["dataset_list"].append(kwargs)
+            return {"data": [], "has_more": False, "total": 0, "limit": 100, "page": 1}
+
+        fake_dify.list_datasets = list_datasets_fake  # type: ignore[assignment]
+
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            await cli.get(
+                "/v1/datasets?keyword=anything",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        # The Dify call must NOT carry the caller's keyword.
+        sent = fake_dify.calls["dataset_list"][0]
+        assert sent.get("keyword") is None
+
+
+class TestReview8Fix_DedicatedCustomerIdNoLengthCap:
+    """Codex review-8 P2: PR #1-#3 deployments may have customer_ids
+    longer than 64 chars. The PR #4 max_length=64 field cap was a
+    backward-compat regression in dedicated mode (same pattern as
+    review-4 with the slug rule). Length is only meaningful in shared
+    mode where it interacts with Dify's 40-char dataset prefix budget."""
+
+    def test_long_dedicated_customer_id_accepted(self) -> None:
+        """100-char dedicated customer_id loads fine."""
+        long_id = "x" * 100
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id=long_id,
+            dify=DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == long_id
+
+
 class TestReview7Fix_GlobalCustomerIdUniqueness:
     """Codex review-7 P2: customer_id must be globally unique across the
     whole registry — not just within a base_url group (review-6 stopped

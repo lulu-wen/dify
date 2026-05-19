@@ -204,15 +204,16 @@ class CustomerEntry(BaseModel):
     sdk_key: str = Field(min_length=1)
     customer_id: str = Field(
         min_length=1,
-        max_length=64,
         description=(
-            "Per-customer identifier. In shared mode it is additionally "
-            "constrained to a lowercase / hyphen slug (no underscores) "
-            "because the gateway uses it as a literal prefix for App / "
-            "Dataset names. See ``_shared_mode_customer_id_is_slug`` for "
-            "the validator that enforces the slug rule. Dedicated mode "
-            "(PR #1-#3 default) accepts any string within the length cap "
-            "so existing deployments don't break (codex review-4 P2)."
+            "Per-customer identifier. Shared mode adds two extra rules "
+            "(``_shared_mode_customer_id_is_slug`` and "
+            "``_shared_mode_customer_id_fits_name_budget``): the value "
+            "must be a lowercase / hyphen slug and short enough that "
+            "``{customer_id}__{name}`` fits Dify's dataset-name limit. "
+            "Dedicated mode (PR #1-#3 default) places no such constraint "
+            "so existing deployments with longer or differently-shaped "
+            "IDs keep loading after the PR #4 upgrade (codex review-4 "
+            "+ review-8 P2)."
         ),
     )
     dify: DifyConnection
