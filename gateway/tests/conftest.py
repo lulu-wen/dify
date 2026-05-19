@@ -11,7 +11,6 @@ from fastapi import FastAPI
 
 from gateway.config import Settings
 from gateway.dify.client import ConsoleSession, DifyClient
-from gateway.errors import DifyUpstreamError
 from gateway.main import create_app
 from gateway.registry import (
     CustomerEntry,
@@ -50,6 +49,11 @@ def make_customer(
                 endpoint_url="http://embed.test/v1",
                 api_key="EMPTY",
                 dimensions=1024,
+                # PR #3 review-2 P2: dataset creation now requires provider.
+                # Default fixture sets it so the bulk of tests get a sane
+                # baseline; tests that exercise the "provider missing"
+                # branch build their own entry.
+                provider="langgenius/openai_api_compatible/openai_api_compatible",
             )
             for eid in embedding_model_ids
         ],
@@ -263,5 +267,5 @@ def app(
         return fake_dify  # type: ignore[return-value]
 
     application.state.dify_client_factory = factory
-    application.state.app_manager._client_factory = factory  # noqa: SLF001
+    application.state.app_manager._client_factory = factory
     return application
