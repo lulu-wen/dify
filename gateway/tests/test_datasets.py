@@ -454,6 +454,188 @@ async def test_dify_timeout_during_list_returns_504(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# R4 — POST /v1/datasets/{id}/retrieve (pure retrieval channel)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retrieve_uses_dataset_default_when_no_knobs(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """When the client passes only ``query``, the gateway must NOT send a
+    ``retrieval_model`` — Dify uses the dataset's bake-in retrieval config.
+    This avoids accidentally overriding the customer's tuned settings."""
+    fake_dify.dataset_retrieve_response = {
+        "query": {"content": "RSRP=-115"},
+        "records": [
+            {
+                "segment": {
+                    "id": "seg-1",
+                    "content": "RSRP below -110 indicates weak signal.",
+                    "document": {"id": "doc-1", "name": "rsrp-guide.pdf"},
+                },
+                "score": 0.87,
+            }
+        ],
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "RSRP=-115"},
+        )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "list"
+    assert body["query"] == "RSRP=-115"
+    assert len(body["data"]) == 1
+    hit = body["data"][0]
+    assert hit["content"].startswith("RSRP below -110")
+    assert hit["score"] == 0.87
+    assert hit["document_id"] == "doc-1"
+    assert hit["document_name"] == "rsrp-guide.pdf"
+    assert hit["segment_id"] == "seg-1"
+
+    # Critical: payload sent to Dify must NOT carry retrieval_model.
+    sent = fake_dify.calls["dataset_retrieve"][0]
+    assert sent["dataset_id"] == "abc-uuid"
+    assert sent["payload"] == {"query": "RSRP=-115"}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_builds_retrieval_model_when_top_k_set(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """One knob (top_k) supplied → gateway fills in the rest of Dify's
+    required RetrievalModel fields with sensible defaults. Required because
+    Dify rejects a partial ``retrieval_model`` payload."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "x", "top_k": 5},
+        )
+
+    sent = fake_dify.calls["dataset_retrieve"][0]
+    rm = sent["payload"]["retrieval_model"]
+    assert rm["top_k"] == 5
+    assert rm["search_method"] == "semantic_search"
+    assert rm["reranking_enable"] is False
+    assert rm["score_threshold_enabled"] is False
+    assert rm["score_threshold"] is None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_score_threshold_enables_flag(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """When client passes ``score_threshold``, gateway sets
+    ``score_threshold_enabled=True`` and forwards the float. Forgetting the
+    flag is the #1 source of «why is my threshold being ignored» in Dify."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "x", "score_threshold": 0.6},
+        )
+
+    rm = fake_dify.calls["dataset_retrieve"][0]["payload"]["retrieval_model"]
+    assert rm["score_threshold"] == 0.6
+    assert rm["score_threshold_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_retrieve_search_method_forwarded(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "x", "search_method": "hybrid_search"},
+        )
+
+    rm = fake_dify.calls["dataset_retrieve"][0]["payload"]["retrieval_model"]
+    assert rm["search_method"] == "hybrid_search"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_empty_records_returns_empty_list(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """No hits → ``data: []`` (not 404). Empty result is a valid query
+    outcome; clients use list length to decide whether to fall back."""
+    fake_dify.dataset_retrieve_response = {"query": {"content": "x"}, "records": []}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "no-match"},
+        )
+
+    assert r.status_code == 200
+    assert r.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_retrieve_rejects_empty_query(app: FastAPI) -> None:
+    """Pydantic min_length=1 → 400 OpenAI envelope (not 422)."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": ""},
+        )
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_rejects_top_k_out_of_range(app: FastAPI) -> None:
+    """Pydantic ge=1, le=100 — defend against the customer asking for
+    ``top_k=10000`` and OOMing the vector store."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "x", "top_k": 9999},
+        )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_retrieve_requires_auth(app: FastAPI) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post("/v1/datasets/abc-uuid/retrieve", json={"query": "x"})
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_retrieve_dify_5xx_returns_502(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    fake_dify.dataset_error = DifyUpstreamError("Dify returned HTTP 503: overloaded")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/datasets/abc-uuid/retrieve",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={"query": "x"},
+        )
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "dify_upstream_error"
+
+
 @pytest.mark.asyncio
 async def test_unknown_embedding_does_not_leak_dataset_into_dify(
     app: FastAPI, fake_dify: FakeDifyClient

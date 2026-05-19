@@ -363,6 +363,57 @@ class DatasetList(BaseModel):
     limit: int = 20
 
 
+class DatasetRetrieveRequest(BaseModel):
+    """Body of ``POST /v1/datasets/{id}/retrieve``.
+
+    Pure-retrieval (hit-testing) channel — no LLM call, no RAG augmentation,
+    just the top-k chunks from the dataset's vector index. Used by clients
+    who want to run their own ranking / display / evaluation pipeline.
+
+    The simple top-level fields (``top_k``, ``score_threshold``,
+    ``search_method``) are the common knobs. If they're all omitted, the
+    gateway forwards no ``retrieval_model`` and Dify uses the dataset's
+    bake-in default. If any is set, the gateway builds a full
+    ``retrieval_model`` payload with sensible defaults for the rest.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=250)
+    top_k: int | None = Field(default=None, ge=1, le=100)
+    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    search_method: Literal[
+        "semantic_search", "hybrid_search", "full_text_search", "keyword_search"
+    ] | None = None
+
+
+class RetrievedSegment(BaseModel):
+    """A single retrieved chunk (subset of Dify's segment payload).
+
+    Clients get the chunk content + score + provenance (which document,
+    which segment within the document) so they can build their own UI.
+    Extra Dify fields pass through via ``extra="allow"``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    content: str
+    score: float | None = None
+    document_id: str | None = None
+    document_name: str | None = None
+    segment_id: str | None = None
+
+
+class DatasetRetrieveResponse(BaseModel):
+    """Response envelope for ``POST /v1/datasets/{id}/retrieve``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    query: str
+    data: list[RetrievedSegment]
+
+
 def make_metadata(
     references: list[dict[str, Any]] | None = None,
     conversation_id: str | None = None,

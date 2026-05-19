@@ -35,7 +35,14 @@ from fastapi.responses import JSONResponse
 from gateway.dify.client import DifyClient
 from gateway.errors import InvalidRequestError, UnknownModelError
 from gateway.registry import CustomerEntry, EmbeddingModelEntry
-from gateway.schemas import Dataset, DatasetCreateRequest, DatasetList
+from gateway.schemas import (
+    Dataset,
+    DatasetCreateRequest,
+    DatasetList,
+    DatasetRetrieveRequest,
+    DatasetRetrieveResponse,
+    RetrievedSegment,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -172,6 +179,51 @@ async def get_dataset(dataset_id: str, request: Request) -> Any:
     return JSONResponse(content=_to_dataset(dify_resp))
 
 
+@router.post("/v1/datasets/{dataset_id}/retrieve")
+async def retrieve_dataset(
+    dataset_id: str, request: Request, body: DatasetRetrieveRequest
+) -> Any:
+    """Pure-retrieval channel (hit-testing) — return top-k chunks for a query.
+
+    No LLM call, no RAG augmentation. The customer can use this to build a
+    search-only UI, run their own ranking pipeline, or evaluate retrieval
+    quality. Output shape mirrors OpenAI's list-style envelope.
+
+    Retrieval-model handling:
+        * If the client provides ``top_k`` / ``score_threshold`` /
+          ``search_method``, the gateway builds a full ``retrieval_model``
+          payload (Dify requires several mandatory sub-fields together).
+        * If all are omitted, the gateway sends NO ``retrieval_model`` and
+          Dify uses the dataset's bake-in default — typically what the
+          customer wants when they trust their dataset's pre-tuned settings.
+    """
+    customer: CustomerEntry = request.state.customer
+    dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+
+    payload: dict[str, Any] = {"query": body.query}
+    retrieval_model = _build_retrieval_model(body)
+    if retrieval_model is not None:
+        payload["retrieval_model"] = retrieval_model
+
+    dify_resp = await dify_client.retrieve_dataset(
+        dataset_api_key=customer.dify.dataset_api_key,
+        dataset_id=dataset_id,
+        payload=payload,
+    )
+
+    response = DatasetRetrieveResponse(
+        query=body.query,
+        data=[_to_segment(r) for r in (dify_resp.get("records") or [])],
+    )
+    logger.info(
+        "datasets.retrieved",
+        dataset_id=dataset_id,
+        query_len=len(body.query),
+        hits=len(response.data),
+    )
+    return JSONResponse(content=response.model_dump(exclude_none=True))
+
+
 @router.delete("/v1/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str, request: Request) -> Any:
     """Delete a dataset by Dify UUID.
@@ -216,6 +268,45 @@ def _to_dataset(raw: dict[str, Any]) -> dict[str, Any]:
         "word_count": int(raw.get("word_count") or 0),
         "created_at": raw.get("created_at"),
     }
+
+
+def _build_retrieval_model(body: DatasetRetrieveRequest) -> dict[str, Any] | None:
+    """Build a Dify ``retrieval_model`` payload, or None to use dataset default.
+
+    Dify's ``RetrievalModel`` requires several fields together (``search_method``,
+    ``reranking_enable``, ``top_k``, ``score_threshold_enabled``). If the
+    client supplies any one knob we have to fill in the rest with sensible
+    defaults; if they supply none, we send no override and Dify uses its
+    own per-dataset defaults — usually what the customer wants.
+    """
+    if body.top_k is None and body.score_threshold is None and body.search_method is None:
+        return None
+    return {
+        "search_method": body.search_method or "semantic_search",
+        "reranking_enable": False,
+        "top_k": body.top_k if body.top_k is not None else 3,
+        "score_threshold_enabled": body.score_threshold is not None,
+        "score_threshold": body.score_threshold,
+    }
+
+
+def _to_segment(raw: dict[str, Any]) -> RetrievedSegment:
+    """Shape a Dify retrieval record into the gateway's exposed segment.
+
+    Dify wraps each hit as ``{"segment": {...}, "score": float, ...}``;
+    inside ``segment`` is content + document metadata. Flatten to the
+    client-facing fields and let ``extra="allow"`` carry through anything
+    advanced clients might want (e.g. positions, child chunks).
+    """
+    segment = raw.get("segment") or {}
+    document = segment.get("document") or {}
+    return RetrievedSegment(
+        content=segment.get("content", ""),
+        score=raw.get("score") if isinstance(raw.get("score"), (int, float)) else None,
+        document_id=document.get("id"),
+        document_name=document.get("name"),
+        segment_id=segment.get("id"),
+    )
 
 
 def _int_query(
