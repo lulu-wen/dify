@@ -33,6 +33,7 @@ v1.x but pinning a Dify version is recommended.
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -343,6 +344,107 @@ class DifyClient:
             raise DifyTimeoutError("Dify delete-dataset timed out") from e
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify delete-dataset failed: {e}") from e
+        if resp.status_code == 404:
+            return
+        _raise_for_dify_status(resp)
+
+    async def create_document_by_file(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+        indexing_technique: str = "high_quality",
+        process_mode: str = "automatic",
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets/{uuid}/document/create-by-file`` — upload a file.
+
+        Dify expects ``multipart/form-data`` with two parts:
+            * ``file`` — the binary content (with filename + Content-Type)
+            * ``data`` — a JSON string carrying ``indexing_technique`` +
+              ``process_rule`` and any other knobs.
+
+        We default ``process_rule.mode = "automatic"`` so Dify picks sensible
+        chunking; customers needing custom chunking go through Dify directly
+        (out of PR #3 scope).
+
+        Memory note: ``content`` is a bytes blob (the caller has already
+        read the request stream into memory). Sufficient for typical KB
+        docs (<100 MB); large-file streaming is a follow-up if needed.
+        """
+        data_payload = {
+            "indexing_technique": indexing_technique,
+            "process_rule": {"mode": process_mode},
+        }
+        files = {"file": (filename, content, content_type)}
+        data = {"data": json.dumps(data_payload)}
+        # Don't use the Content-Type from _bearer — httpx sets multipart
+        # boundary automatically; an explicit application/json header here
+        # would silently override it and break the upload.
+        headers = {"Authorization": f"Bearer {dataset_api_key}"}
+        try:
+            resp = await self._http.post(
+                f"/v1/datasets/{dataset_id}/document/create-by-file",
+                headers=headers,
+                files=files,
+                data=data,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify create-by-file timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify create-by-file failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    async def list_documents(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        page: int = 1,
+        limit: int = 20,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets/{uuid}/documents`` — list documents in a dataset."""
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if keyword:
+            params["keyword"] = keyword
+        try:
+            resp = await self._http.get(
+                f"/v1/datasets/{dataset_id}/documents",
+                headers=_bearer(dataset_api_key),
+                params=params,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify list-documents timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify list-documents failed: {e}") from e
+        _raise_for_dify_status(resp)
+        return resp.json()
+
+    async def delete_document(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        document_id: str,
+    ) -> None:
+        """``DELETE /v1/datasets/{uuid}/documents/{document_id}`` — remove a document.
+
+        404 is treated as idempotent success (matches the dataset / app
+        delete pattern).
+        """
+        try:
+            resp = await self._http.delete(
+                f"/v1/datasets/{dataset_id}/documents/{document_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify delete-document timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify delete-document failed: {e}") from e
         if resp.status_code == 404:
             return
         _raise_for_dify_status(resp)

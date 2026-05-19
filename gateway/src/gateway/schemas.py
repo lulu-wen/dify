@@ -363,6 +363,42 @@ class DatasetList(BaseModel):
     limit: int = 20
 
 
+# ---------- /v1/files (knowledge-base documents) ----------
+
+
+class File(BaseModel):
+    """A document inside a dataset, as surfaced to the SDK client.
+
+    The naming mirrors OpenAI's Files API (``id`` + ``object: "file"``) even
+    though our semantics differ: these are knowledge-base documents that
+    will be vector-indexed by Dify, not finetuning files. Customers using
+    standard OpenAI SDK helpers (``client.files.list()``) recognise the
+    shape without needing custom code.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    object: Literal["file"] = "file"
+    name: str
+    indexing_status: str | None = None
+    word_count: int = 0
+    created_at: int | None = None
+
+
+class FileList(BaseModel):
+    """Response envelope for ``GET /v1/files``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[File]
+    has_more: bool = False
+    total: int = 0
+    page: int = 1
+    limit: int = 20
+
+
 class DatasetRetrieveRequest(BaseModel):
     """Body of ``POST /v1/datasets/{id}/retrieve``.
 

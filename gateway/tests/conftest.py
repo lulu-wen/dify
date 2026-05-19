@@ -109,8 +109,24 @@ class FakeDifyClient:
         }
         self.dataset_get_response: dict[str, Any] | None = None
         self.dataset_retrieve_response: dict[str, Any] = {"query": {}, "records": []}
+        # File/document responses (R3).
+        self.file_upload_response: dict[str, Any] = {
+            "id": "doc-uuid-1",
+            "name": "default.txt",
+            "indexing_status": "waiting",
+            "word_count": 0,
+            "created_at": 1700000000,
+        }
+        self.file_list_response: dict[str, Any] = {
+            "data": [],
+            "has_more": False,
+            "limit": 20,
+            "total": 0,
+            "page": 1,
+        }
         # Set to an exception instance to simulate a Dify failure on a given op.
         self.dataset_error: BaseException | None = None
+        self.file_error: BaseException | None = None
 
         self.calls: dict[str, list[Any]] = {
             "blocking": [],
@@ -124,6 +140,9 @@ class FakeDifyClient:
             "dataset_get": [],
             "dataset_delete": [],
             "dataset_retrieve": [],
+            "doc_upload": [],
+            "doc_list": [],
+            "doc_delete": [],
         }
 
     async def chat_messages_blocking(self, **kwargs: Any) -> dict[str, Any]:
@@ -190,6 +209,24 @@ class FakeDifyClient:
         if self.dataset_error is not None:
             raise self.dataset_error
         return self.dataset_retrieve_response
+
+    async def create_document_by_file(self, **kwargs: Any) -> dict[str, Any]:
+        # Capture the body separately so tests can inspect bytes received.
+        self.calls["doc_upload"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
+        return self.file_upload_response
+
+    async def list_documents(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["doc_list"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
+        return self.file_list_response
+
+    async def delete_document(self, **kwargs: Any) -> None:
+        self.calls["doc_delete"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
 
     async def aclose(self) -> None:
         return None
