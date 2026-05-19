@@ -22,12 +22,17 @@ Multipart-upload memory note:
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import structlog
-from fastapi import APIRouter, Form, Request, UploadFile
-from fastapi import File as FastapiFile
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+# ``Request.form()`` returns Starlette's UploadFile (which FastAPI's
+# ``UploadFile`` historically re-exports but may not be ``isinstance``-
+# compatible across versions). Use the Starlette one for the runtime
+# type check to keep things robust.
+from starlette.datastructures import UploadFile
 
 from gateway.dify.client import DifyClient
 from gateway.errors import InvalidRequestError, UnknownDatasetError, UpstreamClientError
@@ -40,43 +45,66 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+_VALID_INDEXING_TECHNIQUES = frozenset({"high_quality", "economy"})
+
+
 @router.post("/v1/files")
-async def upload_file(
-    request: Request,
-    # PEP 593 ``Annotated[...]`` pattern: FastAPI dependency factory calls
-    # (``File(...)``, ``Form(...)``) live in metadata, not in the default,
-    # so ruff B008 (function-call-in-default-argument) is silenced.
-    file: Annotated[
-        UploadFile,
-        FastapiFile(..., description="Document binary to ingest into the dataset"),
-    ],
-    dataset_id: Annotated[
-        str,
-        Form(..., description="Dify dataset UUID to ingest the document into"),
-    ],
-    indexing_technique: Annotated[
-        Literal["high_quality", "economy"],
-        Form(description="Override the dataset's default indexing technique for this document."),
-    ] = "high_quality",
-) -> Any:
+async def upload_file(request: Request) -> Any:
     """Upload a document into a knowledge-base dataset.
 
     Dify chunks + vectorises the document asynchronously; the response
     carries the document id and a current ``indexing_status`` that the
     client can poll via ``GET /v1/files`` if needed.
+
+    Codex review-3 P2: ``dataset_id`` is read from the **query string**
+    (not the multipart body) so the ownership check can run BEFORE the
+    request body is touched. Earlier versions used a ``Form()`` parameter
+    which forced FastAPI to spool the multipart body up-front, defeating
+    the cheap-fail goal of the ownership gate. The body is now only
+    parsed via ``await request.form()`` *after* ownership is verified.
+
+    Wire format:
+        POST /v1/files?dataset_id=<uuid>[&indexing_technique=...]
+        Content-Type: multipart/form-data
+        body: file=<binary>
     """
-    if not file.filename:
-        raise InvalidRequestError("uploaded file must include a filename", param="file")
+    dataset_id = request.query_params.get("dataset_id")
+    if not dataset_id:
+        raise InvalidRequestError(
+            "dataset_id query parameter is required", param="dataset_id"
+        )
 
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
 
-    # PR #4 R4 + review-2 P2: verify the dataset belongs to this customer
-    # BEFORE reading the file body. Otherwise an attacker who learned a
-    # foreign dataset UUID could push large uploads through the gateway,
-    # forcing it to spool the bytes to disk / memory only to 404 afterward.
-    # Move the check up so a wrong dataset_id is rejected before any I/O.
+    # PR #4 R4 + review-2/3 P2: verify ownership BEFORE any multipart
+    # parsing. ``request.form()`` triggers Starlette's multipart parser
+    # which spools to disk for large uploads; we want a foreign-UUID
+    # rejection to happen before the parser does any work.
     await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
+    indexing_technique = (
+        request.query_params.get("indexing_technique") or "high_quality"
+    )
+    if indexing_technique not in _VALID_INDEXING_TECHNIQUES:
+        raise InvalidRequestError(
+            f"indexing_technique must be 'high_quality' or 'economy', "
+            f"got '{indexing_technique}'",
+            param="indexing_technique",
+        )
+
+    # Now safe to parse the body — ownership check passed.
+    form = await request.form()
+    file = form.get("file")
+    if not isinstance(file, UploadFile):
+        raise InvalidRequestError(
+            "multipart field 'file' is required and must be a file upload",
+            param="file",
+        )
+    if not file.filename:
+        raise InvalidRequestError(
+            "uploaded file must include a filename", param="file"
+        )
 
     content = await file.read()
     if not content:

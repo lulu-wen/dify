@@ -511,10 +511,9 @@ async def test_shared_upload_to_other_customers_dataset_returns_404(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-B",
             headers={"Authorization": "Bearer bsa_tenant_a"},
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-B"},
         )
 
     assert r.status_code == 404
@@ -537,10 +536,9 @@ async def test_shared_upload_to_own_dataset_succeeds(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-A",
             headers={"Authorization": "Bearer bsa_tenant_a"},
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-A"},
         )
 
     assert r.status_code == 200
@@ -699,10 +697,9 @@ class TestReviewFix_DatasetNotFoundNormalization:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             r = await cli.post(
-                "/v1/files",
+                "/v1/files?dataset_id=missing-uuid",
                 headers={"Authorization": "Bearer bsa_tenant_a"},
                 files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-                data={"dataset_id": "missing-uuid"},
             )
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "dataset_not_found"
@@ -928,15 +925,151 @@ class TestReview2Fix_OwnershipBeforeFileRead:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             r = await cli.post(
-                "/v1/files",
+                "/v1/files?dataset_id=ds-uuid-B",
                 headers={"Authorization": "Bearer bsa_tenant_a"},
                 files={"file": ("x.txt", io.BytesIO(b"large payload " * 1000), "text/plain")},
-                data={"dataset_id": "ds-uuid-B"},
             )
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "dataset_not_found"
         # Critical: the upload code path didn't reach Dify's create-by-file.
         assert fake_dify.calls["doc_upload"] == []
+
+
+class TestReview3Fix_UploadDatasetIdInQuery:
+    """Codex review-3 P2: dataset_id must live in the query string so the
+    ownership check runs BEFORE the multipart body is parsed. With the
+    earlier Form-based design, FastAPI would auto-parse multipart up
+    front to bind the parameter, defeating the cheap-fail goal."""
+
+    @pytest.mark.asyncio
+    async def test_upload_with_form_only_dataset_id_is_rejected(
+        self, app: FastAPI
+    ) -> None:
+        """Sending dataset_id as a form field (PR #4 review-2 shape)
+        without the query param → 400 ``dataset_id is required``."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+                data={"dataset_id": "ds-uuid-1"},  # wrong place now
+            )
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"]["param"] == "dataset_id"
+
+    @pytest.mark.asyncio
+    async def test_upload_query_indexing_technique_forwarded(
+        self, app: FastAPI, fake_dify: FakeDifyClient
+    ) -> None:
+        """``indexing_technique`` is also a query param now (review-3
+        consequence: anything outside the multipart body)."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.post(
+                "/v1/files?dataset_id=ds-uuid-1&indexing_technique=economy",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
+            )
+        assert r.status_code == 200
+        assert fake_dify.calls["doc_upload"][0]["indexing_technique"] == "economy"
+
+
+class TestReview3Fix_BaseUrlNormalization:
+    """Codex review-3 P2: trailing slash on base_url must not split
+    consistency-check groups. Otherwise mixed-mode configs can sneak
+    through by typing one base_url with a trailing slash."""
+
+    def test_trailing_slash_grouped_same(self) -> None:
+        """``http://dify`` and ``http://dify/`` MUST be one group so the
+        mode-consistency check fires when they disagree."""
+        # Both customers on the "same" Dify but with differing base_url
+        # spellings AND differing modes — without normalization this
+        # would be accepted; the normalization rejects it.
+        a = _shared_customer(
+            customer_id="a",
+            sdk_key="bsa_a",
+            base_url="http://dify-shared.test",
+        )
+        # b uses trailing-slash + dedicated mode
+        b = CustomerEntry(
+            sdk_key="bsa_b",
+            customer_id="b",
+            dify=DifyConnection(
+                base_url="http://dify-shared.test/",  # trailing slash
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+                # default mode=dedicated
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        with pytest.raises(ValueError, match="disagree on isolation mode"):
+            CustomerRegistry.from_entries([a, b])
+
+
+class TestReview3Fix_SharedCustomerIdLengthBudget:
+    """Codex review-3 P2: customer_id too long for shared-mode prefix +
+    name budget → reject at registry load, not at first dataset op."""
+
+    def test_overflowing_customer_id_in_shared_mode_rejected(self) -> None:
+        """Customer_id 38 chars + ``__`` (2) = 40 chars, leaving 0 for
+        the dataset name. The registry must refuse to load this."""
+        long_id = "x" * 38  # exactly at the breaking point
+        with pytest.raises(ValueError, match="too long for shared mode"):
+            CustomerEntry(
+                sdk_key="bsa_x",
+                customer_id=long_id,
+                dify=DifyConnection(
+                    base_url="http://x",
+                    console_email="a@b",
+                    console_password="p",
+                    dataset_api_key="d",
+                    mode="shared",
+                    shared_embedding_model=SharedEmbeddingModel(
+                        name="bge-m3", provider="prov"
+                    ),
+                ),
+                models=[ModelEntry(id="m", provider="p", name="n")],
+            )
+
+    def test_short_customer_id_in_shared_mode_accepted(self) -> None:
+        """Belt-and-braces: a normal-length customer_id still works."""
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id="tenant-a",  # 8 chars, plenty of budget
+            dify=DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+                mode="shared",
+                shared_embedding_model=SharedEmbeddingModel(
+                    name="bge-m3", provider="prov"
+                ),
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == "tenant-a"
+
+    def test_dedicated_mode_ignores_length_budget(self) -> None:
+        """In dedicated mode the prefix doesn't apply, so a long
+        customer_id is fine. This is a regression test against
+        accidentally tightening dedicated-mode validation."""
+        long_id = "x" * 50  # would fail shared, but dedicated is OK
+        entry = CustomerEntry(
+            sdk_key="bsa_x",
+            customer_id=long_id,
+            dify=DifyConnection(
+                base_url="http://x",
+                console_email="a@b",
+                console_password="p",
+                dataset_api_key="d",
+            ),
+            models=[ModelEntry(id="m", provider="p", name="n")],
+        )
+        assert entry.customer_id == long_id
 
 
 class TestReviewFix_DedicatedRejectsSharedEmbedding:

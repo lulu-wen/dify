@@ -240,6 +240,37 @@ class CustomerEntry(BaseModel):
             raise ValueError("embedding model ids must be unique within a customer")
         return models
 
+    # Mirrors ``_DIFY_DATASET_NAME_MAX`` in routers/datasets.py.
+    # Duplicated here to keep registry validation self-contained — if Dify
+    # ever bumps the limit, both constants need updating together (the
+    # tests in test_shared_mode.py pin this expectation).
+    _DIFY_DATASET_NAME_LIMIT: int = 40
+
+    @model_validator(mode="after")
+    def _shared_mode_customer_id_fits_name_budget(self) -> CustomerEntry:
+        """Codex review-3 P2: a long customer_id leaves no name budget.
+
+        Shared-mode datasets are stored in Dify as ``{customer_id}__{name}``,
+        capped at 40 chars. If ``len(customer_id) >= 38``, the prefix
+        alone uses 40+ chars and EVERY ``POST /v1/datasets`` fails — but
+        the registry loads fine, so the operator only finds out at the
+        first runtime request. Reject at load time with a clear message.
+        """
+        if self.dify.mode == "shared":
+            # Reserve at least 1 char for the user-provided dataset name.
+            prefix_overhead = len(self.customer_id) + 2  # "__"
+            if prefix_overhead >= self._DIFY_DATASET_NAME_LIMIT:
+                budget = self._DIFY_DATASET_NAME_LIMIT - 2 - 1  # 1 char min name
+                raise ValueError(
+                    f"customer_id '{self.customer_id}' "
+                    f"({len(self.customer_id)} chars) is too long for shared mode: "
+                    f"prefix '{self.customer_id}__' would use "
+                    f"{prefix_overhead}/{self._DIFY_DATASET_NAME_LIMIT} of Dify's "
+                    f"dataset-name budget, leaving no room for the name. "
+                    f"Use a customer_id of at most {budget} chars for shared mode."
+                )
+        return self
+
     @model_validator(mode="after")
     def _no_id_collisions_across_lists(self) -> CustomerEntry:
         """Reject the same ``id`` appearing in both ``models`` and ``embedding_models``.
@@ -320,9 +351,15 @@ class CustomerRegistry:
         Fail loud at registry load so the issue is caught in CI / dev,
         not at the first runtime dataset operation.
         """
+        # Codex review-3 P2: normalize trailing slash before grouping.
+        # ``http://dify`` and ``http://dify/`` resolve to the same
+        # upstream (DifyClient does ``rstrip("/")`` itself), so they
+        # MUST be in the same consistency group — otherwise a typo'd
+        # registry can declare mixed mode for "different" base_urls
+        # that point at the same Dify and bypass the consistency check.
         groups: dict[str, list[CustomerEntry]] = defaultdict(list)
         for e in entries:
-            groups[e.dify.base_url].append(e)
+            groups[e.dify.base_url.rstrip("/")].append(e)
 
         for base_url, members in groups.items():
             modes = {m.dify.mode for m in members}
