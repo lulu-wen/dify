@@ -217,10 +217,15 @@ async def delete_file(file_id: str, request: Request) -> Any:
     isn't globally addressable — it lives under one dataset. Without this,
     we'd need to fetch every dataset and scan, which doesn't scale.
 
-    Idempotent contract (PR #3 R3 + codex review-5 P2): 404 from Dify
-    means already-deleted → 200. Shared-mode pre-flight preserves the
-    same: a missing dataset returns 200 (cleanup loop friendly), a
-    foreign dataset returns 404 (don't acknowledge customer B's data).
+    Idempotent contract (PR #3 R3 + codex review-5 P2 + shared-mode
+    existence-leak fix): missing dataset, foreign dataset, and successful
+    delete all return 200 ``{"deleted": True}``. The foreign-dataset case
+    previously returned 404 ``dataset_not_found`` which let a customer
+    distinguish "this UUID doesn't exist" from "this UUID belongs to
+    someone else" — a side-channel-amplified existence leak. The 200
+    envelope mirrors :func:`delete_dataset`; the gateway still refuses
+    to call Dify's ``delete_document`` for the foreign UUID and emits
+    a ``shared.dataset_delete_foreign_attempt`` warning for audit.
     """
     dataset_id = request.query_params.get("dataset_id")
     if not dataset_id:
@@ -233,9 +238,6 @@ async def delete_file(file_id: str, request: Request) -> Any:
     strategy = isolation_strategy_for(customer)
 
     if strategy.is_shared:
-        # Inline the verify so a missing dataset is treated as already-
-        # deleted (matches Dify's own 404-on-document semantics + PR #3
-        # delete_document idempotency).
         try:
             meta = await dify_client.get_dataset(
                 dataset_api_key=customer.dify.dataset_api_key,
@@ -254,9 +256,13 @@ async def delete_file(file_id: str, request: Request) -> Any:
         if not strategy.dataset_belongs_to(
             customer.customer_id, meta.get("name", "")
         ):
-            raise UnknownDatasetError(
-                f"dataset '{dataset_id}' not found", param="dataset_id"
+            logger.warning(
+                "shared.dataset_delete_foreign_attempt",
+                customer_id=customer.customer_id,
+                dataset_id=dataset_id,
+                document_id=file_id,
             )
+            return JSONResponse(content={"id": file_id, "deleted": True})
 
     await dify_client.delete_document(
         dataset_api_key=customer.dify.dataset_api_key,
