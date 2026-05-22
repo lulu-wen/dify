@@ -164,6 +164,17 @@ async def _check_runtime(
     tokens — so we still try it even if L3 fails. The exception is L2:
     if the network is unreachable, L4 will fail with the same error
     and we skip it to avoid duplicating the message.
+
+    Side effect (informational, not a bug):
+        ``client.console_login`` mutates ``client._http``'s cookie jar
+        via :meth:`DifyClient._set_session_cookies`. In shared mode where
+        several customers share a single :class:`DifyClient` (same
+        ``base_url``), the jar ends up with whichever customer logged in
+        last. This does NOT break runtime correctness — the App / GC
+        manager's ``_with_session`` re-logs in on every operation that
+        needs a fresh console JWT — but it does mean state from
+        startup_check leaks into the cached client. Cheap to tolerate;
+        documented here so future readers don't chase it as a bug.
     """
     issues: list[CheckIssue] = []
 

@@ -398,6 +398,72 @@ class TestUnexpectedFailure:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Lifespan wiring (catches "forgot to call run_startup_check at boot")
+# --------------------------------------------------------------------------- #
+
+
+class TestLifespanWiring:
+    """Without this test the orchestrator could be perfectly fine while
+    main.py forgets to call it — that's a wiring bug the unit tests
+    above won't catch. Drives the lifespan context manually so we
+    observe whether run_startup_check actually fires at boot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_strict_lifespan_aborts_when_format_fails(self) -> None:
+        """If lifespan really invokes run_startup_check with strict=True,
+        a malformed registry must abort startup with RuntimeError. If
+        someone deletes the run_startup_check call from lifespan, this
+        test will start passing-by-accident (no raise) and flip to
+        failing here, surfacing the regression at PR review time."""
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+
+        bad = _make_customer(sdk_key="wrong", dataset_api_key="wrong")
+        registry = CustomerRegistry.from_entries([bad])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            strict_startup=True,
+        )
+
+        app = create_app(settings=settings, registry=registry)
+
+        with pytest.raises(RuntimeError, match="GATEWAY_STRICT_STARTUP"):
+            async with app.router.lifespan_context(app):
+                pass  # We never reach here — startup_check raised.
+
+    @pytest.mark.asyncio
+    async def test_warn_only_lifespan_continues_on_failure(self) -> None:
+        """Mirror of the strict-mode wiring test: default mode must let
+        the lifespan complete normally even when the registry is
+        malformed (logs warnings, doesn't raise)."""
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+
+        bad = _make_customer(dataset_api_key="not-a-real-key")
+        registry = CustomerRegistry.from_entries([bad])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            strict_startup=False,
+        )
+
+        app = create_app(settings=settings, registry=registry)
+
+        # No raise expected — lifespan enters + exits cleanly.
+        async with app.router.lifespan_context(app):
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# CheckIssue dataclass sanity
+# --------------------------------------------------------------------------- #
+
+
 def test_check_issue_is_frozen() -> None:
     """Issues are immutable so they can be safely passed between log
     aggregators / stored in collections without surprise mutation. The
