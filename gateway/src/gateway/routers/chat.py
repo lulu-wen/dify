@@ -79,11 +79,13 @@ def _serialise_history(messages: list[ChatMessage]) -> str:
 def _user_id(req: ChatCompletionRequest, customer: CustomerEntry, request_id: str) -> str:
     """Stable end-user identifier sent to Dify.
 
-    Prefers ``request.user`` (OpenAI standard); falls back to a deterministic
-    per-customer fallback when omitted, since Dify requires this field.
+    Honors OpenAI's deprecation precedence via ``effective_user``
+    (``safety_identifier`` > ``user``). Falls back to a deterministic
+    per-customer identifier when both are omitted, since Dify requires this field.
     """
-    if req.user:
-        return req.user
+    resolved = req.effective_user
+    if resolved:
+        return resolved
     # Use ``customer_id:request_id`` as fallback; not ideal for cross-call
     # personalisation but unambiguous for tracing.
     return f"{customer.customer_id}:{request_id}"

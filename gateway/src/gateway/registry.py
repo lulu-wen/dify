@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ModelEntry(BaseModel):
@@ -43,6 +43,12 @@ class ModelEntry(BaseModel):
     ``id`` is the customer-facing identifier passed in ``extra_body.llm_model``.
     ``provider``/``name``/``completion_params`` are written into Dify Apps when
     the gateway lazy-builds an App for ``(customer_id, model_id)``.
+
+    ``owner`` follows OpenAI's ``owned_by`` semantics — it identifies the
+    *publisher* of the underlying model (e.g., ``"openai"`` for GPT,
+    ``"meta-llama"`` for Llama, ``"Qwen"`` for Qwen3, ``"BAAI"`` for
+    bge-m3). Defaults to the gateway identifier when an upstream publisher
+    is unknown or not relevant (e.g., customer-specific fine-tuned models).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -50,6 +56,7 @@ class ModelEntry(BaseModel):
     id: str = Field(min_length=1)
     provider: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    owner: str = Field(default="ai-sdk-gateway", min_length=1)
     completion_params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -64,6 +71,39 @@ class DifyConnection(BaseModel):
     dataset_api_key: str = Field(min_length=1)
 
 
+class EmbeddingModelEntry(BaseModel):
+    """An embedding model the customer can call via ``POST /v1/embeddings``.
+
+    Unlike :class:`ModelEntry`, embedding models bypass Dify entirely — the
+    gateway proxies the request straight to an OpenAI-compatible embedding
+    endpoint (typically vLLM serving in ``--task embed`` mode). Dify is
+    irrelevant for pure vectorisation: there's no prompt, no RAG, no agent,
+    no need for App-level orchestration.
+
+    Attributes:
+        id: Customer-facing model id; what the client passes in the
+            ``model`` field of an embeddings request.
+        name: Model name to send downstream (matches the upstream service's
+            ``--served-model-name`` / model registry).
+        owner: Publisher identity surfaced in ``/v1/models`` (OpenAI ``owned_by``
+            semantics). Defaults to the gateway identifier.
+        endpoint_url: OpenAI-compatible base URL, e.g. ``http://vllm-embed:8000/v1``.
+        api_key: Bearer token sent to the endpoint; vLLM ignores it by default
+            but other OpenAI-compatible services may require a real key.
+        dimensions: Native output dimensions (informational; some models
+            support truncation via the request's ``dimensions`` parameter).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    owner: str = Field(default="ai-sdk-gateway", min_length=1)
+    endpoint_url: str = Field(min_length=1)
+    api_key: str = Field(default="EMPTY")
+    dimensions: int | None = Field(default=None, gt=0)
+
+
 class CustomerEntry(BaseModel):
     """A fully resolved customer registry row."""
 
@@ -73,6 +113,7 @@ class CustomerEntry(BaseModel):
     customer_id: str = Field(min_length=1)
     dify: DifyConnection
     models: list[ModelEntry] = Field(min_length=1)
+    embedding_models: list[EmbeddingModelEntry] = Field(default_factory=list)
     knowledge_bases: list[str] = Field(default_factory=list)
 
     @field_validator("models")
@@ -83,12 +124,51 @@ class CustomerEntry(BaseModel):
             raise ValueError("model ids must be unique within a customer")
         return models
 
+    @field_validator("embedding_models")
+    @classmethod
+    def _unique_embedding_model_ids(
+        cls, models: list[EmbeddingModelEntry]
+    ) -> list[EmbeddingModelEntry]:
+        ids = [m.id for m in models]
+        if len(ids) != len(set(ids)):
+            raise ValueError("embedding model ids must be unique within a customer")
+        return models
+
+    @model_validator(mode="after")
+    def _no_id_collisions_across_lists(self) -> "CustomerEntry":
+        """Reject the same ``id`` appearing in both ``models`` and ``embedding_models``.
+
+        ``/v1/models`` flattens both lists into a single OpenAI-shaped list,
+        and the per-customer dispatchers (``find_model`` vs
+        ``find_embedding_model``) assume the id namespace is shared. If the
+        same id pointed at both an LLM and an embedding model, ``/v1/models``
+        would advertise duplicate entries, and a client calling
+        ``model="x"`` against ``/v1/chat/completions`` would silently win
+        over the embedding side (or vice versa) — confusing behaviour that
+        depends on lookup order.
+
+        Forbid the collision at config-load time so it surfaces as a clear
+        validation error, not a runtime mystery.
+        """
+        llm_ids = {m.id for m in self.models}
+        emb_ids = {e.id for e in self.embedding_models}
+        overlap = llm_ids & emb_ids
+        if overlap:
+            raise ValueError(
+                f"model ids collide across LLM and embedding lists: {sorted(overlap)}"
+            )
+        return self
+
     def find_model(self, model_id: str) -> ModelEntry | None:
-        """Return the model entry matching ``model_id`` or None."""
+        """Return the LLM model entry matching ``model_id`` or None."""
         return next((m for m in self.models if m.id == model_id), None)
 
+    def find_embedding_model(self, model_id: str) -> EmbeddingModelEntry | None:
+        """Return the embedding model entry matching ``model_id`` or None."""
+        return next((m for m in self.embedding_models if m.id == model_id), None)
+
     def default_model(self) -> ModelEntry:
-        """Return the first declared model (used when client omits ``llm_model``)."""
+        """Return the first declared LLM model (fallback for ``llm_model`` omission)."""
         return self.models[0]
 
 

@@ -182,6 +182,93 @@ async def test_validation_error_out_of_range_temperature(app: FastAPI) -> None:
 
 
 @pytest.mark.asyncio
+async def test_safety_identifier_preferred_over_user(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """OpenAI 2025+ deprecates ``user`` in favor of ``safety_identifier``.
+    When both are present, ``safety_identifier`` wins; we forward whichever
+    is resolved as ``user`` to Dify (Dify only knows that field name).
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "old-style-user-id",
+                "safety_identifier": "new-style-user-id",
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["user"] == "new-style-user-id"
+
+
+@pytest.mark.asyncio
+async def test_user_field_alone_still_accepted(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Backwards compatibility: clients on OpenAI SDK <2025 still write ``user``
+    and must keep working."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "legacy-user-id",
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["user"] == "legacy-user-id"
+
+
+@pytest.mark.asyncio
+async def test_max_completion_tokens_accepted(app: FastAPI) -> None:
+    """``max_completion_tokens`` (OpenAI 2025+ replacement for ``max_tokens``)
+    must validate successfully. Behavior is currently informational only —
+    Dify's App config controls the actual cap — but the request must not
+    400-reject on the new field name."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 128,
+            },
+        )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_both_max_tokens_fields_accepted_together(app: FastAPI) -> None:
+    """When both ``max_tokens`` and ``max_completion_tokens`` are sent, the
+    request still succeeds. ``ChatCompletionRequest.effective_max_tokens``
+    resolves precedence (new > old) for any downstream logic that needs it."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 256,
+                "max_completion_tokens": 128,
+            },
+        )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_extra_body_llm_model_overrides_app_selection(
     app: FastAPI, fake_dify: FakeDifyClient
 ) -> None:

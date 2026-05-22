@@ -49,8 +49,22 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = Field(default=False)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+
+    # Token limit: OpenAI deprecated ``max_tokens`` in favor of ``max_completion_tokens``
+    # for reasoning models (o1, o3, GPT-5 thinking). Both are accepted; ``max_completion_tokens``
+    # takes precedence when both are set. Downstream (vLLM/Dify) only recognises
+    # ``max_tokens``, so the router forwards whichever value was resolved as ``max_tokens``.
     max_tokens: int | None = Field(default=None, gt=0)
-    user: str | None = Field(default=None, description="Stable end-user identifier")
+    max_completion_tokens: int | None = Field(default=None, gt=0)
+
+    # End-user identifier: OpenAI deprecated ``user`` in favor of ``safety_identifier``.
+    # Dify's chat-messages API requires ``user``, so we accept both and forward
+    # whichever was provided (preferring ``safety_identifier`` when both set).
+    user: str | None = Field(default=None, description="Stable end-user identifier (deprecated alias)")
+    safety_identifier: str | None = Field(
+        default=None,
+        description="OpenAI 2025+ replacement for ``user``; preferred when both are provided",
+    )
 
     # Gateway extensions (kept under ``extra_body`` for client SDK compatibility).
     # The OpenAI Python SDK flattens ``extra_body={"foo":...}`` into top-level
@@ -65,6 +79,16 @@ class ChatCompletionRequest(BaseModel):
             "otherwise it falls back to the standard ``model`` field."
         ),
     )
+
+    @property
+    def effective_max_tokens(self) -> int | None:
+        """Resolve the token cap honoring OpenAI's deprecation precedence."""
+        return self.max_completion_tokens if self.max_completion_tokens is not None else self.max_tokens
+
+    @property
+    def effective_user(self) -> str | None:
+        """Resolve the end-user identifier honoring OpenAI's deprecation precedence."""
+        return self.safety_identifier if self.safety_identifier is not None else self.user
 
 
 # ---------- Response (non-streaming) ----------
@@ -187,6 +211,72 @@ class ModelList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ModelInfo]
+
+
+# ---------- /v1/embeddings ----------
+
+
+class EmbeddingsRequest(BaseModel):
+    """OpenAI-compatible embeddings request.
+
+    Reference: https://platform.openai.com/docs/api-reference/embeddings/create
+
+    The ``input`` field accepts a single string or a list of strings. OpenAI
+    also accepts list-of-tokens (int) and list-of-list-of-tokens; we do not
+    implement those here — most clients (LangChain, LlamaIndex) only send
+    strings, and the upstream (vLLM) accepts whatever we forward.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(min_length=1)
+    input: str | list[str] = Field(description="A single string or list of strings to embed")
+    encoding_format: Literal["float", "base64"] | None = Field(
+        default=None,
+        description="Defaults to 'float' upstream. Pass through unchanged.",
+    )
+    dimensions: int | None = Field(
+        default=None,
+        gt=0,
+        description="Truncate output dimensions. Only supported by some models.",
+    )
+
+    # OpenAI 2025 deprecation aliases — accept both, prefer new.
+    user: str | None = Field(default=None, description="Stable end-user identifier (deprecated alias)")
+    safety_identifier: str | None = Field(
+        default=None,
+        description="OpenAI 2025+ replacement for ``user``",
+    )
+
+    @property
+    def effective_user(self) -> str | None:
+        return self.safety_identifier if self.safety_identifier is not None else self.user
+
+
+class EmbeddingData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["embedding"] = "embedding"
+    index: int
+    embedding: list[float] | str  # str = base64-encoded when encoding_format="base64"
+
+
+class EmbeddingsUsage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingsResponse(BaseModel):
+    """OpenAI-compatible embeddings response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[EmbeddingData]
+    model: str
+    usage: EmbeddingsUsage = Field(default_factory=EmbeddingsUsage)
 
 
 def make_metadata(

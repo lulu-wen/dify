@@ -13,13 +13,20 @@ from gateway.config import Settings
 from gateway.dify.client import ConsoleSession, DifyClient
 from gateway.errors import DifyUpstreamError
 from gateway.main import create_app
-from gateway.registry import CustomerEntry, CustomerRegistry, DifyConnection, ModelEntry
+from gateway.registry import (
+    CustomerEntry,
+    CustomerRegistry,
+    DifyConnection,
+    EmbeddingModelEntry,
+    ModelEntry,
+)
 
 
 def make_customer(
     sdk_key: str = "bsa_test_a",
     customer_id: str = "test-a",
     model_ids: tuple[str, ...] = ("m1",),
+    embedding_model_ids: tuple[str, ...] = ("emb1",),
     knowledge_bases: list[str] | None = None,
 ) -> CustomerEntry:
     return CustomerEntry(
@@ -34,6 +41,17 @@ def make_customer(
         models=[
             ModelEntry(id=mid, provider="prov", name="n", completion_params={})
             for mid in model_ids
+        ],
+        embedding_models=[
+            EmbeddingModelEntry(
+                id=eid,
+                name=f"upstream-{eid}",
+                owner="TestPublisher",
+                endpoint_url="http://embed.test/v1",
+                api_key="EMPTY",
+                dimensions=1024,
+            )
+            for eid in embedding_model_ids
         ],
         knowledge_bases=knowledge_bases or [],
     )
