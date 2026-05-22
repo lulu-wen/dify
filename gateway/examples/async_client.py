@@ -31,7 +31,7 @@ async def main() -> None:
     stream = await client.chat.completions.create(
         model="qwen3.6-35b",
         messages=[
-            {"role": "user", "content": "說明 ALM-002 的處理流程，逐步思考"},
+            {"role": "user", "content": "說明 ALM-002 的處理流程，逐步思考"},  # noqa: RUF001 (intentional Chinese punctuation)
         ],
         stream=True,
     )

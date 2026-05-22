@@ -9,14 +9,20 @@ Conversation handling:
     tracks conversations server-side keyed by ``conversation_id``. We take the
     *last user message* as the Dify ``query`` and forward
     ``extra_body.conversation_id`` (if any) so clients can opt into Dify-side
-    history. Previous turns in ``messages`` are forwarded as ``inputs.history``
-    text for the App to optionally reference.
+    history.
+
+    System messages and prior turns are bundled into a single
+    ``inputs.system_prompt`` payload that the Dify App expands via the
+    ``{{system_prompt}}`` template variable declared in ``dsl.py``. Dify's
+    chat App then wraps that text as the LLM's system role message. Without
+    this assembly OpenAI ``system`` messages would never reach the LLM —
+    Dify silently drops ``inputs`` keys not referenced by ``pre_prompt``.
 """
 
 from __future__ import annotations
 
 import json
-import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
 import structlog
@@ -55,35 +61,51 @@ def _last_user_message(messages: list[ChatMessage]) -> str:
     raise InvalidRequestError("messages must contain at least one user message", param="messages")
 
 
-def _serialise_history(messages: list[ChatMessage]) -> str:
-    """Render prior turns (excluding the final user message) as plain text.
+def _build_system_prompt(messages: list[ChatMessage]) -> str:
+    """Assemble OpenAI ``system`` messages + prior turns into one block.
 
-    Forwarded as ``inputs.history`` so the Dify App can include it via
-    template substitution if its pre-prompt expects it.
+    The returned string is sent as ``inputs.system_prompt`` and reaches the
+    LLM as its system-role prompt (see module docstring + ``dsl.py``). Empty
+    return is fine — Dify substitutes it as an empty system message, which
+    is the same behaviour as the legacy empty ``pre_prompt``.
     """
     if not messages:
         return ""
-    # Drop the trailing user message; the rest is "history".
+
+    system_text = "\n".join(
+        m.content for m in messages if m.role == "system" and m.content
+    )
+
+    # Prior conversation = everything before the final user turn, excluding
+    # the system messages already captured above (so we don't duplicate them).
     if messages[-1].role == "user":
-        prior = messages[:-1]
+        prior_turns = messages[:-1]
     else:
-        prior = list(messages)
-    parts: list[str] = []
-    for m in prior:
-        if not m.content:
-            continue
-        parts.append(f"{m.role}: {m.content}")
-    return "\n".join(parts)
+        prior_turns = list(messages)
+    history_lines = [
+        f"{m.role}: {m.content}"
+        for m in prior_turns
+        if m.content and m.role != "system"
+    ]
+
+    sections: list[str] = []
+    if system_text:
+        sections.append(system_text)
+    if history_lines:
+        sections.append("Previous conversation:\n" + "\n".join(history_lines))
+    return "\n\n".join(sections)
 
 
 def _user_id(req: ChatCompletionRequest, customer: CustomerEntry, request_id: str) -> str:
     """Stable end-user identifier sent to Dify.
 
-    Prefers ``request.user`` (OpenAI standard); falls back to a deterministic
-    per-customer fallback when omitted, since Dify requires this field.
+    Honors OpenAI's deprecation precedence via ``effective_user``
+    (``safety_identifier`` > ``user``). Falls back to a deterministic
+    per-customer identifier when both are omitted, since Dify requires this field.
     """
-    if req.user:
-        return req.user
+    resolved = req.effective_user
+    if resolved:
+        return resolved
     # Use ``customer_id:request_id`` as fallback; not ideal for cross-call
     # personalisation but unambiguous for tracing.
     return f"{customer.customer_id}:{request_id}"
@@ -142,10 +164,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     dify_client: DifyClient = dify_factory(customer)
 
     query = _last_user_message(body.messages)
-    history_text = _serialise_history(body.messages)
-    inputs: dict[str, Any] = {}
-    if history_text:
-        inputs["history"] = history_text
+    inputs: dict[str, Any] = {"system_prompt": _build_system_prompt(body.messages)}
 
     user = _user_id(body, customer, request_id)
 
@@ -169,7 +188,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         # synchronously which is exactly what we want before sending headers.
         dify_lines = await stream_cm.__aenter__()
 
-        async def event_source():  # type: ignore[no-untyped-def]
+        async def event_source() -> AsyncIterator[str]:
             try:
                 async for chunk in dify_to_openai_chunks(
                     dify_lines, request_id=request_id, model_id=selected_model
@@ -180,7 +199,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                 # the response has already started streaming.
                 try:
                     await stream_cm.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("chat.stream_close_failed")
 
         return StreamingResponse(

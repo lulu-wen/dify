@@ -108,9 +108,15 @@ async def test_blocking_no_user_message_returns_400(app: FastAPI) -> None:
 
 
 @pytest.mark.asyncio
-async def test_blocking_forwards_history_and_conversation_id(
+async def test_blocking_forwards_system_prompt_and_conversation_id(
     app: FastAPI, fake_dify: FakeDifyClient
 ) -> None:
+    """System message + prior turns must reach Dify as ``inputs.system_prompt``
+    so the App's ``{{system_prompt}}`` template can wrap them as the LLM's
+    system-role message. Regression for the silent-drop bug where system
+    messages went into ``inputs.history`` and Dify discarded them because
+    ``pre_prompt`` had no ``{{history}}`` reference.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         await cli.post(
@@ -131,10 +137,74 @@ async def test_blocking_forwards_history_and_conversation_id(
     sent = fake_dify.calls["blocking"][0]
     assert sent["query"] == "Q2"
     assert sent["conversation_id"] == "conv-from-client"
-    assert "history" in sent["inputs"]
-    assert "system: Be concise." in sent["inputs"]["history"]
-    assert "user: Q1" in sent["inputs"]["history"]
-    assert "assistant: A1" in sent["inputs"]["history"]
+    assert "system_prompt" in sent["inputs"]
+    payload = sent["inputs"]["system_prompt"]
+    assert "Be concise." in payload
+    assert "user: Q1" in payload
+    assert "assistant: A1" in payload
+    # System text must not be repeated inside the history block — system
+    # messages are captured once at the top, not again as "system: ..." lines.
+    assert "system: Be concise." not in payload
+
+
+@pytest.mark.asyncio
+async def test_blocking_system_only_reaches_dify_as_inputs_system_prompt(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Single-turn requests with a system message — the most common
+    translation / instruction shape — must deliver the system content
+    to Dify via ``inputs.system_prompt``. This is the case the live Jetson
+    verification hit when ``inputs.history`` was being silently dropped.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a translator. Translate Chinese to English. "
+                            "Keep RSRP, SINR as-is."
+                        ),
+                    },
+                    {"role": "user", "content": "基站 RSRP -110 dBm"},
+                ],
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["query"] == "基站 RSRP -110 dBm"
+    assert sent["inputs"]["system_prompt"].startswith("You are a translator.")
+    # No "Previous conversation" block when there are no prior turns.
+    assert "Previous conversation" not in sent["inputs"]["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_single_user_message_emits_empty_system_prompt(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Bare user message (no system, no history) still produces an
+    ``inputs.system_prompt`` key — Dify needs it declared so the
+    ``{{system_prompt}}`` substitution doesn't leave a literal placeholder
+    in the prompt sent to the LLM.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["inputs"]["system_prompt"] == ""
 
 
 @pytest.mark.asyncio
@@ -179,6 +249,93 @@ async def test_validation_error_out_of_range_temperature(app: FastAPI) -> None:
     assert r.status_code == 400
     body = r.json()
     assert body["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_safety_identifier_preferred_over_user(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """OpenAI 2025+ deprecates ``user`` in favor of ``safety_identifier``.
+    When both are present, ``safety_identifier`` wins; we forward whichever
+    is resolved as ``user`` to Dify (Dify only knows that field name).
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "old-style-user-id",
+                "safety_identifier": "new-style-user-id",
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["user"] == "new-style-user-id"
+
+
+@pytest.mark.asyncio
+async def test_user_field_alone_still_accepted(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """Backwards compatibility: clients on OpenAI SDK <2025 still write ``user``
+    and must keep working."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "legacy-user-id",
+            },
+        )
+
+    sent = fake_dify.calls["blocking"][0]
+    assert sent["user"] == "legacy-user-id"
+
+
+@pytest.mark.asyncio
+async def test_max_completion_tokens_accepted(app: FastAPI) -> None:
+    """``max_completion_tokens`` (OpenAI 2025+ replacement for ``max_tokens``)
+    must validate successfully. Behavior is currently informational only —
+    Dify's App config controls the actual cap — but the request must not
+    400-reject on the new field name."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 128,
+            },
+        )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_both_max_tokens_fields_accepted_together(app: FastAPI) -> None:
+    """When both ``max_tokens`` and ``max_completion_tokens`` are sent, the
+    request still succeeds. ``ChatCompletionRequest.effective_max_tokens``
+    resolves precedence (new > old) for any downstream logic that needs it."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        r = await cli.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer bsa_test_a"},
+            json={
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 256,
+                "max_completion_tokens": 128,
+            },
+        )
+    assert r.status_code == 200
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    "python-multipart>=0.0.18",
     "pyyaml>=6.0",
     "structlog>=24.4",
 ]
@@ -22,6 +23,7 @@ dev = [
     "respx>=0.21",
     "ruff>=0.7",
     "mypy>=1.13",
+    "types-PyYAML>=6.0",
 ]
 
 [build-system]

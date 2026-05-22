@@ -31,13 +31,13 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 import structlog
 
 from gateway.dify.client import ConsoleSession, DifyClient
-from gateway.dify.dsl import build_chat_app_dsl
+from gateway.dify.dsl import DSL_VERSION, build_chat_app_dsl
 from gateway.errors import DifyUpstreamError, UnknownModelError
 from gateway.registry import CustomerEntry, CustomerRegistry, ModelEntry
 
@@ -58,6 +58,11 @@ class CachedApp:
     the TTL. Using ``default_factory=time.time`` would tie creation time to
     the real wall clock, which mismatches the GC sweep's view of ``now``
     when a fake clock is in use.
+
+    ``dsl_version`` stamps the DSL revision the cached App was built from.
+    When :data:`gateway.dify.dsl.DSL_VERSION` later changes, mismatched
+    entries are evicted and rebuilt on next request so the new DSL takes
+    effect without operator intervention.
     """
 
     customer_id: str
@@ -66,6 +71,7 @@ class CachedApp:
     app_key: str
     created_at: float
     last_used_at: float
+    dsl_version: str
 
 
 @dataclass
@@ -131,23 +137,68 @@ class AppManager:
 
         cache_key = (customer.customer_id, model.id)
 
-        # Fast path: cached.
+        # Fast path: cached and DSL version matches the current build.
         cached = self._apps.get(cache_key)
-        if cached is not None:
+        if cached is not None and cached.dsl_version == DSL_VERSION:
             cached.last_used_at = self._clock()
             return cached.app_key
 
-        # Slow path: build under a lock.
+        # Slow path: rebuild (either nothing cached, or stale DSL).
         async with self._app_locks[cache_key]:
             # Re-check after acquiring lock (another task may have built it).
             cached = self._apps.get(cache_key)
-            if cached is not None:
+            if cached is not None and cached.dsl_version == DSL_VERSION:
                 cached.last_used_at = self._clock()
                 return cached.app_key
+
+            stale = cached  # only set when version mismatched
+            if stale is not None:
+                # Best-effort cleanup of the stale Dify-side App so the
+                # workspace doesn't accumulate orphans on every DSL bump.
+                await self._evict_stale(cache_key, stale)
 
             cached = await self._build_app(customer, model)
             self._apps[cache_key] = cached
             return cached.app_key
+
+    async def _evict_stale(
+        self, key: tuple[str, str], stale: CachedApp
+    ) -> None:
+        """Delete the Dify-side App for a stale cache entry. Best-effort:
+        failures are logged but never block the rebuild path. Caller already
+        holds the per-key lock.
+        """
+        customer = self._registry.find_by_customer_id(stale.customer_id)
+        if customer is None:
+            self._apps.pop(key, None)
+            return
+        try:
+            client = self._client_factory(customer)
+
+            async def delete(session: ConsoleSession) -> str:
+                await client.console_delete_app(session, stale.app_id)
+                return ""
+
+            await self._with_session(customer, client, delete)
+        except Exception:
+            logger.warning(
+                "app_manager.stale_delete_failed",
+                customer_id=stale.customer_id,
+                model_id=stale.model_id,
+                app_id=stale.app_id,
+                cached_dsl_version=stale.dsl_version,
+                current_dsl_version=DSL_VERSION,
+                exc_info=True,
+            )
+        finally:
+            logger.info(
+                "app_manager.dsl_version_rebuild",
+                customer_id=stale.customer_id,
+                model_id=stale.model_id,
+                cached_dsl_version=stale.dsl_version,
+                current_dsl_version=DSL_VERSION,
+            )
+            self._apps.pop(key, None)
 
     async def start(self) -> None:
         """Launch the background GC task. Call after asyncio loop is running."""
@@ -161,7 +212,7 @@ class AppManager:
             self._gc_task.cancel()
             try:
                 await self._gc_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
             self._gc_task = None
 
@@ -175,8 +226,16 @@ class AppManager:
 
     async def _build_app(self, customer: CustomerEntry, model: ModelEntry) -> CachedApp:
         client = self._client_factory(customer)
+        # PR #4 review-2 P2: route through the IsolationStrategy so the App
+        # naming contract has one source of truth. Both DedicatedStrategy
+        # and SharedStrategy currently return "{customer_id}:{model_id}",
+        # preserving PR #1-#3 naming so existing Apps in Dify don't orphan.
+        # Future modes (regional, environment-tagged) can override.
+        from gateway.mode import isolation_strategy_for
+        strategy = isolation_strategy_for(customer)
+        app_label = strategy.app_name(customer.customer_id, model.id)
         dsl = build_chat_app_dsl(
-            name=f"auto:{customer.customer_id}:{model.id}",
+            name=f"auto:{app_label}",
             description=f"Auto-built by AI SDK Gateway for customer={customer.customer_id} model={model.id}",
             provider=model.provider,
             model_name=model.name,
@@ -212,6 +271,7 @@ class AppManager:
             app_key=app_key,
             created_at=now,
             last_used_at=now,
+            dsl_version=DSL_VERSION,
         )
 
     async def _with_session(
@@ -282,7 +342,7 @@ class AppManager:
                 return
             try:
                 await self._gc_sweep()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("app_manager.gc_failed")
 
     async def _gc_sweep(self) -> None:
@@ -316,7 +376,7 @@ class AppManager:
 
                     await self._with_session(customer, client, delete)
                     deleted = True
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # GC must never crash the loop. Log and proceed to evict
                     # the cache entry anyway so the next request re-builds.
                     logger.warning(

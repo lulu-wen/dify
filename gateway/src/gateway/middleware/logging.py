@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 import structlog
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from structlog.types import Processor
 
 logger = structlog.get_logger(__name__)
 
@@ -75,7 +76,7 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
 
     timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
 
-    shared_processors = [
+    shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         timestamper,

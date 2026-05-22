@@ -66,6 +66,20 @@ class UnknownModelError(GatewayError):
     code = "model_not_found"
 
 
+class UnknownDatasetError(GatewayError):
+    """Client referenced a dataset they don't own (or that doesn't exist). → 404.
+
+    In shared mode (PR #4) this fires when a customer passes a dataset UUID
+    belonging to another customer. The envelope is identical to a Dify 404
+    so a caller can't distinguish «exists but not yours» from «doesn't
+    exist» — prevents leaking existence of other customers' datasets.
+    """
+
+    status_code = 404
+    error_type = "invalid_request_error"
+    code = "dataset_not_found"
+
+
 class InvalidRequestError(GatewayError):
     """Request body fails OpenAI schema or contradicts gateway constraints. → 400."""
 
@@ -92,6 +106,35 @@ class DifyUpstreamError(GatewayError):
     status_code = 502
     error_type = "upstream_error"
     code = "dify_upstream_error"
+
+
+class UpstreamClientError(GatewayError):
+    """Upstream service rejected the request with a 4xx — pass it through.
+
+    When a proxying path (e.g. ``/v1/embeddings``) forwards a request the
+    gateway couldn't fully validate (model-specific limits, dimensions that
+    the upstream doesn't support, payload too large), and the upstream
+    returns a 4xx, that is **client error** semantics — not a gateway
+    failure. Surfacing it as ``DifyUpstreamError`` (502) would mislead
+    clients into retrying or treating their own bad input as an outage.
+
+    The upstream's status code is preserved so a 413 stays 413, a 422
+    stays 422, etc.
+    """
+
+    error_type = "invalid_request_error"
+    code = "upstream_invalid_request"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        upstream_status: int,
+        param: str | None = None,
+    ) -> None:
+        super().__init__(message, param=param)
+        # Override the class-level default; the FastAPI handler reads this.
+        self.status_code = upstream_status
 
 
 class DifyTimeoutError(GatewayError):

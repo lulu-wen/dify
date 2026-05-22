@@ -33,15 +33,37 @@ v1.x but pinning a Dify version is recommended.
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
 
-from gateway.errors import DifyTimeoutError, DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
+
+# Dify Service API 4xx statuses that describe a *client* mistake on the
+# dataset / document path. Surface these as ``UpstreamClientError`` so the
+# SDK caller sees the original 4xx — not a misleading 502 about gateway
+# health. 401 / 429 still go through ``DifyUpstreamError`` because those
+# describe gateway-side problems (wrong dataset_api_key in registry,
+# gateway hitting the upstream rate limit) the SDK caller can't fix.
+#
+# What each status means in the dataset / document context:
+#   400 — invalid request shape (missing field, bad type)
+#   403 — per-dataset disabled / per-tenant quota refused this operation
+#         (codex review-3 P2 — Dify uses 403 for archived datasets and
+#         disabled-API checks, both of which the caller can act on)
+#   404 — dataset UUID / document id doesn't exist (wrong id)
+#   409 — duplicate dataset name (name conflict)
+#   413 — file payload too large (per-tenant or system limit)
+#   415 — unsupported file type during create-by-file (codex review-3 P2)
+#   422 — schema validation failed
+_DATASET_CLIENT_STATUSES: frozenset[int] = frozenset(
+    {400, 403, 404, 409, 413, 415, 422}
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -100,7 +122,7 @@ class DifyClient:
     def base_url(self) -> str:
         return self._base_url
 
-    async def __aenter__(self) -> "DifyClient":
+    async def __aenter__(self) -> DifyClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -151,7 +173,7 @@ class DifyClient:
             raise DifyUpstreamError(f"Dify request failed: {e}") from e
 
         _raise_for_dify_status(resp)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     @asynccontextmanager
     async def open_chat_stream(
@@ -212,7 +234,7 @@ class DifyClient:
         if not resp.is_success:
             try:
                 await resp.aread()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass  # body unreadable; fall through to status-only error
             try:
                 _raise_for_dify_status(resp)
@@ -232,6 +254,250 @@ class DifyClient:
             yield iter_lines()
         finally:
             await cm.__aexit__(None, None, None)
+
+    # ------------------------------------------------------------------ #
+    # Service API: Datasets (knowledge base CRUD)                        #
+    # ------------------------------------------------------------------ #
+    #
+    # Datasets use a different auth key than chat-messages: the customer's
+    # ``dataset_api_key`` from their Dify deployment (set per-customer in
+    # the registry's ``DifyConnection``). The wire protocol is the same
+    # ``Authorization: Bearer <key>`` pattern, just a different key value.
+    # Dataset IDs in URLs are Dify-issued UUIDs.
+
+    async def create_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets`` — create a new dataset.
+
+        ``payload`` shape (subset of Dify's ``DatasetCreatePayload``):
+            * ``name`` (required)
+            * ``description``
+            * ``indexing_technique`` ("high_quality" | "economy")
+            * ``embedding_model``, ``embedding_model_provider``
+            * ``permission``, ``provider``, ``retrieval_model``, ...
+
+        The gateway router fills in ``embedding_model_provider`` based on
+        the customer registry; callers should pass the resolved payload.
+        """
+        try:
+            resp = await self._http.post(
+                "/v1/datasets",
+                headers=_bearer(dataset_api_key),
+                json=dict(payload),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify create-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify create-dataset failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
+
+    async def list_datasets(
+        self,
+        *,
+        dataset_api_key: str,
+        page: int = 1,
+        limit: int = 20,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets`` — list datasets visible to the API key.
+
+        Returns the raw Dify envelope:
+        ``{"data": [...], "has_more": bool, "limit": int, "total": int, "page": int}``.
+        The gateway router reshapes this into the OpenAI-style response.
+        """
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if keyword:
+            params["keyword"] = keyword
+        try:
+            resp = await self._http.get(
+                "/v1/datasets",
+                headers=_bearer(dataset_api_key),
+                params=params,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify list-datasets timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify list-datasets failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
+
+    async def get_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets/{uuid}`` — fetch a single dataset's metadata."""
+        try:
+            resp = await self._http.get(
+                f"/v1/datasets/{dataset_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify get-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify get-dataset failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
+
+    async def delete_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+    ) -> None:
+        """``DELETE /v1/datasets/{uuid}`` — remove a dataset.
+
+        Idempotent in the GC sense: a 404 from Dify is treated as success
+        (the dataset is already gone), matching the chat-app delete pattern.
+        """
+        try:
+            resp = await self._http.delete(
+                f"/v1/datasets/{dataset_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify delete-dataset timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify delete-dataset failed: {e}") from e
+        if resp.status_code == 404:
+            return
+        _raise_for_dify_status(resp, pass_client_errors=True)
+
+    async def create_document_by_file(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+        indexing_technique: str = "high_quality",
+        process_mode: str = "automatic",
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets/{uuid}/document/create-by-file`` — upload a file.
+
+        Dify expects ``multipart/form-data`` with two parts:
+            * ``file`` — the binary content (with filename + Content-Type)
+            * ``data`` — a JSON string carrying ``indexing_technique`` +
+              ``process_rule`` and any other knobs.
+
+        We default ``process_rule.mode = "automatic"`` so Dify picks sensible
+        chunking; customers needing custom chunking go through Dify directly
+        (out of PR #3 scope).
+
+        Memory note: ``content`` is a bytes blob (the caller has already
+        read the request stream into memory). Sufficient for typical KB
+        docs (<100 MB); large-file streaming is a follow-up if needed.
+        """
+        data_payload = {
+            "indexing_technique": indexing_technique,
+            "process_rule": {"mode": process_mode},
+        }
+        files = {"file": (filename, content, content_type)}
+        data = {"data": json.dumps(data_payload)}
+        # Don't use the Content-Type from _bearer — httpx sets multipart
+        # boundary automatically; an explicit application/json header here
+        # would silently override it and break the upload.
+        headers = {"Authorization": f"Bearer {dataset_api_key}"}
+        try:
+            resp = await self._http.post(
+                f"/v1/datasets/{dataset_id}/document/create-by-file",
+                headers=headers,
+                files=files,
+                data=data,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify create-by-file timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify create-by-file failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
+
+    async def list_documents(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        page: int = 1,
+        limit: int = 20,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """``GET /v1/datasets/{uuid}/documents`` — list documents in a dataset."""
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if keyword:
+            params["keyword"] = keyword
+        try:
+            resp = await self._http.get(
+                f"/v1/datasets/{dataset_id}/documents",
+                headers=_bearer(dataset_api_key),
+                params=params,
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify list-documents timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify list-documents failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
+
+    async def delete_document(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        document_id: str,
+    ) -> None:
+        """``DELETE /v1/datasets/{uuid}/documents/{document_id}`` — remove a document.
+
+        404 is treated as idempotent success (matches the dataset / app
+        delete pattern).
+        """
+        try:
+            resp = await self._http.delete(
+                f"/v1/datasets/{dataset_id}/documents/{document_id}",
+                headers=_bearer(dataset_api_key),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify delete-document timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify delete-document failed: {e}") from e
+        if resp.status_code == 404:
+            return
+        _raise_for_dify_status(resp, pass_client_errors=True)
+
+    async def retrieve_dataset(
+        self,
+        *,
+        dataset_api_key: str,
+        dataset_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """``POST /v1/datasets/{uuid}/retrieve`` — pure-retrieval (hit-testing).
+
+        ``payload`` shape:
+            * ``query`` (required)
+            * ``retrieval_model`` (optional override)
+            * ``external_retrieval_model``
+
+        Returns ``{"query": {...}, "records": [{segment, score, ...}]}``.
+        """
+        try:
+            resp = await self._http.post(
+                f"/v1/datasets/{dataset_id}/retrieve",
+                headers=_bearer(dataset_api_key),
+                json=dict(payload),
+            )
+        except httpx.TimeoutException as e:
+            raise DifyTimeoutError("Dify dataset-retrieve timed out") from e
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify dataset-retrieve failed: {e}") from e
+        _raise_for_dify_status(resp, pass_client_errors=True)
+        return cast(dict[str, Any], resp.json())
 
     # ------------------------------------------------------------------ #
     # Console API (App management)                                       #
@@ -393,15 +659,27 @@ def _read_cookie_with_name(
     return None, base_name
 
 
-def _raise_for_dify_status(resp: httpx.Response) -> None:
-    """Translate non-2xx HTTP responses into gateway domain errors."""
+def _raise_for_dify_status(
+    resp: httpx.Response,
+    *,
+    pass_client_errors: bool = False,
+) -> None:
+    """Translate non-2xx HTTP responses into gateway domain errors.
+
+    ``pass_client_errors=True`` (used by dataset / document methods) preserves
+    expected client-shape 4xx (``_DATASET_CLIENT_STATUSES`` — wrong UUID,
+    duplicate name, oversized file, schema error) as ``UpstreamClientError``,
+    so the SDK caller sees the right 4xx instead of a misleading 502.
+    Other 4xx (401/403/429) and 5xx still surface as ``DifyUpstreamError``;
+    those are gateway-side credential / rate-limit / outage signals.
+    """
     if resp.is_success:
         return
 
     body_preview: str = ""
     try:
         body_preview = resp.text[:_ERR_BODY_TRUNCATE]
-    except Exception:  # noqa: BLE001
+    except Exception:
         # ``resp.text`` may raise on streaming responses; fall through.
         body_preview = "<body unreadable>"
 
@@ -412,6 +690,12 @@ def _raise_for_dify_status(resp: httpx.Response) -> None:
         url=str(resp.request.url),
         body=body_preview,
     )
+
+    if pass_client_errors and resp.status_code in _DATASET_CLIENT_STATUSES:
+        raise UpstreamClientError(
+            f"Dify rejected request (HTTP {resp.status_code}): {body_preview}",
+            upstream_status=resp.status_code,
+        )
 
     raise DifyUpstreamError(
         f"Dify returned HTTP {resp.status_code}: {body_preview}",

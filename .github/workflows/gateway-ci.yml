@@ -1,0 +1,80 @@
+name: Gateway CI
+
+# Run on PRs and pushes that touch the gateway tree (or its CI config).
+# Path filter keeps this off Dify-core changes that don't affect us.
+on:
+  pull_request:
+    paths:
+      - "gateway/**"
+      - ".github/workflows/gateway-ci.yml"
+  push:
+    branches:
+      - main
+      - "feat/ai-sdk-gateway-**"
+    paths:
+      - "gateway/**"
+      - ".github/workflows/gateway-ci.yml"
+
+# Cancel in-flight runs for the same ref when a new commit arrives — saves
+# minutes when pushing rapid fixes during code review.
+concurrency:
+  group: gateway-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: gateway
+
+jobs:
+  test:
+    name: pytest + lint + typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pin to 3.11 (the lowest supported version) so we catch syntax/typing
+        # regressions that would break on the older runtime first. Add 3.12 /
+        # 3.13 to the matrix when we want to gate on the newer ones too.
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: gateway/pyproject.toml
+
+      - name: Install gateway + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        # Non-blocking for now (no formatter committed yet); switch to
+        # `ruff format --check .` once we commit a formatting pass.
+        run: ruff format --check . || true
+
+      - name: Mypy strict typecheck
+        # Strict mode per pyproject.toml. Keep this hard-gating so the
+        # gateway's type guarantees don't silently regress.
+        run: mypy src/
+
+      - name: Pytest
+        run: pytest -v --tb=short
+
+      - name: Upload coverage (optional)
+        if: always()
+        run: |
+          # Coverage threshold isn't enforced yet; this just produces the
+          # artifact so we can track trends. Add `--cov-fail-under=N` to
+          # the pytest invocation once we agree on a floor.
+          pytest --cov=gateway --cov-report=term-missing --cov-report=xml --tb=no -q || true
