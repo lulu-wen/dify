@@ -11,7 +11,6 @@ from fastapi import FastAPI
 
 from gateway.config import Settings
 from gateway.dify.client import ConsoleSession, DifyClient
-from gateway.errors import DifyUpstreamError
 from gateway.main import create_app
 from gateway.registry import (
     CustomerEntry,
@@ -50,6 +49,11 @@ def make_customer(
                 endpoint_url="http://embed.test/v1",
                 api_key="EMPTY",
                 dimensions=1024,
+                # PR #3 review-2 P2: dataset creation now requires provider.
+                # Default fixture sets it so the bulk of tests get a sane
+                # baseline; tests that exercise the "provider missing"
+                # branch build their own entry.
+                provider="langgenius/openai_api_compatible/openai_api_compatible",
             )
             for eid in embedding_model_ids
         ],
@@ -86,6 +90,48 @@ class FakeDifyClient:
         self.import_app_ids = ["app-id-1", "app-id-2", "app-id-3"]
         self.api_key_tokens = ["app-key-1", "app-key-2", "app-key-3"]
 
+        # Dataset (PR #3 R2/R4/R5) scriptable responses. Tests assign whatever
+        # shape they want to assert on; defaults are deliberately minimal so a
+        # test that doesn't override these still exercises the schema.
+        self.dataset_create_response: dict[str, Any] = {
+            "id": "ds-uuid-1",
+            "name": "default-ds",
+            "description": "",
+            "indexing_technique": "high_quality",
+            "embedding_model": "upstream-emb1",
+            "embedding_model_provider": None,
+            "document_count": 0,
+            "word_count": 0,
+            "created_at": 1700000000,
+        }
+        self.dataset_list_response: dict[str, Any] = {
+            "data": [],
+            "has_more": False,
+            "limit": 20,
+            "total": 0,
+            "page": 1,
+        }
+        self.dataset_get_response: dict[str, Any] | None = None
+        self.dataset_retrieve_response: dict[str, Any] = {"query": {}, "records": []}
+        # File/document responses (R3).
+        self.file_upload_response: dict[str, Any] = {
+            "id": "doc-uuid-1",
+            "name": "default.txt",
+            "indexing_status": "waiting",
+            "word_count": 0,
+            "created_at": 1700000000,
+        }
+        self.file_list_response: dict[str, Any] = {
+            "data": [],
+            "has_more": False,
+            "limit": 20,
+            "total": 0,
+            "page": 1,
+        }
+        # Set to an exception instance to simulate a Dify failure on a given op.
+        self.dataset_error: BaseException | None = None
+        self.file_error: BaseException | None = None
+
         self.calls: dict[str, list[Any]] = {
             "blocking": [],
             "streaming": [],
@@ -93,6 +139,14 @@ class FakeDifyClient:
             "import": [],
             "api_key": [],
             "delete": [],
+            "dataset_create": [],
+            "dataset_list": [],
+            "dataset_get": [],
+            "dataset_delete": [],
+            "dataset_retrieve": [],
+            "doc_upload": [],
+            "doc_list": [],
+            "doc_delete": [],
         }
 
     async def chat_messages_blocking(self, **kwargs: Any) -> dict[str, Any]:
@@ -126,6 +180,57 @@ class FakeDifyClient:
 
     async def console_delete_app(self, session: ConsoleSession, app_id: str) -> None:
         self.calls["delete"].append((session, app_id))
+
+    # ----- PR #3 dataset methods -----
+
+    async def create_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_create"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_create_response
+
+    async def list_datasets(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_list"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_list_response
+
+    async def get_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_get"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        if self.dataset_get_response is not None:
+            return self.dataset_get_response
+        return self.dataset_create_response
+
+    async def delete_dataset(self, **kwargs: Any) -> None:
+        self.calls["dataset_delete"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+
+    async def retrieve_dataset(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["dataset_retrieve"].append(kwargs)
+        if self.dataset_error is not None:
+            raise self.dataset_error
+        return self.dataset_retrieve_response
+
+    async def create_document_by_file(self, **kwargs: Any) -> dict[str, Any]:
+        # Capture the body separately so tests can inspect bytes received.
+        self.calls["doc_upload"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
+        return self.file_upload_response
+
+    async def list_documents(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls["doc_list"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
+        return self.file_list_response
+
+    async def delete_document(self, **kwargs: Any) -> None:
+        self.calls["doc_delete"].append(kwargs)
+        if self.file_error is not None:
+            raise self.file_error
 
     async def aclose(self) -> None:
         return None
@@ -162,5 +267,5 @@ def app(
         return fake_dify  # type: ignore[return-value]
 
     application.state.dify_client_factory = factory
-    application.state.app_manager._client_factory = factory  # noqa: SLF001
+    application.state.app_manager._client_factory = factory
     return application

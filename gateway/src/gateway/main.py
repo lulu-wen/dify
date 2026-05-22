@@ -19,7 +19,9 @@ from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import chat as chat_router
+from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
+from gateway.routers import files as files_router
 from gateway.routers import models as models_router
 
 logger = structlog.get_logger(__name__)
@@ -106,6 +108,8 @@ def create_app(
     app.include_router(chat_router.router)
     app.include_router(embeddings_router.router)
     app.include_router(models_router.router)
+    app.include_router(datasets_router.router)
+    app.include_router(files_router.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

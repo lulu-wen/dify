@@ -88,10 +88,18 @@ class EmbeddingModelEntry(BaseModel):
         owner: Publisher identity surfaced in ``/v1/models`` (OpenAI ``owned_by``
             semantics). Defaults to the gateway identifier.
         endpoint_url: OpenAI-compatible base URL, e.g. ``http://vllm-embed:8000/v1``.
+            Used by ``POST /v1/embeddings`` to proxy directly to the upstream.
         api_key: Bearer token sent to the endpoint; vLLM ignores it by default
             but other OpenAI-compatible services may require a real key.
         dimensions: Native output dimensions (informational; some models
             support truncation via the request's ``dimensions`` parameter).
+        provider: Dify plugin provider id (e.g.
+            ``langgenius/openai_api_compatible/openai_api_compatible``) used
+            when the gateway creates a dataset bound to this embedding model
+            (PR #3 R2 + R5). Optional — if unset, ``POST /v1/datasets`` will
+            send only ``embedding_model`` to Dify and let Dify resolve the
+            provider, which works when the customer's Dify has exactly one
+            embedding plugin installed.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -102,6 +110,7 @@ class EmbeddingModelEntry(BaseModel):
     endpoint_url: str = Field(min_length=1)
     api_key: str = Field(default="EMPTY")
     dimensions: int | None = Field(default=None, gt=0)
+    provider: str | None = Field(default=None, min_length=1)
 
 
 class CustomerEntry(BaseModel):
@@ -135,7 +144,7 @@ class CustomerEntry(BaseModel):
         return models
 
     @model_validator(mode="after")
-    def _no_id_collisions_across_lists(self) -> "CustomerEntry":
+    def _no_id_collisions_across_lists(self) -> CustomerEntry:
         """Reject the same ``id`` appearing in both ``models`` and ``embedding_models``.
 
         ``/v1/models`` flattens both lists into a single OpenAI-shaped list,
@@ -184,7 +193,7 @@ class CustomerRegistry:
         self._by_sdk_key = by_sdk_key
 
     @classmethod
-    def from_entries(cls, entries: list[CustomerEntry]) -> "CustomerRegistry":
+    def from_entries(cls, entries: list[CustomerEntry]) -> CustomerRegistry:
         """Build a registry from a list of entries (raises on duplicate SDK keys)."""
         by_key: dict[str, CustomerEntry] = {}
         for entry in entries:
@@ -194,7 +203,7 @@ class CustomerRegistry:
         return cls(by_key)
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "CustomerRegistry":
+    def from_yaml(cls, path: str | Path) -> CustomerRegistry:
         """Load and validate a registry YAML file.
 
         Raises:

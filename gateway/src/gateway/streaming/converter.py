@@ -3,6 +3,9 @@
 Dify's ``POST /v1/chat-messages`` (response_mode=streaming) emits events:
 
 * ``message`` — a chunk of the assistant's answer (``answer`` field is delta).
+* ``agent_thought`` — reasoning model (Qwen3/DeepSeek-R1/o1-family) thinking
+  trace; the ``thought`` field is the incremental content. Routed to OpenAI's
+  ``delta.reasoning_content`` so standard clients can render a "thinking" UI.
 * ``message_end`` — terminal event with ``metadata`` (usage, retriever_resources).
 * ``error`` — Dify reports an error mid-stream.
 * ``ping`` — keep-alive.
@@ -80,6 +83,15 @@ async def dify_to_openai_chunks(
     finish_reason: str = "stop"
     conversation_id: str | None = None
 
+    # Codex review-1 P2: Dify's ``agent_thought`` payload carries the
+    # **cumulative** ``thought`` text — re-emitted in full when the agent
+    # appends new reasoning. OpenAI clients concatenate ``delta.reasoning_content``,
+    # so forwarding the whole thought each time would produce ``"foofoobar"``
+    # for two events with thoughts ``"foo"`` then ``"foobar"``. Track the last
+    # seen thought per id (Dify gives a stable ``id`` per MessageAgentThought)
+    # and emit only the new suffix.
+    last_thought_by_id: dict[str, str] = {}
+
     async for raw in dify_lines:
         event = parse_dify_sse_line(raw)
         if event is None:
@@ -94,6 +106,53 @@ async def dify_to_openai_chunks(
             delta = DeltaMessage(content=answer)
             if not started:
                 # First chunk announces the role per OpenAI convention.
+                delta.role = "assistant"
+                started = True
+            yield _format_chunk(
+                ChatCompletionChunk(
+                    id=request_id,
+                    model=model_id,
+                    choices=[ChatChunkChoice(index=0, delta=delta, finish_reason=None)],
+                )
+            )
+
+        elif event_type == "agent_thought":
+            # Reasoning model thinking trace → OpenAI-style ``reasoning_content``.
+            # Dify emits ``agent_thought`` with several extra fields (observation,
+            # tool, tool_input, ...). For pure reasoning models only ``thought``
+            # is populated; tool-using agents will use the other fields and we
+            # do not surface them in PR #3 (chat-only reasoning is the target).
+            thought = event.get("thought") or ""
+            if not thought:
+                continue
+            # Dify re-sends the cumulative thought on every update; emit only
+            # the new suffix relative to the last value we saw for this id.
+            # Missing id (older Dify, malformed event) → treat as standalone
+            # and skip dedup so we don't drop content.
+            thought_id = event.get("id")
+            if isinstance(thought_id, str) and thought_id:
+                prev = last_thought_by_id.get(thought_id, "")
+                if thought == prev:
+                    # No new content; ignore the redundant event.
+                    continue
+                if thought.startswith(prev):
+                    delta_text = thought[len(prev):]
+                else:
+                    # Upstream rewrote the thought (rare; e.g. tool result
+                    # replaced earlier draft). Fall back to emitting the full
+                    # new value — duplication beats silent loss.
+                    delta_text = thought
+                last_thought_by_id[thought_id] = thought
+            else:
+                delta_text = thought
+
+            if not delta_text:
+                continue
+
+            delta = DeltaMessage(reasoning_content=delta_text)
+            if not started:
+                # First chunk announces the role even when it's a reasoning
+                # chunk — clients building UIs need ``role`` to bind the message.
                 delta.role = "assistant"
                 started = True
             yield _format_chunk(

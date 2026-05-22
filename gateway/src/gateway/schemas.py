@@ -17,7 +17,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 # ---------- Request ----------
 
 
@@ -166,12 +165,25 @@ class ChatCompletionResponse(BaseModel):
 
 
 class DeltaMessage(BaseModel):
-    """Incremental delta in a streaming response."""
+    """Incremental delta in a streaming response.
+
+    ``reasoning_content`` matches OpenAI's o1-style streaming surface — when a
+    reasoning model (Qwen3 ``<think>``, DeepSeek-R1, o1-family) emits its
+    thinking trace, those chunks come down with ``delta.reasoning_content``
+    populated and ``content`` left null. Once thinking is done and the model
+    starts producing the user-facing answer, subsequent chunks carry
+    ``delta.content`` and ``reasoning_content`` is left null.
+
+    The gateway maps Dify's ``agent_thought`` SSE event → ``reasoning_content``
+    and Dify's ``message`` event → ``content``. Standard OpenAI clients read
+    both fields off the same ``delta`` so existing SDK code keeps working.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     role: Literal["assistant"] | None = None
     content: str | None = None
+    reasoning_content: str | None = None
 
 
 class ChatChunkChoice(BaseModel):
@@ -277,6 +289,164 @@ class EmbeddingsResponse(BaseModel):
     data: list[EmbeddingData]
     model: str
     usage: EmbeddingsUsage = Field(default_factory=EmbeddingsUsage)
+
+
+# ---------- /v1/datasets ----------
+
+
+class DatasetCreateRequest(BaseModel):
+    """Body of ``POST /v1/datasets``.
+
+    Customer-facing surface is intentionally smaller than Dify's
+    ``DatasetCreatePayload`` — only the fields a client should set are
+    accepted. Gateway resolves ``embedding_model_provider`` from the
+    registry; clients pass just ``embedding_model`` (and may omit it
+    entirely to use the customer's default).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=40)
+    description: str = Field(default="", max_length=400)
+    indexing_technique: Literal["high_quality", "economy"] = Field(
+        default="high_quality",
+        description=(
+            "``high_quality`` runs the documents through an embedding model "
+            "and stores vectors in Qdrant — required for semantic retrieval. "
+            "``economy`` is keyword-only and much cheaper but worse recall."
+        ),
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description=(
+            "Customer-facing embedding model id (must match an entry in the "
+            "customer's ``embedding_models`` registry). If omitted, the "
+            "gateway falls back to the customer's first registered embedding "
+            "model. If neither is present, the request is rejected."
+        ),
+    )
+
+
+class Dataset(BaseModel):
+    """A dataset entry as surfaced to the SDK client.
+
+    Mirrors Dify's ``dataset_detail_fields`` output but with the noisy
+    internal fields (provider plugin ids, indexing settings, partial
+    member list, ...) stripped. We use ``extra="allow"`` so the customer
+    can still see any extra Dify fields if they need to.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    name: str
+    description: str | None = None
+    indexing_technique: str | None = None
+    embedding_model: str | None = None
+    embedding_model_provider: str | None = None
+    document_count: int = 0
+    word_count: int = 0
+    created_at: int | None = None
+
+
+class DatasetList(BaseModel):
+    """Response envelope for ``GET /v1/datasets``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[Dataset]
+    has_more: bool = False
+    total: int = 0
+    page: int = 1
+    limit: int = 20
+
+
+# ---------- /v1/files (knowledge-base documents) ----------
+
+
+class File(BaseModel):
+    """A document inside a dataset, as surfaced to the SDK client.
+
+    The naming mirrors OpenAI's Files API (``id`` + ``object: "file"``) even
+    though our semantics differ: these are knowledge-base documents that
+    will be vector-indexed by Dify, not finetuning files. Customers using
+    standard OpenAI SDK helpers (``client.files.list()``) recognise the
+    shape without needing custom code.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    object: Literal["file"] = "file"
+    name: str
+    indexing_status: str | None = None
+    word_count: int = 0
+    created_at: int | None = None
+
+
+class FileList(BaseModel):
+    """Response envelope for ``GET /v1/files``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    data: list[File]
+    has_more: bool = False
+    total: int = 0
+    page: int = 1
+    limit: int = 20
+
+
+class DatasetRetrieveRequest(BaseModel):
+    """Body of ``POST /v1/datasets/{id}/retrieve``.
+
+    Pure-retrieval (hit-testing) channel — no LLM call, no RAG augmentation,
+    just the top-k chunks from the dataset's vector index. Used by clients
+    who want to run their own ranking / display / evaluation pipeline.
+
+    The simple top-level fields (``top_k``, ``score_threshold``,
+    ``search_method``) are the common knobs. If they're all omitted, the
+    gateway forwards no ``retrieval_model`` and Dify uses the dataset's
+    bake-in default. If any is set, the gateway builds a full
+    ``retrieval_model`` payload with sensible defaults for the rest.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=250)
+    top_k: int | None = Field(default=None, ge=1, le=100)
+    score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    search_method: Literal[
+        "semantic_search", "hybrid_search", "full_text_search", "keyword_search"
+    ] | None = None
+
+
+class RetrievedSegment(BaseModel):
+    """A single retrieved chunk (subset of Dify's segment payload).
+
+    Clients get the chunk content + score + provenance (which document,
+    which segment within the document) so they can build their own UI.
+    Extra Dify fields pass through via ``extra="allow"``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    content: str
+    score: float | None = None
+    document_id: str | None = None
+    document_name: str | None = None
+    segment_id: str | None = None
+
+
+class DatasetRetrieveResponse(BaseModel):
+    """Response envelope for ``POST /v1/datasets/{id}/retrieve``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    object: Literal["list"] = "list"
+    query: str
+    data: list[RetrievedSegment]
 
 
 def make_metadata(
