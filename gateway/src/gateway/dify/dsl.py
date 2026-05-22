@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-DSL_VERSION = "v2-system-prompt"
+DSL_VERSION = "v3-dataset-enabled"
 """Bump when ``build_chat_app_dsl`` output changes in a way that requires
 existing cached Apps to be rebuilt. :class:`AppManager` records this on each
 :class:`CachedApp` and forces a rebuild when the constant disagrees with the
@@ -58,8 +58,15 @@ def build_chat_app_dsl(
     Returns:
         UTF-8 YAML string suitable for ``yaml-content`` import.
     """
+    # ``enabled: True`` is mandatory — Dify's DatasetConfigManager.convert
+    # (api/core/app/app_config/easy_ui_based_app/dataset/manager.py) silently
+    # drops any dataset entry without ``enabled=true``, leaving the App with
+    # an empty dataset list and no retrieval. Live RAG verification on
+    # 2026-05-21 hit this: dataset was created, document indexed, retrieve
+    # endpoint returned hits, but chat-with-RAG returned no references.
     datasets_block: list[dict[str, Any]] = [
-        {"dataset": {"id": kb_id}} for kb_id in (knowledge_base_ids or [])
+        {"dataset": {"id": kb_id, "enabled": True}}
+        for kb_id in (knowledge_base_ids or [])
     ]
 
     payload: dict[str, Any] = {

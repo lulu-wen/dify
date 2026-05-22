@@ -56,9 +56,26 @@ def test_dsl_carries_model_provider_and_completion_params() -> None:
     assert cfg["model"]["provider"].endswith("openai_api_compatible")
     assert cfg["model"]["name"] == "gemma-3n-e4b"
     assert cfg["model"]["completion_params"] == {"temperature": 0.2}
+    # ``enabled: True`` is mandatory — without it Dify silently drops the
+    # dataset and the App ends up with no retrieval. Regression for the
+    # 2026-05-21 chat-with-RAG verification failure where references came
+    # back empty despite the dataset existing and being indexed.
     assert cfg["dataset_configs"]["datasets"]["datasets"] == [
-        {"dataset": {"id": "kb-1"}}
+        {"dataset": {"id": "kb-1", "enabled": True}}
     ]
+
+
+def test_dsl_marks_every_knowledge_base_enabled() -> None:
+    """Multi-KB attachments must all carry ``enabled: True``."""
+    dsl = build_chat_app_dsl(
+        name="t", description="d", provider="p", model_name="m",
+        knowledge_base_ids=["kb-a", "kb-b", "kb-c"],
+    )
+    cfg = _parse(dsl)["model_config"]
+    datasets = cfg["dataset_configs"]["datasets"]["datasets"]
+    assert len(datasets) == 3
+    assert all(d["dataset"]["enabled"] is True for d in datasets)
+    assert [d["dataset"]["id"] for d in datasets] == ["kb-a", "kb-b", "kb-c"]
 
 
 def test_dsl_emits_empty_datasets_when_no_knowledge_base() -> None:
