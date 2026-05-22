@@ -61,3 +61,15 @@ class Settings(BaseSettings):
         default="x-request-id",
         description="Header name to read/echo for distributed tracing",
     )
+
+    strict_startup: bool = Field(
+        default=False,
+        description=(
+            "When True, the startup health check (registry format + Dify "
+            "reachability + console / dataset auth round-trip) aborts boot "
+            "on any failure. When False (default), failures are logged but "
+            "the gateway keeps serving — suitable for dev where Dify may "
+            "come up after the gateway. Set GATEWAY_STRICT_STARTUP=1 in "
+            "production."
+        ),
+    )

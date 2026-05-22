@@ -23,6 +23,7 @@ from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
 from gateway.routers import files as files_router
 from gateway.routers import models as models_router
+from gateway.startup_check import run_startup_check
 
 logger = structlog.get_logger(__name__)
 
@@ -80,6 +81,17 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
         try:
+            # PR #5: validate registry against real Dify deployments before
+            # accepting traffic. Raises RuntimeError (and so aborts uvicorn
+            # startup with non-zero exit) when settings.strict_startup is
+            # True; otherwise logs warnings and continues. The check uses
+            # the same client factory the routers use, so any issue at
+            # startup is the same issue the SDK would hit at runtime.
+            await run_startup_check(
+                registry,
+                factory,
+                strict=settings.strict_startup,
+            )
             yield
         finally:
             await app_manager.stop()
