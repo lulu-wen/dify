@@ -37,7 +37,7 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
@@ -173,7 +173,7 @@ class DifyClient:
             raise DifyUpstreamError(f"Dify request failed: {e}") from e
 
         _raise_for_dify_status(resp)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     @asynccontextmanager
     async def open_chat_stream(
@@ -294,7 +294,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify create-dataset failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     async def list_datasets(
         self,
@@ -324,7 +324,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify list-datasets failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     async def get_dataset(
         self,
@@ -343,7 +343,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify get-dataset failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     async def delete_dataset(
         self,
@@ -417,7 +417,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify create-by-file failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     async def list_documents(
         self,
@@ -443,7 +443,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify list-documents failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     async def delete_document(
         self,
@@ -497,7 +497,7 @@ class DifyClient:
         except httpx.RequestError as e:
             raise DifyUpstreamError(f"Dify dataset-retrieve failed: {e}") from e
         _raise_for_dify_status(resp, pass_client_errors=True)
-        return resp.json()
+        return cast(dict[str, Any], resp.json())
 
     # ------------------------------------------------------------------ #
     # Console API (App management)                                       #

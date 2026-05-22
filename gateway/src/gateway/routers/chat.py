@@ -22,6 +22,7 @@ Conversation handling:
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import structlog
@@ -187,7 +188,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         # synchronously which is exactly what we want before sending headers.
         dify_lines = await stream_cm.__aenter__()
 
-        async def event_source():  # type: ignore[no-untyped-def]
+        async def event_source() -> AsyncIterator[str]:
             try:
                 async for chunk in dify_to_openai_chunks(
                     dify_lines, request_id=request_id, model_id=selected_model

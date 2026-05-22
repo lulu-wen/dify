@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -30,7 +30,7 @@ logger = structlog.get_logger(__name__)
 def _build_dify_client_factory(
     settings: Settings,
     cache: dict[str, DifyClient],
-):  # type: ignore[no-untyped-def]
+) -> Callable[[CustomerEntry], DifyClient]:
     """Return a function that yields a singleton ``DifyClient`` per ``base_url``."""
 
     def factory(customer: CustomerEntry) -> DifyClient:
