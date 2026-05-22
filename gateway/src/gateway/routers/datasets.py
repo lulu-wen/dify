@@ -494,30 +494,31 @@ async def retrieve_dataset(
 async def delete_dataset(dataset_id: str, request: Request) -> Any:
     """Delete a dataset by Dify UUID.
 
-    Idempotent contract (PR #3 R2 + codex review-5 P2): returns 200 whether
-    or not the dataset existed. The Dify client treats its own 404 as
-    success on the actual delete call, and the shared-mode pre-flight
-    here must preserve the same semantics:
+    Idempotent contract (PR #3 R2 + codex review-5 P2 + shared-mode
+    existence-leak fix): returns 200 ``{"deleted": True}`` for every
+    UUID the caller cannot prove ownership of. The three responses
+    that previously distinguished missing / foreign / owned all collapse
+    into one shape so a probing customer cannot tell
 
-    - **Missing UUID** (Dify get_dataset 404): treat as already deleted →
-      200 ``{"deleted": True}``. Lets cleanup loops call DELETE on stale
-      IDs without distinguishing dedicated vs shared customers.
-    - **Foreign UUID** (Dify 200 + name not owned): reject with 404
-      ``dataset_not_found``. This DOES leak existence-vs-not via the
-      delete envelope, but the alternative — silently 200ing on foreign
-      datasets — would let a malicious customer believe they deleted
-      somebody else's data. The existence-leak surface here is no worse
-      than other shared-mode operations.
+    - "this UUID doesn't exist anywhere" (missing → 200, unchanged)
+    - "this UUID belongs to someone else" (foreign → was 404, NOW 200)
+    - "this UUID is yours and was just deleted" (owned → 200, unchanged)
+
+    apart from each other by reading the response envelope. The 404
+    branch that previously fired for foreign UUIDs leaked the existence
+    of other tenants' datasets to any customer who could obtain a UUID
+    via side channel (chat log paste, screenshot, debug output). Hiding
+    the foreign case behind the idempotent envelope closes the gap
+    without weakening the actual access control — gateway still refuses
+    to call Dify's delete for foreign UUIDs, B's data is untouched, and
+    a ``shared.dataset_delete_foreign_attempt`` warning is logged so
+    repeated probing remains visible to operators.
     """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
     strategy = isolation_strategy_for(customer)
 
     if strategy.is_shared:
-        # Inline the verify so we can distinguish missing (200 idempotent)
-        # from foreign (404 reject). The shared _verify_dataset_ownership
-        # helper collapses both into UnknownDatasetError, which would
-        # break the idempotent contract for already-missing datasets.
         try:
             meta = await dify_client.get_dataset(
                 dataset_api_key=customer.dify.dataset_api_key,
@@ -537,9 +538,16 @@ async def delete_dataset(dataset_id: str, request: Request) -> Any:
         if not strategy.dataset_belongs_to(
             customer.customer_id, meta.get("name", "")
         ):
-            raise UnknownDatasetError(
-                f"dataset '{dataset_id}' not found", param="dataset_id"
+            # Foreign UUID — do NOT delete on Dify side, do NOT reveal
+            # existence to the caller. Log loudly so repeated attempts
+            # by one customer against UUIDs they shouldn't know about
+            # are recoverable post-hoc.
+            logger.warning(
+                "shared.dataset_delete_foreign_attempt",
+                customer_id=customer.customer_id,
+                dataset_id=dataset_id,
             )
+            return JSONResponse(content={"id": dataset_id, "deleted": True})
 
     await dify_client.delete_dataset(
         dataset_api_key=customer.dify.dataset_api_key,

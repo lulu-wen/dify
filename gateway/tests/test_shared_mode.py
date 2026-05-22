@@ -449,10 +449,14 @@ async def test_shared_get_own_dataset_succeeds_with_stripped_name(
 
 
 @pytest.mark.asyncio
-async def test_shared_delete_cross_customer_returns_404(
+async def test_shared_delete_cross_customer_returns_idempotent_success(
     fake_dify: FakeDifyClient,
 ) -> None:
-    """Delete check must happen before the actual delete fires."""
+    """Cross-customer DELETE returns the idempotent 200 envelope, NOT 404.
+    Returning 404 here would let customer A distinguish "B's UUID" from
+    "no such UUID" by reading the response — closing this side-channel is
+    the whole point of the existence-leak fix. Gateway still refuses to
+    forward the delete to Dify; B's data stays put."""
     fake_dify.dataset_get_response = {
         "id": "ds-uuid-B",
         "name": "tenant-b__kb-1",
@@ -465,8 +469,8 @@ async def test_shared_delete_cross_customer_returns_404(
             headers={"Authorization": "Bearer bsa_tenant_a"},
         )
 
-    assert r.status_code == 404
-    assert r.json()["error"]["code"] == "dataset_not_found"
+    assert r.status_code == 200
+    assert r.json() == {"id": "ds-uuid-B", "deleted": True}
     # The actual delete must NOT have been called (only the ownership get).
     assert fake_dify.calls["dataset_delete"] == []
 
@@ -562,9 +566,14 @@ async def test_shared_list_files_cross_customer_returns_404(
 
 
 @pytest.mark.asyncio
-async def test_shared_delete_file_cross_customer_returns_404(
+async def test_shared_delete_file_cross_customer_returns_idempotent_success(
     fake_dify: FakeDifyClient,
 ) -> None:
+    """Cross-customer DELETE must look identical to deleting a missing
+    UUID. Returning 404 here would let customer A distinguish "this
+    document/dataset belongs to someone else" from "doesn't exist" —
+    a side-channel-amplified existence leak. Gateway still refuses to
+    forward to Dify's ``delete_document``; B's data stays intact."""
     fake_dify.dataset_get_response = {"id": "ds-B", "name": "tenant-b__kb"}
     app = _app_with(_shared_customer(), fake_dify)
     transport = httpx.ASGITransport(app=app)
@@ -573,7 +582,9 @@ async def test_shared_delete_file_cross_customer_returns_404(
             "/v1/files/doc-1?dataset_id=ds-B",
             headers={"Authorization": "Bearer bsa_tenant_a"},
         )
-    assert r.status_code == 404
+    assert r.status_code == 200
+    assert r.json() == {"id": "doc-1", "deleted": True}
+    # Gateway must NOT have forwarded the delete to Dify.
     assert fake_dify.calls["doc_delete"] == []
 
 
@@ -1474,11 +1485,27 @@ class TestReview5Fix_IdempotentSharedDelete:
         assert fake_dify.calls["dataset_delete"] == []
 
     @pytest.mark.asyncio
-    async def test_shared_delete_foreign_dataset_still_returns_404(
+    async def test_shared_delete_foreign_dataset_returns_idempotent_success(
         self, fake_dify: FakeDifyClient
     ) -> None:
-        """Regression: foreign UUID must still 404. The review-5 fix
-        only relaxes the *missing* case, not the *foreign* case."""
+        """Shared-mode existence-leak fix: a foreign UUID returns the
+        same 200 ``{"deleted": True}`` shape as a missing UUID. Previously
+        the foreign branch raised ``UnknownDatasetError`` (404), which
+        let customer A distinguish "B's dataset" from "no such UUID"
+        by reading the response envelope.
+
+        Verifies the two contractual security properties at once:
+
+        - status + body match the missing-UUID idempotent shape exactly,
+          so the response is indistinguishable to the caller
+        - Gateway does NOT forward the delete to Dify (B's data intact)
+
+        The audit-log warning (``shared.dataset_delete_foreign_attempt``)
+        is asserted by inspection of the request log in operations, not
+        here — gateway's structlog config caches loggers at module-import
+        time, which makes :func:`structlog.testing.capture_logs` a no-op
+        for the routers' bound loggers.
+        """
         fake_dify.dataset_get_response = {
             "id": "ds-uuid-B",
             "name": "tenant-b__kb-1",
@@ -1490,9 +1517,38 @@ class TestReview5Fix_IdempotentSharedDelete:
                 "/v1/datasets/ds-uuid-B",
                 headers={"Authorization": "Bearer bsa_tenant_a"},
             )
-        assert r.status_code == 404
-        assert r.json()["error"]["code"] == "dataset_not_found"
+
+        # Response indistinguishable from missing-UUID case.
+        assert r.status_code == 200
+        assert r.json() == {"id": "ds-uuid-B", "deleted": True}
+        # B's dataset stays intact — gateway never forwarded the delete.
         assert fake_dify.calls["dataset_delete"] == []
+
+    @pytest.mark.asyncio
+    async def test_shared_delete_file_foreign_dataset_returns_idempotent_success(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Same existence-leak fix applies to ``DELETE /v1/files/{id}``:
+        when the file's dataset belongs to someone else, return the
+        idempotent envelope (200) instead of 404. Gateway must still
+        skip the upstream ``delete_document`` call so B's documents stay
+        intact.
+        """
+        fake_dify.dataset_get_response = {
+            "id": "ds-uuid-B",
+            "name": "tenant-b__kb-1",
+        }
+        app = _app_with(_shared_customer(), fake_dify)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            r = await cli.delete(
+                "/v1/files/doc-1?dataset_id=ds-uuid-B",
+                headers={"Authorization": "Bearer bsa_tenant_a"},
+            )
+
+        assert r.status_code == 200
+        assert r.json() == {"id": "doc-1", "deleted": True}
+        assert fake_dify.calls["doc_delete"] == []
 
     @pytest.mark.asyncio
     async def test_shared_delete_file_missing_dataset_returns_idempotent_success(
