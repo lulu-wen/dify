@@ -22,15 +22,21 @@ Multipart-upload memory note:
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import structlog
-from fastapi import APIRouter, Form, Request, UploadFile
-from fastapi import File as FastapiFile
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+# ``Request.form()`` returns Starlette's UploadFile (which FastAPI's
+# ``UploadFile`` historically re-exports but may not be ``isinstance``-
+# compatible across versions). Use the Starlette one for the runtime
+# type check to keep things robust.
+from starlette.datastructures import UploadFile
+
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError
+from gateway.errors import InvalidRequestError, UnknownDatasetError, UpstreamClientError
+from gateway.mode import isolation_strategy_for
 from gateway.registry import CustomerEntry
 from gateway.schemas import File, FileList
 
@@ -39,36 +45,94 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+_VALID_INDEXING_TECHNIQUES = frozenset({"high_quality", "economy"})
+
+
 @router.post("/v1/files")
-async def upload_file(
-    request: Request,
-    # PEP 593 ``Annotated[...]`` pattern: FastAPI dependency factory calls
-    # (``File(...)``, ``Form(...)``) live in metadata, not in the default,
-    # so ruff B008 (function-call-in-default-argument) is silenced.
-    file: Annotated[
-        UploadFile,
-        FastapiFile(..., description="Document binary to ingest into the dataset"),
-    ],
-    dataset_id: Annotated[
-        str,
-        Form(..., description="Dify dataset UUID to ingest the document into"),
-    ],
-    indexing_technique: Annotated[
-        Literal["high_quality", "economy"],
-        Form(description="Override the dataset's default indexing technique for this document."),
-    ] = "high_quality",
-) -> Any:
+async def upload_file(request: Request) -> Any:
     """Upload a document into a knowledge-base dataset.
 
     Dify chunks + vectorises the document asynchronously; the response
     carries the document id and a current ``indexing_status`` that the
     client can poll via ``GET /v1/files`` if needed.
-    """
-    if not file.filename:
-        raise InvalidRequestError("uploaded file must include a filename", param="file")
 
+    Wire format (codex review-3 P2 + review-6 P1 backward compat):
+
+    - ``dataset_id`` (required): query param ``?dataset_id=<uuid>`` OR
+      multipart form field (PR #3 R3 contract). Shared mode REQUIRES the
+      query form so ownership can be verified before the multipart body
+      is parsed; dedicated mode accepts either (no pre-flight cost there,
+      so backward compat with PR #3 clients matters more than the
+      cheap-fail goal).
+    - ``indexing_technique`` (optional): query param or form field.
+      Defaults to ``high_quality``.
+    - ``file`` (required): multipart form field with the binary.
+
+    Why hybrid: existing PR #3 / OpenAI-SDK ``extra_body`` clients send
+    ``dataset_id`` in the form. Shared-mode pre-flight only works with
+    query, so we enforce query in that mode (security) but accept form
+    in dedicated (backward compat).
+    """
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
+
+    dataset_id = request.query_params.get("dataset_id")
+
+    if strategy.is_shared:
+        # Shared mode: dataset_id MUST be in query. Otherwise FastAPI
+        # would have to parse the multipart body to find it, and the
+        # ownership check loses its cheap-fail property (review-3 P2).
+        if not dataset_id:
+            raise InvalidRequestError(
+                "dataset_id query parameter is required in shared mode "
+                "(needed for ownership verification before parsing the body)",
+                param="dataset_id",
+            )
+        # Verify ownership BEFORE parsing the body.
+        await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
+    # indexing_technique from query (preferred) — falls back to form below.
+    indexing_technique: str | None = request.query_params.get("indexing_technique")
+
+    # Parse the multipart body. In shared mode the ownership pre-flight
+    # already ran; in dedicated mode there's no pre-flight (workspace IS
+    # the customer), so reading the body here costs nothing extra.
+    form = await request.form()
+
+    if not dataset_id:
+        # Dedicated-mode fallback: dataset_id in the form (PR #3 contract).
+        # Codex review-6 P1: existing clients with `data={"dataset_id":...}`
+        # must keep working. Shared mode already required query above, so
+        # this branch is only reachable in dedicated mode.
+        form_dataset_id = form.get("dataset_id")
+        if not form_dataset_id:
+            raise InvalidRequestError(
+                "dataset_id is required (query parameter or form field)",
+                param="dataset_id",
+            )
+        dataset_id = str(form_dataset_id)
+
+    if not indexing_technique:
+        form_indexing = form.get("indexing_technique")
+        indexing_technique = str(form_indexing) if form_indexing else "high_quality"
+    if indexing_technique not in _VALID_INDEXING_TECHNIQUES:
+        raise InvalidRequestError(
+            f"indexing_technique must be 'high_quality' or 'economy', "
+            f"got '{indexing_technique}'",
+            param="indexing_technique",
+        )
+
+    file = form.get("file")
+    if not isinstance(file, UploadFile):
+        raise InvalidRequestError(
+            "multipart field 'file' is required and must be a file upload",
+            param="file",
+        )
+    if not file.filename:
+        raise InvalidRequestError(
+            "uploaded file must include a filename", param="file"
+        )
 
     content = await file.read()
     if not content:
@@ -120,6 +184,8 @@ async def list_files(request: Request) -> Any:
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
 
+    await _verify_dataset_ownership_for_files(dify_client, customer, dataset_id)
+
     page = _int_query(request, "page", default=1, minimum=1)
     limit = _int_query(request, "limit", default=20, minimum=1, maximum=100)
     keyword = request.query_params.get("keyword") or None
@@ -151,7 +217,10 @@ async def delete_file(file_id: str, request: Request) -> Any:
     isn't globally addressable — it lives under one dataset. Without this,
     we'd need to fetch every dataset and scan, which doesn't scale.
 
-    Idempotent: 404 from Dify is treated as already-deleted.
+    Idempotent contract (PR #3 R3 + codex review-5 P2): 404 from Dify
+    means already-deleted → 200. Shared-mode pre-flight preserves the
+    same: a missing dataset returns 200 (cleanup loop friendly), a
+    foreign dataset returns 404 (don't acknowledge customer B's data).
     """
     dataset_id = request.query_params.get("dataset_id")
     if not dataset_id:
@@ -161,6 +230,33 @@ async def delete_file(file_id: str, request: Request) -> Any:
 
     customer: CustomerEntry = request.state.customer
     dify_client: DifyClient = request.app.state.dify_client_factory(customer)
+    strategy = isolation_strategy_for(customer)
+
+    if strategy.is_shared:
+        # Inline the verify so a missing dataset is treated as already-
+        # deleted (matches Dify's own 404-on-document semantics + PR #3
+        # delete_document idempotency).
+        try:
+            meta = await dify_client.get_dataset(
+                dataset_api_key=customer.dify.dataset_api_key,
+                dataset_id=dataset_id,
+            )
+        except UpstreamClientError as exc:
+            if exc.status_code == 404:
+                logger.info(
+                    "files.deleted",
+                    dataset_id=dataset_id,
+                    document_id=file_id,
+                    status="dataset-missing",
+                )
+                return JSONResponse(content={"id": file_id, "deleted": True})
+            raise
+        if not strategy.dataset_belongs_to(
+            customer.customer_id, meta.get("name", "")
+        ):
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found", param="dataset_id"
+            )
 
     await dify_client.delete_document(
         dataset_api_key=customer.dify.dataset_api_key,
@@ -174,6 +270,47 @@ async def delete_file(file_id: str, request: Request) -> Any:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _verify_dataset_ownership_for_files(
+    dify_client: DifyClient,
+    customer: CustomerEntry,
+    dataset_id: str,
+) -> None:
+    """In shared mode, ensure the dataset belongs to this customer (PR #4 R4).
+
+    Files are scoped to a dataset, so file-level isolation reduces to
+    dataset-level: if the caller owns the dataset, they can act on its
+    files. Cross-customer access → 404 dataset_not_found (same envelope
+    as a real miss, no existence leak).
+
+    Dedicated mode skips this check (the customer's Dify only has their
+    own datasets, by construction).
+    """
+    strategy = isolation_strategy_for(customer)
+    if not strategy.is_shared:
+        return
+    try:
+        meta = await dify_client.get_dataset(
+            dataset_api_key=customer.dify.dataset_api_key,
+            dataset_id=dataset_id,
+        )
+    except UpstreamClientError as exc:
+        # Codex review-1 P1: normalize missing-vs-foreign to the same
+        # envelope so callers can't probe other tenants' UUIDs by error
+        # code. See datasets.py `_verify_dataset_ownership` for context.
+        if exc.status_code == 404:
+            raise UnknownDatasetError(
+                f"dataset '{dataset_id}' not found",
+                param="dataset_id",
+            ) from exc
+        raise
+    dify_name = meta.get("name", "")
+    if not strategy.dataset_belongs_to(customer.customer_id, dify_name):
+        raise UnknownDatasetError(
+            f"dataset '{dataset_id}' not found",
+            param="dataset_id",
+        )
 
 
 def _to_file(raw: dict[str, Any]) -> dict[str, Any]:

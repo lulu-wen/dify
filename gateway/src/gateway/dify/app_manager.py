@@ -175,8 +175,16 @@ class AppManager:
 
     async def _build_app(self, customer: CustomerEntry, model: ModelEntry) -> CachedApp:
         client = self._client_factory(customer)
+        # PR #4 review-2 P2: route through the IsolationStrategy so the App
+        # naming contract has one source of truth. Both DedicatedStrategy
+        # and SharedStrategy currently return "{customer_id}:{model_id}",
+        # preserving PR #1-#3 naming so existing Apps in Dify don't orphan.
+        # Future modes (regional, environment-tagged) can override.
+        from gateway.mode import isolation_strategy_for
+        strategy = isolation_strategy_for(customer)
+        app_label = strategy.app_name(customer.customer_id, model.id)
         dsl = build_chat_app_dsl(
-            name=f"auto:{customer.customer_id}:{model.id}",
+            name=f"auto:{app_label}",
             description=f"Auto-built by AI SDK Gateway for customer={customer.customer_id} model={model.id}",
             provider=model.provider,
             model_name=model.name,

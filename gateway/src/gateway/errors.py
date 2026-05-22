@@ -66,6 +66,20 @@ class UnknownModelError(GatewayError):
     code = "model_not_found"
 
 
+class UnknownDatasetError(GatewayError):
+    """Client referenced a dataset they don't own (or that doesn't exist). → 404.
+
+    In shared mode (PR #4) this fires when a customer passes a dataset UUID
+    belonging to another customer. The envelope is identical to a Dify 404
+    so a caller can't distinguish «exists but not yours» from «doesn't
+    exist» — prevents leaking existence of other customers' datasets.
+    """
+
+    status_code = 404
+    error_type = "invalid_request_error"
+    code = "dataset_not_found"
+
+
 class InvalidRequestError(GatewayError):
     """Request body fails OpenAI schema or contradicts gateway constraints. → 400."""
 

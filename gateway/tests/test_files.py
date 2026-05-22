@@ -42,14 +42,10 @@ async def test_upload_file_happy_path(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1&indexing_technique=high_quality",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={
                 "file": ("rsrp-guide.txt", io.BytesIO(file_bytes), "text/plain"),
-            },
-            data={
-                "dataset_id": "ds-uuid-1",
-                "indexing_technique": "high_quality",
             },
         )
 
@@ -95,10 +91,9 @@ async def test_upload_file_unwraps_dify_document_envelope(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("manual.pdf", io.BytesIO(b"%PDF-1.4 hi"), "application/pdf")},
-            data={"dataset_id": "ds-uuid-1"},
         )
 
     assert r.status_code == 200
@@ -120,10 +115,9 @@ async def test_upload_file_defaults_to_high_quality(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("x.txt", io.BytesIO(b"hello"), "text/plain")},
-            data={"dataset_id": "ds-uuid-1"},
         )
 
     assert r.status_code == 200
@@ -133,9 +127,13 @@ async def test_upload_file_defaults_to_high_quality(
 
 @pytest.mark.asyncio
 async def test_upload_file_missing_dataset_id_returns_400(app: FastAPI) -> None:
-    """No ``dataset_id`` in form → 400. Without this, gateway can't know
+    """No ``dataset_id`` in query → 400. Without this, gateway can't know
     where to put the document, and Dify would create a stray document in
-    nobody's dataset."""
+    nobody's dataset.
+
+    Note: ``dataset_id`` moved from multipart form to query string in
+    codex review-3 so ownership can be checked before parsing the body.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
@@ -158,10 +156,9 @@ async def test_upload_empty_file_returns_400(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("empty.txt", io.BytesIO(b""), "text/plain")},
-            data={"dataset_id": "ds-uuid-1"},
         )
 
     assert r.status_code == 400
@@ -173,15 +170,14 @@ async def test_upload_empty_file_returns_400(
 
 @pytest.mark.asyncio
 async def test_upload_rejects_invalid_indexing_technique(app: FastAPI) -> None:
-    """Pydantic Literal — same defence as datasets create. Unknown value
-    must not silently fall through to Dify."""
+    """Unknown ``indexing_technique`` query value → 400. Defence against
+    typos slipping past gateway-side validation into Dify."""
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1&indexing_technique=bogus",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-1", "indexing_technique": "bogus"},
         )
     assert r.status_code == 400
 
@@ -191,9 +187,8 @@ async def test_upload_requires_auth(app: FastAPI) -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-1"},
         )
     assert r.status_code == 401
 
@@ -206,10 +201,9 @@ async def test_upload_dify_failure_returns_502(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-1"},
         )
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "dify_upstream_error"
@@ -223,10 +217,9 @@ async def test_upload_dify_timeout_returns_504(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         r = await cli.post(
-            "/v1/files",
+            "/v1/files?dataset_id=ds-uuid-1",
             headers={"Authorization": "Bearer bsa_test_a"},
             files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")},
-            data={"dataset_id": "ds-uuid-1"},
         )
     assert r.status_code == 504
     assert r.json()["error"]["code"] == "dify_timeout"
