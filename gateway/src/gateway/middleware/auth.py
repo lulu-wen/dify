@@ -33,13 +33,20 @@ _BEARER_PREFIX = "Bearer "
 def extract_sdk_key(authorization_header: str | None) -> str:
     """Parse a ``Bearer <key>`` header, or raise :class:`InvalidSdkKeyError`.
 
-    Trims whitespace; rejects empty or malformed values. The key value itself
+    Trims whitespace and rejects empty/malformed values. The key value itself
     is *not* validated for shape here—registry lookup is the source of truth.
+
+    Note:
+        We only ``lstrip`` the raw header before the prefix check. Stripping
+        trailing whitespace too early would collapse ``"Bearer "`` (a valid
+        scheme prefix with an empty key) into ``"Bearer"``, which would then
+        fail the ``startswith`` check and surface a confusing "scheme" error
+        instead of the correct "empty SDK key" diagnostic.
     """
     if not authorization_header:
         raise InvalidSdkKeyError("missing Authorization header", param="authorization")
 
-    header = authorization_header.strip()
+    header = authorization_header.lstrip()
     if not header.startswith(_BEARER_PREFIX):
         raise InvalidSdkKeyError(
             "Authorization header must use 'Bearer <sdk_key>' scheme",

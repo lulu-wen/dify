@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import structlog
@@ -51,20 +51,31 @@ _AUTH_FAILURE_HINTS: tuple[str, ...] = ("401", "unauthorized", "expired")
 
 @dataclass
 class CachedApp:
-    """One Dify App provisioned for a ``(customer_id, model_id)`` pair."""
+    """One Dify App provisioned for a ``(customer_id, model_id)`` pair.
+
+    Timestamps are caller-provided (using the AppManager's injected clock)
+    so that tests with a fake clock can deterministically age entries past
+    the TTL. Using ``default_factory=time.time`` would tie creation time to
+    the real wall clock, which mismatches the GC sweep's view of ``now``
+    when a fake clock is in use.
+    """
 
     customer_id: str
     model_id: str
     app_id: str
     app_key: str
-    created_at: float = field(default_factory=time.time)
-    last_used_at: float = field(default_factory=time.time)
+    created_at: float
+    last_used_at: float
 
 
 @dataclass
 class _CachedSession:
+    """Console session entry. ``obtained_at`` is reserved for future
+    diagnostics; freshness is enforced by the lock + ``force`` flag in
+    :meth:`AppManager._refresh_session`, not by elapsed time."""
+
     session: ConsoleSession
-    obtained_at: float = field(default_factory=time.time)
+    obtained_at: float = 0.0
 
 
 # Type alias for the dependency-injected client factory used by the manager.
@@ -190,11 +201,17 @@ class AppManager:
             model_id=model.id,
             app_id=app_id,
         )
+        # IMPORTANT: timestamps must come from ``self._clock`` (not real
+        # time.time) so that GC sweep arithmetic stays consistent under
+        # injected test clocks.
+        now = self._clock()
         return CachedApp(
             customer_id=customer.customer_id,
             model_id=model.id,
             app_id=app_id,
             app_key=app_key,
+            created_at=now,
+            last_used_at=now,
         )
 
     async def _with_session(
@@ -211,8 +228,9 @@ class AppManager:
             msg = str(e).lower()
             if not any(hint in msg for hint in _AUTH_FAILURE_HINTS):
                 raise
-            # Cookies likely expired; refresh and retry.
-            session = await self._refresh_session(customer, client)
+            # Cookies likely expired; force a fresh login (don't return the
+            # cached-but-failing session).
+            session = await self._refresh_session(customer, client, force=True)
             return await op(session)
 
     async def _get_session(self, customer: CustomerEntry, client: DifyClient) -> ConsoleSession:
@@ -221,17 +239,35 @@ class AppManager:
             return cached.session
         return await self._refresh_session(customer, client)
 
-    async def _refresh_session(self, customer: CustomerEntry, client: DifyClient) -> ConsoleSession:
+    async def _refresh_session(
+        self,
+        customer: CustomerEntry,
+        client: DifyClient,
+        *,
+        force: bool = False,
+    ) -> ConsoleSession:
+        """Acquire or renew the console session.
+
+        Args:
+            force: When False (default), if another concurrent caller has
+                already populated the cache while we were waiting for the
+                lock, reuse it (avoids thundering-herd logins). When True,
+                always perform a fresh login — used by the auth-retry path
+                in :meth:`_with_session`, where the cached session is the
+                one that just failed.
+        """
         async with self._session_locks[customer.customer_id]:
-            # Another concurrent caller may have refreshed already.
             cached = self._sessions.get(customer.customer_id)
-            if cached is not None and self._clock() - cached.obtained_at < 60:
+            if cached is not None and not force:
                 return cached.session
             session = await client.console_login(
                 customer.dify.console_email,
                 customer.dify.console_password,
             )
-            self._sessions[customer.customer_id] = _CachedSession(session=session)
+            self._sessions[customer.customer_id] = _CachedSession(
+                session=session,
+                obtained_at=self._clock(),
+            )
             return session
 
     # ------------------------------------------------------------------ #

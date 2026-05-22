@@ -100,6 +100,28 @@ async def test_console_login_returns_session_from_cookies(client: DifyClient) ->
 
 
 @pytest.mark.asyncio
+async def test_console_login_sends_base64_encoded_password(client: DifyClient) -> None:
+    """Regression: Dify's @decrypt_password_field decorator first base64-decodes
+    the password before bcrypt-checking it. A plaintext password yields a 401
+    ``Invalid encrypted data`` from the server because base64 decoding fails.
+    """
+    import base64
+    import json as json_module
+
+    plaintext = "S3cret!P@ss"
+    expected_b64 = base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
+
+    with respx.mock(base_url="http://dify.test") as m:
+        route = m.post("/console/api/login").mock(return_value=_login_response_with_cookies())
+        await client.console_login("admin@x", plaintext)
+
+    sent_body = json_module.loads(route.calls.last.request.read().decode())
+    assert sent_body["password"] == expected_b64
+    assert sent_body["password"] != plaintext  # paranoid double-check
+    assert sent_body["email"] == "admin@x"     # email untouched
+
+
+@pytest.mark.asyncio
 async def test_console_login_supports_host_prefixed_cookies(client: DifyClient) -> None:
     """Dify uses __Host- prefix on cookies for HTTPS deploys without cookie domain."""
     with respx.mock(base_url="http://dify.test") as m:
