@@ -7,6 +7,16 @@ Generates the YAML payload accepted by ``POST /console/api/apps/imports``
 For PR#1 we use Dify's basic ``chat`` mode (not Chatflow / advanced-chat) to
 keep the surface narrow. Chatflow support can be added in a later PR if
 custom workflow nodes (variable assignment, branching) become a requirement.
+
+``pre_prompt`` template + ``user_input_form``:
+    Dify's chat App wraps ``pre_prompt`` as ``role: system`` in the LLM call
+    (see ``api/core/prompt/prompt_templates/advanced_prompt_templates.py``
+    CHAT_APP_CHAT_PROMPT_CONFIG). We declare a single ``system_prompt``
+    template variable so the gateway can inject per-request system messages
+    (assembled from OpenAI ``messages: [system, ..., user]`` plus any prior
+    conversation turns) by passing ``inputs.system_prompt``. Without this
+    plumbing, OpenAI-style system messages were silently dropped by Dify
+    because ``inputs`` keys not referenced in ``pre_prompt`` are discarded.
 """
 
 from __future__ import annotations
@@ -14,6 +24,13 @@ from __future__ import annotations
 from typing import Any
 
 import yaml
+
+DSL_VERSION = "v3-dataset-enabled"
+"""Bump when ``build_chat_app_dsl`` output changes in a way that requires
+existing cached Apps to be rebuilt. :class:`AppManager` records this on each
+:class:`CachedApp` and forces a rebuild when the constant disagrees with the
+cached entry. Single source of truth: only this module produces DSL, so this
+constant covers every meaningful change."""
 
 
 def build_chat_app_dsl(
@@ -24,7 +41,6 @@ def build_chat_app_dsl(
     model_name: str,
     completion_params: dict[str, Any] | None = None,
     knowledge_base_ids: list[str] | None = None,
-    pre_prompt: str = "",
 ) -> str:
     """Render a Dify ``chat`` mode App into YAML.
 
@@ -38,13 +54,19 @@ def build_chat_app_dsl(
         completion_params: Per-request defaults (``temperature``, ``max_tokens``,
             etc.). Empty dict if omitted.
         knowledge_base_ids: Dify Dataset IDs to attach. Empty list if omitted.
-        pre_prompt: System prompt baked into the App.
 
     Returns:
         UTF-8 YAML string suitable for ``yaml-content`` import.
     """
+    # ``enabled: True`` is mandatory — Dify's DatasetConfigManager.convert
+    # (api/core/app/app_config/easy_ui_based_app/dataset/manager.py) silently
+    # drops any dataset entry without ``enabled=true``, leaving the App with
+    # an empty dataset list and no retrieval. Live RAG verification on
+    # 2026-05-21 hit this: dataset was created, document indexed, retrieve
+    # endpoint returned hits, but chat-with-RAG returned no references.
     datasets_block: list[dict[str, Any]] = [
-        {"dataset": {"id": kb_id}} for kb_id in (knowledge_base_ids or [])
+        {"dataset": {"id": kb_id, "enabled": True}}
+        for kb_id in (knowledge_base_ids or [])
     ]
 
     payload: dict[str, Any] = {
@@ -62,8 +84,20 @@ def build_chat_app_dsl(
                 "mode": "chat",
                 "completion_params": dict(completion_params or {}),
             },
-            "pre_prompt": pre_prompt,
-            "user_input_form": [],
+            # Single template variable wired to ``inputs.system_prompt`` on every
+            # ``/v1/chat-messages`` call. Dify expands this into the chat App's
+            # system-role prompt before the LLM sees it. Without the matching
+            # ``user_input_form`` declaration below, Dify rejects the import.
+            "pre_prompt": "{{system_prompt}}",
+            "user_input_form": [
+                {
+                    "paragraph": {
+                        "label": "System prompt (gateway-injected)",
+                        "variable": "system_prompt",
+                        "required": False,
+                    }
+                }
+            ],
             "dataset_configs": {
                 "retrieval_model": "multiple",
                 "datasets": {"datasets": datasets_block},
