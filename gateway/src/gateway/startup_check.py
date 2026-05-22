@@ -268,13 +268,19 @@ async def validate_registry(
     """
     issues: list[CheckIssue] = []
 
+    # Snapshot the customer list once. Two reasons: (1) the L1 and L2-L4
+    # loops below MUST see the same set of customers — otherwise a
+    # mid-check registry mutation (today impossible, but defensive) could
+    # let L1 issues come from a different customer set than L2-L4
+    # results, breaking the zip pairing; (2) avoids ``CustomerRegistry``
+    # constructing the list twice per startup.
+    customers = registry.customers()
+
     # L1 first — sync, blocks before any network.
-    for customer in registry.customers():
+    for customer in customers:
         issues.extend(check_format(customer))
 
-    # L2-L4 in parallel per-customer. Snapshot the list once so the zip
-    # below pairs results with the same customer objects we kicked off.
-    customers = registry.customers()
+    # L2-L4 in parallel per-customer.
     runtime_tasks = [
         _check_runtime(customer, client_factory(customer))
         for customer in customers

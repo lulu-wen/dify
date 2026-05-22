@@ -37,12 +37,13 @@ def _make_customer(
     customer_id: str = "tenant-a",
     sdk_key: str = "bsa_tenant_a_abcdef",
     dataset_api_key: str = "dataset-real-key-xyz",
+    base_url: str | None = None,
 ) -> CustomerEntry:
     return CustomerEntry(
         sdk_key=sdk_key,
         customer_id=customer_id,
         dify=DifyConnection(
-            base_url=f"http://dify-{customer_id}.test",
+            base_url=base_url or f"http://dify-{customer_id}.test",
             console_email="admin@example.com",
             console_password="pw",
             dataset_api_key=dataset_api_key,
@@ -301,6 +302,52 @@ class TestMultiCustomerAggregation:
         assert levels_per_customer["tenant-a"] == set()
         assert levels_per_customer["tenant-b"] == {"L1"}
         assert levels_per_customer["tenant-c"] == {"L2"}
+
+    @pytest.mark.asyncio
+    async def test_shared_dify_client_reuse_runs_check_per_customer(self) -> None:
+        """PR #4 shared mode: N customers share one DifyClient (same
+        ``base_url``). Factory caches per base_url, so the startup
+        check's ``_check_runtime`` tasks all receive the SAME client
+        instance. We still need to call ``console_login`` + ``list_datasets``
+        N times — once per customer's credentials — even though the
+        client is shared.
+
+        Without this guarantee, a quiet refactor in the factory or in
+        ``_check_runtime`` could collapse N logins into 1 and silently
+        miss credential failures for all-but-one of the customers.
+
+        Also documents the cookie-jar interference: every login mutates
+        the same DifyClient's cookie state. Sequential, not racy
+        (asyncio is single-threaded), but worth a regression test."""
+        shared_base = "http://shared-dify.test"
+        a = _make_customer(
+            customer_id="tenant-a",
+            sdk_key="bsa_a",
+            base_url=shared_base,
+        )
+        b = _make_customer(
+            customer_id="tenant-b",
+            sdk_key="bsa_b",
+            dataset_api_key="dataset-b-key",
+            base_url=shared_base,
+        )
+
+        registry = CustomerRegistry.from_entries([a, b])
+
+        # Factory returns the same fake for both customers — emulates
+        # the production factory's per-base_url caching.
+        shared_fake = _FakeDifyClient()
+
+        def shared_factory(_: CustomerEntry) -> DifyClient:
+            return shared_fake  # type: ignore[return-value]
+
+        issues = await validate_registry(registry, shared_factory)
+
+        assert issues == []
+        # Both customers must each have triggered a login + list call,
+        # even though the underlying client object is one and the same.
+        assert shared_fake.login_calls == 2
+        assert shared_fake.list_calls == 2
 
     @pytest.mark.asyncio
     async def test_empty_registry_is_a_no_op(self) -> None:
