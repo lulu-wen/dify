@@ -255,3 +255,59 @@ async def test_gc_swallows_delete_errors(
     # Should NOT raise.
     await manager._gc_sweep()
     assert len(manager.cached_apps()) == 0
+
+
+@pytest.mark.asyncio
+async def test_dsl_version_mismatch_forces_rebuild(
+    manager: AppManager, customer: CustomerEntry, fake_client: FakeDifyClient
+) -> None:
+    """A cached App tagged with an obsolete DSL_VERSION must be evicted and
+    rebuilt on next call. Regression for the silent-system-prompt-drop fix:
+    bumping ``DSL_VERSION`` is how the gateway invalidates Apps imported
+    before the ``{{system_prompt}}`` template was added.
+    """
+    # First call builds the cache normally.
+    await manager.get_app_key(customer, "m1")
+    cached = manager.cached_apps()[(customer.customer_id, "m1")]
+    assert cached.app_id == "app-1"
+
+    # Simulate a stored DSL version older than the current build.
+    cached.dsl_version = "legacy-v1"
+
+    # Next call must rebuild — different app_id + extra import call.
+    key = await manager.get_app_key(customer, "m1")
+    assert key == "app-key-2"
+    rebuilt = manager.cached_apps()[(customer.customer_id, "m1")]
+    assert rebuilt.app_id == "app-2"
+    assert len(fake_client.import_calls) == 2
+    # Stale App should have been deleted from Dify-side (best effort).
+    assert ("app-1",) == tuple(app_id for _, app_id in fake_client.delete_calls)
+
+
+@pytest.mark.asyncio
+async def test_dsl_version_rebuild_survives_stale_delete_failure(
+    registry: CustomerRegistry, customer: CustomerEntry
+) -> None:
+    """If deleting the stale Dify App fails, the rebuild path must still
+    produce a fresh App rather than refusing to upgrade the cache. The
+    workspace will have an orphan but the gateway stays available."""
+    flaky = FakeDifyClient()
+
+    async def boom(*_: Any, **__: Any) -> None:
+        raise DifyUpstreamError("500 internal")
+
+    flaky.console_delete_app = boom  # type: ignore[assignment]
+
+    def factory(_: CustomerEntry) -> DifyClient:  # type: ignore[return-value]
+        return flaky  # type: ignore[return-value]
+
+    manager = AppManager(
+        registry=registry, client_factory=factory, ttl_s=60, gc_interval_s=3600
+    )
+    await manager.get_app_key(customer, "m1")
+    manager.cached_apps()[(customer.customer_id, "m1")].dsl_version = "legacy-v1"
+
+    # Despite delete failure, get_app_key must succeed with a freshly built App.
+    key = await manager.get_app_key(customer, "m1")
+    assert key == "app-key-2"
+    assert len(flaky.import_calls) == 2
