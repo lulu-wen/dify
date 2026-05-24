@@ -72,6 +72,44 @@ _DATASET_KEY_PREFIX = "dataset-"
 # Long enough to confirm "right prefix" without leaking the random tail.
 _KEY_PREVIEW_LEN = 16
 
+# Exception types that mean "network is unreachable" rather than "Dify
+# rejected the credentials". Used by :func:`_is_network_failure` to
+# unwrap the ``DifyUpstreamError`` / ``UpstreamClientError`` wrappers
+# that :class:`DifyClient` applies around raw ``httpx`` failures.
+_NETWORK_EXC_TYPES: tuple[type[BaseException], ...] = (
+    httpx.RequestError,
+    DifyTimeoutError,
+    OSError,
+)
+
+
+def _is_network_failure(exc: BaseException) -> bool:
+    """Return True iff ``exc`` originated from a network-layer failure.
+
+    :class:`DifyClient` wraps ``httpx.RequestError`` (including
+    ``ConnectError``, ``ReadError``, etc.) into ``DifyUpstreamError``
+    via ``raise DifyUpstreamError(...) from e``. So an unreachable Dify
+    deployment surfaces here as an **auth-shaped** :class:`DifyUpstreamError`,
+    not a raw :class:`httpx.RequestError`. Without unwrapping, the
+    L2 / L3 distinction collapses — every connectivity failure ends up
+    misclassified as a credential failure, and the operator gets a
+    misleading "console_login rejected" message plus an unnecessary
+    L4 call against the down host.
+
+    We unwrap by walking ``__cause__`` (set by ``raise X from e``) and
+    checking whether any link in the chain is a network exception type.
+    Direct network exceptions also match (for defence-in-depth — if a
+    future DifyClient stops wrapping, behaviour stays correct).
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _NETWORK_EXC_TYPES):
+            return True
+        current = current.__cause__
+    return False
+
 
 @dataclass(frozen=True)
 class CheckIssue:
@@ -180,20 +218,22 @@ async def _check_runtime(
 
     network_down = False
 
-    # L3 first (also covers L2 implicitly).
-    try:
-        await client.console_login(
-            customer.dify.console_email,
-            customer.dify.console_password,
-        )
-    except (httpx.RequestError, DifyTimeoutError, OSError) as exc:
-        # Network-shaped failure → L2.
+    def _record_network_l2(exc: BaseException) -> None:
+        """Build an L2 issue for a network-level failure. ``exc`` may be
+        the wrapping ``DifyUpstreamError`` or the raw cause; we surface
+        the most informative form by reaching through ``__cause__``."""
+        nonlocal network_down
         network_down = True
+        root: BaseException = exc
+        while root.__cause__ is not None and isinstance(
+            root.__cause__, _NETWORK_EXC_TYPES
+        ):
+            root = root.__cause__
         issues.append(
             CheckIssue(
                 customer_id=customer.customer_id,
                 level="L2",
-                message=f"cannot reach {customer.dify.base_url}: {exc}",
+                message=f"cannot reach {customer.dify.base_url}: {root}",
                 hint=(
                     "Verify the Dify deployment is running (e.g. "
                     "`docker compose ps`) and that base_url resolves + is "
@@ -201,47 +241,51 @@ async def _check_runtime(
                 ),
             )
         )
-    except DifyUpstreamError as exc:
-        # Auth-shaped failure → L3.
-        issues.append(
-            CheckIssue(
-                customer_id=customer.customer_id,
-                level="L3",
-                message=f"console_login rejected: {exc}",
-                hint=(
-                    "Confirm console_email + console_password in the registry "
-                    "match the Dify admin account. A password rotated in Dify "
-                    "Web UI requires updating the registry too."
-                ),
-            )
+
+    # L3 first (also covers L2 — DifyClient wraps httpx.RequestError
+    # into DifyUpstreamError, so we have to unwrap via __cause__ to
+    # tell connectivity failures apart from credential failures).
+    try:
+        await client.console_login(
+            customer.dify.console_email,
+            customer.dify.console_password,
         )
+    except (httpx.RequestError, DifyTimeoutError, OSError) as exc:
+        # Defence-in-depth: a DifyClient that ever stops wrapping would
+        # still classify correctly here.
+        _record_network_l2(exc)
+    except DifyUpstreamError as exc:
+        if _is_network_failure(exc):
+            # The "auth-shaped" wrapper hides a network failure underneath.
+            _record_network_l2(exc)
+        else:
+            issues.append(
+                CheckIssue(
+                    customer_id=customer.customer_id,
+                    level="L3",
+                    message=f"console_login rejected: {exc}",
+                    hint=(
+                        "Confirm console_email + console_password in the registry "
+                        "match the Dify admin account. A password rotated in Dify "
+                        "Web UI requires updating the registry too."
+                    ),
+                )
+            )
 
     # Skip L4 only if L2 actually failed — L3 failure shouldn't block it.
     if network_down:
         return issues
 
-    # L4 dataset auth.
+    # L4 dataset auth. Same wrapping problem: list_datasets wraps
+    # httpx.RequestError as DifyUpstreamError, so a network blip between
+    # L3 success and L4 would otherwise look like a key rejection.
     try:
         await client.list_datasets(
             dataset_api_key=customer.dify.dataset_api_key,
             page=1,
             limit=1,
         )
-    except (DifyUpstreamError, UpstreamClientError) as exc:
-        issues.append(
-            CheckIssue(
-                customer_id=customer.customer_id,
-                level="L4",
-                message=f"dataset_api_key rejected by Dify: {exc}",
-                hint=(
-                    "The key may be revoked, belong to a different workspace, "
-                    "or still be the PR #1 placeholder. Regenerate in Dify "
-                    "Web UI → Knowledge → 服務 API."
-                ),
-            )
-        )
     except (httpx.RequestError, DifyTimeoutError, OSError) as exc:
-        # Network blip between L3 success and L4 — unusual but recoverable.
         issues.append(
             CheckIssue(
                 customer_id=customer.customer_id,
@@ -249,6 +293,31 @@ async def _check_runtime(
                 message=f"dataset_api_key check network error: {exc}",
             )
         )
+    except (DifyUpstreamError, UpstreamClientError) as exc:
+        if _is_network_failure(exc):
+            issues.append(
+                CheckIssue(
+                    customer_id=customer.customer_id,
+                    level="L4",
+                    message=(
+                        f"dataset_api_key check network error: "
+                        f"{exc.__cause__ or exc}"
+                    ),
+                )
+            )
+        else:
+            issues.append(
+                CheckIssue(
+                    customer_id=customer.customer_id,
+                    level="L4",
+                    message=f"dataset_api_key rejected by Dify: {exc}",
+                    hint=(
+                        "The key may be revoked, belong to a different workspace, "
+                        "or still be the PR #1 placeholder. Regenerate in Dify "
+                        "Web UI → Knowledge → 服務 API."
+                    ),
+                )
+            )
 
     return issues
 

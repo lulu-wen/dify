@@ -159,10 +159,12 @@ class TestRuntimeChecks:
         assert fake.list_calls == 1
 
     @pytest.mark.asyncio
-    async def test_network_down_reports_l2_and_skips_l4(self) -> None:
-        """When console_login raises a network error, the check reports L2
-        and does NOT try the dataset key — both calls would fail with the
-        same network error and the duplicate noise isn't useful."""
+    async def test_network_down_raw_httpx_error_reports_l2_and_skips_l4(
+        self,
+    ) -> None:
+        """Defence-in-depth path: if the DifyClient ever stops wrapping
+        ``httpx.RequestError`` (or a test/double raises raw), the L2
+        branch still catches it directly."""
         c = _make_customer()
         registry = CustomerRegistry.from_entries([c])
         fake = _FakeDifyClient()
@@ -176,6 +178,80 @@ class TestRuntimeChecks:
         assert "docker compose ps" in (issues[0].hint or "")
         # L4 must NOT have been attempted.
         assert fake.list_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_network_down_wrapped_in_dify_upstream_error_still_l2(
+        self,
+    ) -> None:
+        """Production DifyClient wraps ``httpx.RequestError`` as
+        ``DifyUpstreamError`` via ``raise ... from e``. Without unwrapping
+        ``__cause__``, an unreachable Dify deployment would be misclassified
+        as an L3 (auth) failure and the operator would chase the wrong
+        bug. Regression for the codex review-2 P2 finding.
+        """
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        # Build the same exception shape DifyClient.console_login produces:
+        #   raise DifyUpstreamError("...") from httpx.ConnectError("...")
+        original = httpx.ConnectError("connection refused")
+        try:
+            raise DifyUpstreamError(
+                f"Dify console login failed: {original}"
+            ) from original
+        except DifyUpstreamError as wrapped:
+            fake.login_error = wrapped
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        issue = issues[0]
+        # Critical: must classify as L2, NOT L3.
+        assert issue.level == "L2", (
+            f"Expected L2 (network), got {issue.level}. The wrapped "
+            f"DifyUpstreamError needs __cause__ unwrapping."
+        )
+        # Message should surface the underlying network exception, not
+        # the "console_login rejected" auth phrasing.
+        assert "cannot reach" in issue.message
+        assert "console_login rejected" not in issue.message
+        # And L4 must NOT have been attempted — the down host can't
+        # possibly answer a dataset call either.
+        assert fake.list_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_network_blip_at_l4_wrapped_in_dify_upstream_error_still_l4_network(
+        self,
+    ) -> None:
+        """Same wrapping problem at L4: list_datasets wraps
+        httpx.RequestError as DifyUpstreamError. If L3 succeeded (network
+        was up at that moment) but the connection drops before L4, the
+        L4 issue should still be classified as a network error, not a
+        bogus 'dataset key rejected'."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        original = httpx.ReadError("network reset")
+        try:
+            raise DifyUpstreamError(
+                f"Dify list-datasets failed: {original}"
+            ) from original
+        except DifyUpstreamError as wrapped:
+            fake.list_error = wrapped
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        # Login succeeded, list failed with wrapped network error.
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.level == "L4"
+        # Message must surface "network error", not "rejected by Dify".
+        assert "network error" in issue.message
+        assert "rejected by Dify" not in issue.message
+        # And the underlying httpx exception text should bubble up.
+        assert "network reset" in issue.message
 
     @pytest.mark.asyncio
     async def test_timeout_treated_as_l2(self) -> None:
