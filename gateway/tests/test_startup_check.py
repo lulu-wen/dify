@@ -531,7 +531,51 @@ class TestLifespanWiring:
     main.py forgets to call it — that's a wiring bug the unit tests
     above won't catch. Drives the lifespan context manually so we
     observe whether run_startup_check actually fires at boot.
+
+    Codex review-3 P2: tests in this class must override
+    ``app.state.dify_client_factory`` with a fake BEFORE entering the
+    lifespan context. The lifespan reads the factory from
+    ``app.state`` at call time (not from closure), so the override
+    actually takes effect. Without this, lifespan would issue real
+    httpx calls against the registry's ``base_url``, which is slow,
+    flaky, and tests behaviour that doesn't match production.
     """
+
+    def _make_app_with_fake(
+        self,
+        *,
+        customer: CustomerEntry,
+        strict: bool,
+        fake_login_error: BaseException | None = None,
+    ) -> tuple[Any, _FakeDifyClient]:
+        """Helper: build app + register fake factory + return both.
+
+        Returns ``(app, fake)`` so the caller can assert behaviour on
+        either side.
+        """
+        from gateway.config import Settings
+        from gateway.main import create_app
+
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            strict_startup=strict,
+        )
+
+        app = create_app(settings=settings, registry=registry)
+
+        fake = _FakeDifyClient()
+        if fake_login_error is not None:
+            fake.login_error = fake_login_error
+
+        def factory(_: CustomerEntry) -> DifyClient:
+            return fake  # type: ignore[return-value]
+
+        # Critical: override BEFORE entering lifespan. Lifespan reads
+        # this at call time so the override takes effect.
+        app.state.dify_client_factory = factory
+        return app, fake
 
     @pytest.mark.asyncio
     async def test_strict_lifespan_aborts_when_format_fails(self) -> None:
@@ -539,47 +583,85 @@ class TestLifespanWiring:
         a malformed registry must abort startup with RuntimeError. If
         someone deletes the run_startup_check call from lifespan, this
         test will start passing-by-accident (no raise) and flip to
-        failing here, surfacing the regression at PR review time."""
-        from gateway.config import Settings
-        from gateway.main import create_app
-        from gateway.registry import CustomerRegistry
+        failing here, surfacing the regression at PR review time.
 
+        The fake factory means L1 format failures are the only issues
+        (network L2-L4 all clean), so we're testing strict-mode-on-L1
+        in isolation.
+        """
         bad = _make_customer(sdk_key="wrong", dataset_api_key="wrong")
-        registry = CustomerRegistry.from_entries([bad])
-        settings = Settings(
-            registry_path="unused.yaml",
-            log_json=False,
-            strict_startup=True,
-        )
-
-        app = create_app(settings=settings, registry=registry)
+        app, fake = self._make_app_with_fake(customer=bad, strict=True)
 
         with pytest.raises(RuntimeError, match="GATEWAY_STRICT_STARTUP"):
             async with app.router.lifespan_context(app):
-                pass  # We never reach here — startup_check raised.
+                pass  # never reached — startup_check raised
+
+        # Network checks DID run against the fake (proves factory override
+        # took effect) and didn't fail there (proves the only issues are
+        # L1 format).
+        assert fake.login_calls == 1
 
     @pytest.mark.asyncio
     async def test_warn_only_lifespan_continues_on_failure(self) -> None:
         """Mirror of the strict-mode wiring test: default mode must let
         the lifespan complete normally even when the registry is
         malformed (logs warnings, doesn't raise)."""
+        bad = _make_customer(dataset_api_key="not-a-real-key")
+        app, fake = self._make_app_with_fake(customer=bad, strict=False)
+
+        # No raise expected — lifespan enters + exits cleanly.
+        async with app.router.lifespan_context(app):
+            pass
+
+        # Verify the override actually flowed through — runtime checks
+        # used the fake, not real httpx.
+        assert fake.login_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_lifespan_uses_state_factory_override(self) -> None:
+        """Codex review-3 regression: directly verify that overriding
+        ``app.state.dify_client_factory`` AFTER ``create_app`` returns is
+        respected by the lifespan's startup_check. Earlier the lifespan
+        closed over the original factory and the override was silently
+        ignored — production never overrides post-create_app, but the
+        fixture pattern does, and tests need this to stay deterministic.
+
+        If a future refactor reverts to closing over the factory, this
+        test starts hitting real network (or failing because no httpx
+        access in the sandbox), surfacing the regression loudly.
+        """
         from gateway.config import Settings
         from gateway.main import create_app
-        from gateway.registry import CustomerRegistry
 
-        bad = _make_customer(dataset_api_key="not-a-real-key")
-        registry = CustomerRegistry.from_entries([bad])
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
         settings = Settings(
             registry_path="unused.yaml",
             log_json=False,
             strict_startup=False,
         )
-
         app = create_app(settings=settings, registry=registry)
 
-        # No raise expected — lifespan enters + exits cleanly.
+        # Build two fakes to prove the override actually wins.
+        original_fake = _FakeDifyClient()
+        override_fake = _FakeDifyClient()
+
+        # Sanity: original_fake is what create_app's factory would
+        # normally hit. But we replace BEFORE entering lifespan so
+        # the override should be the one called.
+        def overriding_factory(_: CustomerEntry) -> DifyClient:
+            return override_fake  # type: ignore[return-value]
+
+        app.state.dify_client_factory = overriding_factory
+
         async with app.router.lifespan_context(app):
             pass
+
+        # Override fake saw the calls; original fake didn't.
+        assert override_fake.login_calls == 1
+        assert override_fake.list_calls == 1
+        assert original_fake.login_calls == 0
+        assert original_fake.list_calls == 0
 
 
 # --------------------------------------------------------------------------- #
