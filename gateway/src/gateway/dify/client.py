@@ -588,6 +588,36 @@ class DifyClient:
             raise DifyUpstreamError("Dify api-key response missing token")
         return str(token)
 
+    async def console_create_dataset_api_key(self, session: ConsoleSession) -> str:
+        """Generate a new ``dataset-*`` token scoped to the workspace.
+
+        Dataset API keys (unlike App keys) are workspace-global — one
+        key can list / read / write every dataset visible to the
+        workspace. The gateway uses this during customer onboarding to
+        replace the historically manual "go to Dify Web UI → Knowledge
+        → 服務 API → 建立新的金鑰" step that operators kept skipping,
+        leaving placeholders like ``dataset-not-used-in-pr1`` in the
+        registry and 401'ing on the first KB request.
+
+        The endpoint mirrors the App key path
+        (``POST /console/api/datasets/api-keys``), see Dify source
+        ``api/controllers/console/datasets/datasets.py``.
+        """
+        self._set_session_cookies(session)
+        try:
+            resp = await self._http.post(
+                "/console/api/datasets/api-keys",
+                headers=_console_headers(session),
+            )
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify dataset api-key creation failed: {e}") from e
+        _raise_for_dify_status(resp)
+        data = resp.json()
+        token = data.get("token")
+        if not token:
+            raise DifyUpstreamError("Dify dataset api-key response missing token")
+        return str(token)
+
     async def console_delete_app(self, session: ConsoleSession, app_id: str) -> None:
         """Delete an App (used by the GC sweep)."""
         self._set_session_cookies(session)

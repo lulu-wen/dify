@@ -12,7 +12,11 @@ dependencies = [
     "python-multipart>=0.0.18",
     "pyyaml>=6.0",
     "structlog>=24.4",
+    "click>=8.1",
 ]
+
+[project.scripts]
+gateway-admin = "gateway.admin.cli:main"
 
 [project.optional-dependencies]
 dev = [
