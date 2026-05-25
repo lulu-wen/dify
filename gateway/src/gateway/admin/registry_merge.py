@@ -26,6 +26,17 @@ filesystem-level swap is atomic; what isn't is the brief window where
 both files might exist if the process is SIGKILL'd between
 ``write+close`` and ``replace``). Good enough — the worst case is an
 ``.tmp`` orphan, which we clean up on next run.
+
+Caveat — comments are not preserved:
+
+``yaml.safe_load`` → ``yaml.safe_dump`` round-trip strips YAML comments.
+Operators who hand-edit ``registry.yaml`` with explanatory comments
+will lose them on every ``gateway-admin add-customer`` invocation
+(self-review P2-2). The fix is to swap PyYAML for ``ruamel.yaml``
+(which preserves comments), but that's a new top-level dependency
+just for this one ergonomic concern. Documented here so operators
+keep narrative notes in a sibling file (``registry.notes.md`` etc.)
+or commit messages rather than as inline YAML comments.
 """
 
 from __future__ import annotations

@@ -290,6 +290,16 @@ def add_customer(
             hide_input=True,
         )
 
+    # 1a. Normalise --mode case BEFORE any side-effecting work. Click's
+    # ``case_sensitive=False`` accepts ``SHARED`` / ``Shared`` but passes
+    # the original case through to us. ``DifyConnection.mode`` is
+    # ``Literal["dedicated", "shared"]`` and pydantic only accepts the
+    # lowercase form. Without normalising here, the CLI would: log into
+    # Dify successfully → create a real dataset_api_key → THEN fail at
+    # CustomerEntry validation, leaving the freshly-created key
+    # orphaned on the Dify side (PR #6 self-review P2-1).
+    mode = mode.lower()
+
     # 2. Generate / validate SDK key.
     if sdk_key is None:
         sdk_key = _generate_sdk_key()

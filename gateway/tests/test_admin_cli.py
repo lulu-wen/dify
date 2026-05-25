@@ -405,6 +405,66 @@ class TestAddCustomerCommand:
         assert result.exit_code != 0
         assert "--shared-embedding-name is required" in result.output
 
+    def test_uppercase_mode_normalised_before_dify_call(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Self-review P2-1 regression: --mode SHARED (uppercase) must
+        be lowercased BEFORE we talk to Dify, not after. If we did the
+        normalisation after the Dify round-trip, an uppercase --mode
+        would create a dataset key on Dify side and then fail at
+        pydantic validation, leaving an orphan key the operator has to
+        clean up manually."""
+        registry_path = tmp_path / "registry.yaml"
+        runner = CliRunner()
+
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--mode", "SHARED",                       # ← uppercase
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        # Whole thing succeeds — pydantic accepts the lowercased value.
+        assert result.exit_code == 0, result.output
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        assert loaded["customers"][0]["dify"]["mode"] == "shared"
+
+    def test_password_never_appears_in_output(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Defensive: SDK key is the only secret the CLI prints. The
+        Dify admin password must never make it to stdout or stderr,
+        even when the operator captures output for an issue report."""
+        registry_path = tmp_path / "registry.yaml"
+        runner = CliRunner()
+
+        # Use a distinctive password we can grep for.
+        secret_password = "S3cret-D1fy-Adm1n-Pwd"
+
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", secret_password,
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        # Password must not appear anywhere in stdout/stderr the
+        # operator might paste into Slack / a bug report.
+        assert secret_password not in result.output
+        # Password is still persisted to registry.yaml — the CLI's job
+        # is not to redact disk state, only operator-visible output.
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        assert loaded["customers"][0]["dify"]["console_password"] == secret_password
+
 
 # --------------------------------------------------------------------------- #
 # Bonus: ConsoleSession fixture covers DifyClient.console_create_dataset_api_key
