@@ -23,6 +23,7 @@ from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
 from gateway.routers import files as files_router
 from gateway.routers import models as models_router
+from gateway.startup_check import run_startup_check
 
 logger = structlog.get_logger(__name__)
 
@@ -77,9 +78,30 @@ def create_app(
     )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
         try:
+            # PR #5: validate registry against real Dify deployments before
+            # accepting traffic. Raises RuntimeError (and so aborts uvicorn
+            # startup with non-zero exit) when settings.strict_startup is
+            # True; otherwise logs warnings and continues.
+            #
+            # Codex review-3 P2: read the factory from app.state at call
+            # time, NOT from the closure captured during create_app. Tests
+            # (see ``conftest.py::app``) replace
+            # ``app.state.dify_client_factory`` AFTER ``create_app`` returns
+            # so requests hit a FakeDifyClient instead of doing real HTTP.
+            # If lifespan closed over the original factory, lifespan-using
+            # tests would issue real httpx calls against the registry's
+            # ``base_url`` — slow, flaky, and worst of all not actually
+            # testing what production does (production never has a
+            # post-create_app override).
+            active_factory = app_instance.state.dify_client_factory
+            await run_startup_check(
+                registry,
+                active_factory,
+                strict=settings.strict_startup,
+            )
             yield
         finally:
             await app_manager.stop()

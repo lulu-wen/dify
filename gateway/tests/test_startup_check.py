@@ -1,0 +1,681 @@
+"""Tests for the registry startup health check (PR #5).
+
+Coverage:
+- L1 format checks for sdk_key + dataset_api_key prefixes
+- L2 connectivity (httpx.RequestError → L2 issue, L4 skipped)
+- L3 console auth (DifyUpstreamError → L3 issue, L4 still tried)
+- L4 dataset auth (DifyUpstreamError → L4 issue)
+- Multi-customer parallel aggregation
+- Strict vs warn-only modes
+- Healthy registry produces zero issues
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+import pytest
+
+from gateway.dify.client import ConsoleSession, DifyClient
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
+from gateway.registry import CustomerEntry, CustomerRegistry, DifyConnection, ModelEntry
+from gateway.startup_check import (
+    CheckIssue,
+    check_format,
+    run_startup_check,
+    validate_registry,
+)
+
+# --------------------------------------------------------------------------- #
+# Fixtures
+# --------------------------------------------------------------------------- #
+
+
+def _make_customer(
+    *,
+    customer_id: str = "tenant-a",
+    sdk_key: str = "bsa_tenant_a_abcdef",
+    dataset_api_key: str = "dataset-real-key-xyz",
+    base_url: str | None = None,
+) -> CustomerEntry:
+    return CustomerEntry(
+        sdk_key=sdk_key,
+        customer_id=customer_id,
+        dify=DifyConnection(
+            base_url=base_url or f"http://dify-{customer_id}.test",
+            console_email="admin@example.com",
+            console_password="pw",
+            dataset_api_key=dataset_api_key,
+        ),
+        models=[ModelEntry(id="m1", provider="prov", name="n")],
+    )
+
+
+class _FakeDifyClient:
+    """Scriptable fake — set ``login_error`` / ``list_error`` to raise."""
+
+    def __init__(self) -> None:
+        self.login_error: BaseException | None = None
+        self.list_error: BaseException | None = None
+        self.login_calls = 0
+        self.list_calls = 0
+
+    async def console_login(self, email: str, password: str) -> ConsoleSession:
+        self.login_calls += 1
+        if self.login_error is not None:
+            raise self.login_error
+        return ConsoleSession(access_token="acc", csrf_token="csrf")
+
+    async def list_datasets(self, **kwargs: Any) -> dict[str, Any]:
+        self.list_calls += 1
+        if self.list_error is not None:
+            raise self.list_error
+        return {"data": [], "has_more": False, "total": 0, "page": 1, "limit": 1}
+
+
+def _factory(client_for: dict[str, _FakeDifyClient]):
+    def factory(customer: CustomerEntry) -> DifyClient:
+        # Test-only cast: _FakeDifyClient has the methods we call.
+        return client_for[customer.customer_id]  # type: ignore[return-value]
+    return factory
+
+
+# --------------------------------------------------------------------------- #
+# L1: format checks (synchronous, no I/O)
+# --------------------------------------------------------------------------- #
+
+
+class TestCheckFormat:
+    def test_clean_customer_yields_no_issues(self) -> None:
+        c = _make_customer()
+        assert check_format(c) == []
+
+    def test_sdk_key_missing_prefix_caught(self) -> None:
+        c = _make_customer(sdk_key="totally-wrong-key")
+        issues = check_format(c)
+        assert len(issues) == 1
+        assert issues[0].level == "L1"
+        assert "sdk_key must start with 'bsa_'" in issues[0].message
+        # Redacted preview must NOT expose the full key (defence against
+        # log leakage when operators paste error reports).
+        assert "totally-wrong-key" not in issues[0].message
+
+    def test_dataset_key_obvious_garbage_caught(self) -> None:
+        """A dataset_api_key that doesn't even have the ``dataset-`` prefix
+        is the cheap case — L1 catches it before any network round-trip."""
+        c = _make_customer(dataset_api_key="just-a-string")
+        issues = check_format(c)
+        assert len(issues) == 1
+        assert issues[0].level == "L1"
+        assert "dataset_api_key must start with 'dataset-'" in issues[0].message
+        assert "Knowledge → 服務 API" in (issues[0].hint or "")
+
+    def test_dataset_key_placeholder_with_right_prefix_passes_l1(self) -> None:
+        """The specific placeholder ``dataset-not-used-in-pr1`` (which
+        triggered a 401 during PR #4 verification) starts with the right
+        prefix, so L1 alone can't catch it — this is the exact case L4
+        (live Dify round-trip) exists to handle. Confirming L1 does NOT
+        false-positive here ensures L4 stays load-bearing for placeholder
+        detection."""
+        c = _make_customer(dataset_api_key="dataset-not-used-in-pr1")
+        assert check_format(c) == []
+
+    def test_both_keys_wrong_reports_both(self) -> None:
+        c = _make_customer(sdk_key="wrong", dataset_api_key="also-wrong")
+        issues = check_format(c)
+        assert len(issues) == 2
+        assert {i.level for i in issues} == {"L1"}
+
+    def test_redact_keeps_prefix_only(self) -> None:
+        """Operators need to see 'oh, this is the wrong key family' from
+        logs without the high-entropy tail leaking through."""
+        c = _make_customer(sdk_key="garbage-with-secret-suffix-1234567890abcdef")
+        issues = check_format(c)
+        msg = issues[0].message
+        # The first 16 chars get included so 'garbage-with-sec' shows up
+        assert "garbage-with-sec" in msg
+        # The high-entropy tail is hidden
+        assert "1234567890abcdef" not in msg
+
+
+# --------------------------------------------------------------------------- #
+# L2-L4: runtime checks (with fake DifyClient)
+# --------------------------------------------------------------------------- #
+
+
+class TestRuntimeChecks:
+    @pytest.mark.asyncio
+    async def test_healthy_dify_yields_no_runtime_issues(self) -> None:
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert issues == []
+        # Both calls fired.
+        assert fake.login_calls == 1
+        assert fake.list_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_network_down_raw_httpx_error_reports_l2_and_skips_l4(
+        self,
+    ) -> None:
+        """Defence-in-depth path: if the DifyClient ever stops wrapping
+        ``httpx.RequestError`` (or a test/double raises raw), the L2
+        branch still catches it directly."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.login_error = httpx.ConnectError("connection refused")
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        assert issues[0].level == "L2"
+        assert "cannot reach" in issues[0].message
+        assert "docker compose ps" in (issues[0].hint or "")
+        # L4 must NOT have been attempted.
+        assert fake.list_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_network_down_wrapped_in_dify_upstream_error_still_l2(
+        self,
+    ) -> None:
+        """Production DifyClient wraps ``httpx.RequestError`` as
+        ``DifyUpstreamError`` via ``raise ... from e``. Without unwrapping
+        ``__cause__``, an unreachable Dify deployment would be misclassified
+        as an L3 (auth) failure and the operator would chase the wrong
+        bug. Regression for the codex review-2 P2 finding.
+        """
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        # Build the same exception shape DifyClient.console_login produces:
+        #   raise DifyUpstreamError("...") from httpx.ConnectError("...")
+        original = httpx.ConnectError("connection refused")
+        try:
+            raise DifyUpstreamError(
+                f"Dify console login failed: {original}"
+            ) from original
+        except DifyUpstreamError as wrapped:
+            fake.login_error = wrapped
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        issue = issues[0]
+        # Critical: must classify as L2, NOT L3.
+        assert issue.level == "L2", (
+            f"Expected L2 (network), got {issue.level}. The wrapped "
+            f"DifyUpstreamError needs __cause__ unwrapping."
+        )
+        # Message should surface the underlying network exception, not
+        # the "console_login rejected" auth phrasing.
+        assert "cannot reach" in issue.message
+        assert "console_login rejected" not in issue.message
+        # And L4 must NOT have been attempted — the down host can't
+        # possibly answer a dataset call either.
+        assert fake.list_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_network_blip_at_l4_wrapped_in_dify_upstream_error_still_l4_network(
+        self,
+    ) -> None:
+        """Same wrapping problem at L4: list_datasets wraps
+        httpx.RequestError as DifyUpstreamError. If L3 succeeded (network
+        was up at that moment) but the connection drops before L4, the
+        L4 issue should still be classified as a network error, not a
+        bogus 'dataset key rejected'."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        original = httpx.ReadError("network reset")
+        try:
+            raise DifyUpstreamError(
+                f"Dify list-datasets failed: {original}"
+            ) from original
+        except DifyUpstreamError as wrapped:
+            fake.list_error = wrapped
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        # Login succeeded, list failed with wrapped network error.
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.level == "L4"
+        # Message must surface "network error", not "rejected by Dify".
+        assert "network error" in issue.message
+        assert "rejected by Dify" not in issue.message
+        # And the underlying httpx exception text should bubble up.
+        assert "network reset" in issue.message
+
+    @pytest.mark.asyncio
+    async def test_timeout_treated_as_l2(self) -> None:
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.login_error = DifyTimeoutError("login timed out")
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        assert issues[0].level == "L2"
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_reports_l3_but_still_tries_l4(self) -> None:
+        """Console auth and dataset auth use different bearer tokens — a
+        bad console password doesn't mean the dataset key is also broken,
+        so we still report on L4 independently."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.login_error = DifyUpstreamError("Dify returned HTTP 401: bad password")
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        # Only L3 because L4 succeeded.
+        assert len(issues) == 1
+        assert issues[0].level == "L3"
+        # L4 was attempted.
+        assert fake.list_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_dataset_key_rejected_reports_l4(self) -> None:
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.list_error = DifyUpstreamError(
+            "Dify returned HTTP 401: Access token is invalid"
+        )
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        assert issues[0].level == "L4"
+        assert "dataset_api_key rejected" in issues[0].message
+        assert "Knowledge → 服務 API" in (issues[0].hint or "")
+
+    @pytest.mark.asyncio
+    async def test_upstream_client_error_also_reports_l4(self) -> None:
+        """The dataset router can surface ``UpstreamClientError`` for 4xx
+        on the Dify side (codex review-1 P2). Startup check must treat
+        that as an L4 fail too, not let it escape."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.list_error = UpstreamClientError(
+            "Dify rejected request (HTTP 403): disabled",
+            upstream_status=403,
+        )
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        assert len(issues) == 1
+        assert issues[0].level == "L4"
+
+    @pytest.mark.asyncio
+    async def test_both_auths_failing_reports_both(self) -> None:
+        """L3 + L4 are independent — a misconfigured customer can fail
+        both. Report both so the operator gets the full picture in one
+        startup, not over two restart cycles."""
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.login_error = DifyUpstreamError("HTTP 401: bad password")
+        fake.list_error = DifyUpstreamError("HTTP 401: bad dataset key")
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        levels = {i.level for i in issues}
+        assert levels == {"L3", "L4"}
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation across multiple customers
+# --------------------------------------------------------------------------- #
+
+
+class TestMultiCustomerAggregation:
+    @pytest.mark.asyncio
+    async def test_parallel_check_one_customer_failure_doesnt_mask_others(self) -> None:
+        """The whole point of asyncio.gather: a slow / broken customer
+        shouldn't delay or hide failures from other customers."""
+        a = _make_customer(customer_id="tenant-a", sdk_key="bsa_a")
+        b = _make_customer(
+            customer_id="tenant-b",
+            sdk_key="bsa_b",
+            dataset_api_key="not-a-real-key",  # L1 fail
+        )
+        c = _make_customer(customer_id="tenant-c", sdk_key="bsa_c")
+
+        registry = CustomerRegistry.from_entries([a, b, c])
+
+        fake_a = _FakeDifyClient()
+        fake_b = _FakeDifyClient()  # L1 catches first; runtime still runs but clean
+        fake_c = _FakeDifyClient()
+        fake_c.login_error = httpx.ConnectError("c is down")
+
+        issues = await validate_registry(
+            registry,
+            _factory(
+                {
+                    "tenant-a": fake_a,
+                    "tenant-b": fake_b,
+                    "tenant-c": fake_c,
+                }
+            ),
+        )
+
+        levels_per_customer = {
+            cust: {i.level for i in issues if i.customer_id == cust}
+            for cust in ("tenant-a", "tenant-b", "tenant-c")
+        }
+
+        assert levels_per_customer["tenant-a"] == set()
+        assert levels_per_customer["tenant-b"] == {"L1"}
+        assert levels_per_customer["tenant-c"] == {"L2"}
+
+    @pytest.mark.asyncio
+    async def test_shared_dify_client_reuse_runs_check_per_customer(self) -> None:
+        """PR #4 shared mode: N customers share one DifyClient (same
+        ``base_url``). Factory caches per base_url, so the startup
+        check's ``_check_runtime`` tasks all receive the SAME client
+        instance. We still need to call ``console_login`` + ``list_datasets``
+        N times — once per customer's credentials — even though the
+        client is shared.
+
+        Without this guarantee, a quiet refactor in the factory or in
+        ``_check_runtime`` could collapse N logins into 1 and silently
+        miss credential failures for all-but-one of the customers.
+
+        Also documents the cookie-jar interference: every login mutates
+        the same DifyClient's cookie state. Sequential, not racy
+        (asyncio is single-threaded), but worth a regression test."""
+        shared_base = "http://shared-dify.test"
+        a = _make_customer(
+            customer_id="tenant-a",
+            sdk_key="bsa_a",
+            base_url=shared_base,
+        )
+        b = _make_customer(
+            customer_id="tenant-b",
+            sdk_key="bsa_b",
+            dataset_api_key="dataset-b-key",
+            base_url=shared_base,
+        )
+
+        registry = CustomerRegistry.from_entries([a, b])
+
+        # Factory returns the same fake for both customers — emulates
+        # the production factory's per-base_url caching.
+        shared_fake = _FakeDifyClient()
+
+        def shared_factory(_: CustomerEntry) -> DifyClient:
+            return shared_fake  # type: ignore[return-value]
+
+        issues = await validate_registry(registry, shared_factory)
+
+        assert issues == []
+        # Both customers must each have triggered a login + list call,
+        # even though the underlying client object is one and the same.
+        assert shared_fake.login_calls == 2
+        assert shared_fake.list_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_is_a_no_op(self) -> None:
+        """A registry with no customers shouldn't crash the gather call."""
+        # CustomerRegistry.from_entries requires at least one entry, so
+        # build a minimal one to confirm gather() behaves with the single
+        # path. Empty-list test is at the unit level if from_entries ever
+        # relaxes that constraint.
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+        assert issues == []
+
+
+# --------------------------------------------------------------------------- #
+# Orchestrator behaviour (run_startup_check) + strict vs warn-only
+# --------------------------------------------------------------------------- #
+
+
+class TestRunStartupCheck:
+    @pytest.mark.asyncio
+    async def test_clean_registry_no_raise(self) -> None:
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        # Strict True should still succeed when there's nothing to find.
+        await run_startup_check(
+            registry,
+            _factory({c.customer_id: fake}),
+            strict=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_warn_only_continues_on_failure(self) -> None:
+        """Default mode: bad customer → log warning, but don't raise.
+        Lets gateway boot in dev when Dify isn't ready yet."""
+        c = _make_customer(dataset_api_key="not-a-real-key")
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        # No raise expected.
+        await run_startup_check(
+            registry,
+            _factory({c.customer_id: fake}),
+            strict=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_strict_raises_on_failure(self) -> None:
+        """Strict mode: any issue aborts startup with a clear RuntimeError
+        so uvicorn exits non-zero and container orchestrators mark the
+        pod unhealthy."""
+        c = _make_customer(dataset_api_key="not-a-real-key")
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+
+        with pytest.raises(RuntimeError, match="GATEWAY_STRICT_STARTUP"):
+            await run_startup_check(
+                registry,
+                _factory({c.customer_id: fake}),
+                strict=True,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Defensive: unexpected exception type during runtime check
+# --------------------------------------------------------------------------- #
+
+
+class TestUnexpectedFailure:
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_surfaces_as_l2(self) -> None:
+        """If _check_runtime's try/except misses some exception subclass,
+        validate_registry's gather wrapper still catches it and produces
+        a CheckIssue rather than crashing startup outright."""
+
+        class WeirdError(BaseException):
+            pass
+
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        fake = _FakeDifyClient()
+        fake.login_error = WeirdError("never seen before")
+
+        issues = await validate_registry(registry, _factory({c.customer_id: fake}))
+
+        # WeirdError is BaseException-not-Exception, escapes the inner
+        # try/except — gather wrapper catches it and reports as L2.
+        assert len(issues) >= 1
+        assert any(i.level == "L2" for i in issues)
+
+
+# --------------------------------------------------------------------------- #
+# CheckIssue dataclass sanity
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Lifespan wiring (catches "forgot to call run_startup_check at boot")
+# --------------------------------------------------------------------------- #
+
+
+class TestLifespanWiring:
+    """Without this test the orchestrator could be perfectly fine while
+    main.py forgets to call it — that's a wiring bug the unit tests
+    above won't catch. Drives the lifespan context manually so we
+    observe whether run_startup_check actually fires at boot.
+
+    Codex review-3 P2: tests in this class must override
+    ``app.state.dify_client_factory`` with a fake BEFORE entering the
+    lifespan context. The lifespan reads the factory from
+    ``app.state`` at call time (not from closure), so the override
+    actually takes effect. Without this, lifespan would issue real
+    httpx calls against the registry's ``base_url``, which is slow,
+    flaky, and tests behaviour that doesn't match production.
+    """
+
+    def _make_app_with_fake(
+        self,
+        *,
+        customer: CustomerEntry,
+        strict: bool,
+        fake_login_error: BaseException | None = None,
+    ) -> tuple[Any, _FakeDifyClient]:
+        """Helper: build app + register fake factory + return both.
+
+        Returns ``(app, fake)`` so the caller can assert behaviour on
+        either side.
+        """
+        from gateway.config import Settings
+        from gateway.main import create_app
+
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            strict_startup=strict,
+        )
+
+        app = create_app(settings=settings, registry=registry)
+
+        fake = _FakeDifyClient()
+        if fake_login_error is not None:
+            fake.login_error = fake_login_error
+
+        def factory(_: CustomerEntry) -> DifyClient:
+            return fake  # type: ignore[return-value]
+
+        # Critical: override BEFORE entering lifespan. Lifespan reads
+        # this at call time so the override takes effect.
+        app.state.dify_client_factory = factory
+        return app, fake
+
+    @pytest.mark.asyncio
+    async def test_strict_lifespan_aborts_when_format_fails(self) -> None:
+        """If lifespan really invokes run_startup_check with strict=True,
+        a malformed registry must abort startup with RuntimeError. If
+        someone deletes the run_startup_check call from lifespan, this
+        test will start passing-by-accident (no raise) and flip to
+        failing here, surfacing the regression at PR review time.
+
+        The fake factory means L1 format failures are the only issues
+        (network L2-L4 all clean), so we're testing strict-mode-on-L1
+        in isolation.
+        """
+        bad = _make_customer(sdk_key="wrong", dataset_api_key="wrong")
+        app, fake = self._make_app_with_fake(customer=bad, strict=True)
+
+        with pytest.raises(RuntimeError, match="GATEWAY_STRICT_STARTUP"):
+            async with app.router.lifespan_context(app):
+                pass  # never reached — startup_check raised
+
+        # Network checks DID run against the fake (proves factory override
+        # took effect) and didn't fail there (proves the only issues are
+        # L1 format).
+        assert fake.login_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_warn_only_lifespan_continues_on_failure(self) -> None:
+        """Mirror of the strict-mode wiring test: default mode must let
+        the lifespan complete normally even when the registry is
+        malformed (logs warnings, doesn't raise)."""
+        bad = _make_customer(dataset_api_key="not-a-real-key")
+        app, fake = self._make_app_with_fake(customer=bad, strict=False)
+
+        # No raise expected — lifespan enters + exits cleanly.
+        async with app.router.lifespan_context(app):
+            pass
+
+        # Verify the override actually flowed through — runtime checks
+        # used the fake, not real httpx.
+        assert fake.login_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_lifespan_uses_state_factory_override(self) -> None:
+        """Codex review-3 regression: directly verify that overriding
+        ``app.state.dify_client_factory`` AFTER ``create_app`` returns is
+        respected by the lifespan's startup_check. Earlier the lifespan
+        closed over the original factory and the override was silently
+        ignored — production never overrides post-create_app, but the
+        fixture pattern does, and tests need this to stay deterministic.
+
+        If a future refactor reverts to closing over the factory, this
+        test starts hitting real network (or failing because no httpx
+        access in the sandbox), surfacing the regression loudly.
+        """
+        from gateway.config import Settings
+        from gateway.main import create_app
+
+        c = _make_customer()
+        registry = CustomerRegistry.from_entries([c])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            strict_startup=False,
+        )
+        app = create_app(settings=settings, registry=registry)
+
+        # Build two fakes to prove the override actually wins.
+        original_fake = _FakeDifyClient()
+        override_fake = _FakeDifyClient()
+
+        # Sanity: original_fake is what create_app's factory would
+        # normally hit. But we replace BEFORE entering lifespan so
+        # the override should be the one called.
+        def overriding_factory(_: CustomerEntry) -> DifyClient:
+            return override_fake  # type: ignore[return-value]
+
+        app.state.dify_client_factory = overriding_factory
+
+        async with app.router.lifespan_context(app):
+            pass
+
+        # Override fake saw the calls; original fake didn't.
+        assert override_fake.login_calls == 1
+        assert override_fake.list_calls == 1
+        assert original_fake.login_calls == 0
+        assert original_fake.list_calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# CheckIssue dataclass sanity
+# --------------------------------------------------------------------------- #
+
+
+def test_check_issue_is_frozen() -> None:
+    """Issues are immutable so they can be safely passed between log
+    aggregators / stored in collections without surprise mutation. The
+    dataclass ``frozen=True`` decorator turns attribute assignment into
+    a ``FrozenInstanceError`` (which subclasses ``AttributeError``)."""
+    from dataclasses import FrozenInstanceError
+
+    issue = CheckIssue(customer_id="x", level="L1", message="m")
+    with pytest.raises(FrozenInstanceError):
+        issue.message = "mutated"  # type: ignore[misc]
