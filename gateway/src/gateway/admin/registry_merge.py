@@ -44,6 +44,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -237,9 +238,19 @@ def write_registry_atomic(path: Path, registry_data: dict[str, Any]) -> None:
     The tmp file lives alongside the target (same directory) so the
     final rename is on the same filesystem — required for ``os.replace``
     to be atomic.
+
+    Codex review-5 P2: use :func:`tempfile.mkstemp` rather than a
+    deterministic ``registry.yaml.tmp`` filename plus
+    ``os.open(O_CREAT|O_TRUNC, mode)``. ``O_CREAT`` without ``O_EXCL``
+    silently reuses an existing file (e.g. a 0644 orphan left by a
+    SIGKILL'd previous run, or one planted by another local user) and
+    the ``mode`` argument to :func:`os.open` is **ignored** when the
+    target file already exists — so secrets would be written into a
+    permissive file before the belt-and-braces chmod could narrow it.
+    :func:`tempfile.mkstemp` creates a uniquely-named file atomically
+    at ``0600`` on POSIX, closing both holes.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
 
     # Codex review-4 P2: pick the most restrictive file mode we can
     # justify. Default is ``0600`` (owner-only). If the existing
@@ -249,21 +260,20 @@ def write_registry_atomic(path: Path, registry_data: dict[str, Any]) -> None:
     # differently so the chmod is a no-op there.
     target_mode = _secret_file_mode(path)
 
-    try:
-        # Use ``os.open`` with explicit mode rather than ``tmp.open("w")``
-        # so the file is created with the restrictive perms from the
-        # start — not "open at 0644 then chmod down", which would leave
-        # a tiny window where another process could read the secrets.
-        if target_mode is not None:
-            fd = os.open(
-                tmp,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                target_mode,
-            )
-            file_obj = os.fdopen(fd, "w", encoding="utf-8")
-        else:
-            file_obj = tmp.open("w", encoding="utf-8")
+    # ``mkstemp`` returns ``(fd, abs_path_str)`` — fd is already open
+    # for writing and the file is guaranteed not to have existed before
+    # this call (atomic O_EXCL under the hood). Prefix/suffix keep the
+    # name discoverable as belonging to this write (so an orphan from
+    # a process-crash window is still recognisable as ours).
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp = Path(tmp_str)
 
+    try:
+        file_obj = os.fdopen(fd, "w", encoding="utf-8")
         try:
             yaml.safe_dump(
                 registry_data,
@@ -275,11 +285,13 @@ def write_registry_atomic(path: Path, registry_data: dict[str, Any]) -> None:
         finally:
             file_obj.close()
 
-        # Belt and braces: chmod again post-write. ``os.open`` with mode
-        # is supposed to honour the mode but is subject to umask on
-        # some platforms; an explicit chmod closes that gap. No-op on
-        # Windows.
-        if target_mode is not None:
+        # ``mkstemp`` already creates the file at ``0600`` on POSIX, so
+        # the default case needs no chmod. Only chmod when the operator
+        # asked for a stricter mode (e.g. preserved ``0400``) or — as
+        # belt-and-braces — to confirm even on platforms where mkstemp's
+        # mode behaviour is fuzzier. No-op on Windows (``target_mode``
+        # is ``None``).
+        if target_mode is not None and target_mode != 0o600:
             try:
                 os.chmod(tmp, target_mode)
             except OSError:
@@ -341,4 +353,52 @@ def _find_customer_index(
     for i, c in enumerate(customers):
         if c.get("customer_id") == customer_id:
             return i
+    return None
+
+
+def find_shared_workspace_dataset_key(
+    registry_data: dict[str, Any],
+    *,
+    base_url: str,
+    console_email: str,
+) -> str | None:
+    """Return an existing ``dataset_api_key`` for the same shared workspace.
+
+    Codex review-5 P2: in shared mode every customer in a Dify workspace
+    can use the **same** workspace-scoped dataset API key (that's what
+    "shared" means at the Dify side too — one workspace, many tenants).
+    Dify caps ``/console/api/datasets/api-keys`` at **10 keys per
+    workspace**. If the CLI provisions a fresh key on every shared
+    onboarding, the 11th customer onboarding for that workspace blows
+    up with a Dify-side limit error even though all previous customers
+    already share a perfectly good key.
+
+    Workspace identity is ``(base_url, console_email)`` — same login
+    against the same Dify host = same workspace. ``base_url`` is
+    normalised by ``rstrip("/")`` to match the rule
+    :meth:`CustomerRegistry._check_dify_consistency` already uses.
+
+    Returns the first matching ``dataset_api_key`` so the CLI can skip
+    the network provisioning call entirely. Returns ``None`` when no
+    matching shared-mode peer exists (truly new workspace, or only
+    dedicated peers on this base_url).
+    """
+    normalized = base_url.rstrip("/")
+    for entry in registry_data.get("customers", []):
+        if not isinstance(entry, dict):
+            continue
+        dify = entry.get("dify")
+        if not isinstance(dify, dict):
+            continue
+        if dify.get("mode") != "shared":
+            continue
+        if not isinstance(dify.get("base_url"), str):
+            continue
+        if dify["base_url"].rstrip("/") != normalized:
+            continue
+        if dify.get("console_email") != console_email:
+            continue
+        key = dify.get("dataset_api_key")
+        if isinstance(key, str) and key:
+            return key
     return None

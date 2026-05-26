@@ -27,6 +27,7 @@ from gateway.admin.cli import (
 )
 from gateway.admin.registry_merge import (
     RegistryMergeError,
+    find_shared_workspace_dataset_key,
     load_existing_registry,
     merge_customer,
     write_registry_atomic,
@@ -793,3 +794,398 @@ class TestRegistryFilePermissions:
         assert mode_bits == 0o400, (
             f"existing mode 0400 was widened to {oct(mode_bits)} on write"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Codex review-5: shared-mode dataset-key reuse + exclusive temp file
+# --------------------------------------------------------------------------- #
+
+
+class TestFindSharedWorkspaceDatasetKey:
+    """Codex review-5 P2 #1 unit tests: locate an existing shared-mode
+    peer's ``dataset_api_key`` in the on-disk registry so the next
+    shared onboarding for the same workspace can reuse it instead of
+    burning one of Dify's 10 workspace-scoped keys.
+    """
+
+    def test_returns_key_for_matching_shared_peer(self) -> None:
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_peer",
+                    "customer_id": "peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "ws-admin@example.com",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-workspace-key-9876",
+                        "mode": "shared",
+                        "shared_embedding_model": {
+                            "name": "bge-m3",
+                            "provider": "p",
+                        },
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        found = find_shared_workspace_dataset_key(
+            registry_data,
+            base_url="http://shared-dify",
+            console_email="ws-admin@example.com",
+        )
+        assert found == "dataset-workspace-key-9876"
+
+    def test_trailing_slash_in_base_url_still_matches(self) -> None:
+        """Dify client rstrips trailing slashes so ``http://x`` and
+        ``http://x/`` resolve to the same upstream — peer lookup must
+        agree, otherwise an operator could end up with parallel keys
+        for what is functionally one workspace."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_peer",
+                    "customer_id": "peer",
+                    "dify": {
+                        "base_url": "http://shared-dify/",  # trailing slash
+                        "console_email": "ws-admin@example.com",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-workspace-key",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        found = find_shared_workspace_dataset_key(
+            registry_data,
+            base_url="http://shared-dify",  # no slash
+            console_email="ws-admin@example.com",
+        )
+        assert found == "dataset-workspace-key"
+
+    def test_different_console_email_is_different_workspace(self) -> None:
+        """Same Dify host, different login = different workspace.
+        Don't cross-reuse, otherwise tenant boundary leaks."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_peer",
+                    "customer_id": "peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "workspace-1@example.com",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-ws1-key",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        # Different email → different Dify workspace.
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                console_email="workspace-2@example.com",
+            )
+            is None
+        )
+
+    def test_dedicated_peer_is_not_a_match(self) -> None:
+        """The optimisation only applies to shared mode. Dedicated peers
+        on the same host (rare but possible during migration) must NOT
+        donate their dataset key — dedicated keys aren't workspace-wide."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_peer",
+                    "customer_id": "peer",
+                    "dify": {
+                        "base_url": "http://dify",
+                        "console_email": "admin@example.com",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-dedicated-key",
+                        "mode": "dedicated",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://dify",
+                console_email="admin@example.com",
+            )
+            is None
+        )
+
+    def test_no_peers_returns_none(self) -> None:
+        assert (
+            find_shared_workspace_dataset_key(
+                {"customers": []},
+                base_url="http://dify",
+                console_email="x@y",
+            )
+            is None
+        )
+
+    def test_malformed_entries_skipped_not_crash(self) -> None:
+        """If somebody hand-edits the registry into shape with stray
+        non-dict entries, the lookup must skip them rather than crash —
+        a defensive complement to ``load_existing_registry`` (which now
+        rejects non-mappings at load) for the case where the caller
+        passes a raw dict that hasn't been through ``load_existing_registry``."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                None,
+                "not a dict",
+                {"customer_id": "no-dify-block"},  # missing dify
+                {"customer_id": "dify-not-dict", "dify": "wrong shape"},
+                {
+                    "sdk_key": "bsa_real_peer",
+                    "customer_id": "real-peer",
+                    "dify": {
+                        "base_url": "http://dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-real",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                },
+            ]
+        }
+        found = find_shared_workspace_dataset_key(
+            registry_data,
+            base_url="http://dify",
+            console_email="admin@x",
+        )
+        assert found == "dataset-real"
+
+
+class TestSharedModeKeyReuseEndToEnd:
+    """Codex review-5 P2 #1 e2e tests: the CLI must skip
+    ``_provision_dataset_api_key`` entirely when adding a new shared-mode
+    customer to a workspace that already has a shared-mode peer in
+    registry.yaml. The key signal: ``mock_provision_dataset_key.call_count
+    == 0`` AND the new entry's ``dataset_api_key`` equals the peer's.
+    """
+
+    def _seed_shared_peer(self, registry_path: Path) -> str:
+        """Write registry.yaml containing one shared-mode customer.
+        Returns the dataset_api_key that subsequent onboardings should reuse."""
+        existing_key = "dataset-shared-workspace-key-from-peer"
+        registry_path.write_text(
+            yaml.safe_dump({
+                "customers": [
+                    {
+                        "sdk_key": "bsa_peer_one",
+                        "customer_id": "peer-one",
+                        "dify": {
+                            "base_url": "http://shared-dify",
+                            "console_email": "ws-admin@example.com",
+                            "console_password": "pw",
+                            "dataset_api_key": existing_key,
+                            "mode": "shared",
+                            "shared_embedding_model": {
+                                "name": "bge-m3",
+                                "provider": (
+                                    "langgenius/openai_api_compatible/"
+                                    "openai_api_compatible"
+                                ),
+                            },
+                        },
+                        "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+        return existing_key
+
+    def test_second_shared_customer_reuses_peer_key_no_network(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        registry_path = tmp_path / "registry.yaml"
+        existing_key = self._seed_shared_peer(registry_path)
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "peer-two",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+
+        # The Dify provisioning function must NOT have been called —
+        # we reused the peer's key, no new key was burned out of the
+        # workspace's 10-key budget.
+        assert mock_provision_dataset_key.call_count == 0, (
+            "_provision_dataset_api_key was called even though a "
+            "shared-mode peer key already exists for this workspace "
+            "(codex review-5 P2 — Dify caps at 10 keys/workspace)."
+        )
+
+        # And the new entry's dataset_api_key matches the peer's.
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "peer-two")
+        assert new["dify"]["dataset_api_key"] == existing_key
+
+        # User-visible message confirms reuse.
+        assert "Reusing existing workspace dataset key" in result.output
+
+    def test_shared_with_different_workspace_email_still_provisions(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Different console_email = different Dify workspace even on
+        the same host. Must provision a fresh key, not cross-reuse."""
+        registry_path = tmp_path / "registry.yaml"
+        self._seed_shared_peer(registry_path)  # admin = ws-admin@example.com
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "peer-two",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "OTHER-ws-admin@example.com",  # different ws
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        # Different workspace -> must call Dify for a fresh key.
+        assert mock_provision_dataset_key.call_count == 1
+
+    def test_dedicated_mode_never_reuses_even_with_shared_peer_present(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Dedicated mode onboarding must always provision its own key,
+        even when a shared-mode peer happens to live on the same host."""
+        registry_path = tmp_path / "registry.yaml"
+        self._seed_shared_peer(registry_path)
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "peer-two",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",
+            "--dify-admin-password", "pw",
+            "--mode", "dedicated",   # ← not shared
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        # Mixing dedicated + shared on the same base_url is rejected
+        # by from_entries (mode disagreement), so this exits non-zero.
+        # The point of this test is: the rejection happened locally,
+        # and the provisioner was NOT called.
+        assert result.exit_code != 0
+        assert mock_provision_dataset_key.call_count == 0
+
+
+class TestExclusiveTempFile:
+    """Codex review-5 P2 #2: ``write_registry_atomic`` must not reuse a
+    pre-existing ``registry.yaml.tmp`` file. The previous implementation
+    used a deterministic ``.tmp`` filename plus
+    ``os.open(..., O_CREAT | O_TRUNC, target_mode)`` — but ``O_CREAT``
+    without ``O_EXCL`` reopens an existing file and silently IGNORES
+    the mode argument. If an attacker (or a SIGKILL'd previous run) had
+    placed an empty 0644 ``registry.yaml.tmp`` next to the target, the
+    secrets would have been written into it before the post-write
+    chmod could narrow permissions.
+
+    Fix: use :func:`tempfile.mkstemp` which atomically creates a
+    uniquely-named file at 0600 on POSIX, so we never touch any
+    pre-existing predictable filename.
+    """
+
+    def test_preexisting_deterministic_tmp_is_not_touched(
+        self, tmp_path: Path
+    ) -> None:
+        """The legacy ``<name>.tmp`` filename must be left alone —
+        we use a randomised name now, so any pre-existing predictable
+        ``.tmp`` is irrelevant to our write."""
+        path = tmp_path / "registry.yaml"
+        legacy_tmp = path.with_suffix(".yaml.tmp")
+        legacy_tmp.write_text("ATTACKER-CONTROLLED-PRE-EXISTING-CONTENT\n", encoding="utf-8")
+
+        write_registry_atomic(path, {"customers": []})
+
+        # Target written successfully.
+        assert path.exists()
+        assert yaml.safe_load(path.read_text(encoding="utf-8")) == {"customers": []}
+        # The pre-existing deterministic-name file was not overwritten,
+        # not unlinked, and not turned into the registry. Its content
+        # is untouched, proving we wrote to a different (random) name.
+        assert legacy_tmp.exists()
+        assert legacy_tmp.read_text(encoding="utf-8") == (
+            "ATTACKER-CONTROLLED-PRE-EXISTING-CONTENT\n"
+        )
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="POSIX file mode bits"
+    )
+    def test_write_succeeds_at_0600_with_preexisting_permissive_legacy_tmp(
+        self, tmp_path: Path
+    ) -> None:
+        """The classic attack: a 0644 ``registry.yaml.tmp`` placed by
+        another user. With the old code, ``O_CREAT`` would reopen it
+        and the mode argument would be ignored — secrets briefly at
+        0644 before chmod. With mkstemp, our write goes to a brand-new
+        randomly-named file at 0600 from the start."""
+        path = tmp_path / "registry.yaml"
+        legacy_tmp = path.with_suffix(".yaml.tmp")
+        legacy_tmp.write_text("attacker-placed\n", encoding="utf-8")
+        os.chmod(legacy_tmp, 0o644)
+
+        # Force a permissive umask too, to make the assertion meaningful.
+        old_umask = os.umask(0o022)
+        try:
+            write_registry_atomic(path, {"customers": []})
+        finally:
+            os.umask(old_umask)
+
+        mode_bits = stat.S_IMODE(path.stat().st_mode)
+        assert mode_bits & 0o077 == 0, (
+            f"registry.yaml ended up at {oct(mode_bits)} despite a "
+            f"pre-existing permissive tmp file — mkstemp must give us "
+            f"a fresh 0600 file. (codex review-5 P2 #2)"
+        )
+
+    def test_atomic_write_cleans_up_random_tmp_on_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """If yaml.safe_dump raises mid-write, the randomly-named tmp
+        file must be unlinked so we don't leak it. (The legacy test
+        only checked for the deterministic name; with mkstemp we
+        instead glob for residue.)"""
+        path = tmp_path / "registry.yaml"
+
+        with patch(
+            "gateway.admin.registry_merge.yaml.safe_dump",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                write_registry_atomic(path, {"customers": []})
+
+        # No target written.
+        assert not path.exists()
+        # No leftover tmp file (deterministic OR random) in the dir.
+        residue = [
+            p for p in tmp_path.iterdir() if ".registry.yaml" in p.name or p.name.endswith(".tmp")
+        ]
+        assert residue == [], f"unexpected tmp residue: {residue}"

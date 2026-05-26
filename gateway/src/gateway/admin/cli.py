@@ -41,6 +41,7 @@ import structlog
 from gateway.admin.registry_merge import (
     RegistryMergeError,
     check_writable,
+    find_shared_workspace_dataset_key,
     load_existing_registry,
     merge_customer,
     write_registry_atomic,
@@ -404,33 +405,60 @@ def add_customer(
         click.echo(f"ERROR: registry path not writable: {exc}", err=True)
         sys.exit(4)
 
-    # 6. Local validation + filesystem preflight passed — safe to talk to Dify.
-    click.echo(f"Connecting to Dify at {dify_base_url} ...", err=True)
-    try:
-        dataset_api_key = asyncio.run(
-            _provision_dataset_api_key(
-                base_url=dify_base_url,
-                console_email=dify_admin_email,
-                console_password=dify_admin_password,
-            )
+    # 5b. Shared-mode dataset key reuse. Dify caps
+    # ``/console/api/datasets/api-keys`` at 10 keys per workspace. In
+    # shared mode every customer in a workspace can use the same key
+    # (workspace-scoped), so the 11th onboarding for a workspace would
+    # otherwise blow up on the Dify side even though there is a
+    # perfectly good key already in registry.yaml. Look up the existing
+    # peer here so we can skip ``_provision_dataset_api_key`` entirely
+    # — zero Dify network calls, zero risk of an orphan key.
+    # Codex review-5 P2.
+    reused_dataset_api_key: str | None = None
+    if mode == "shared":
+        reused_dataset_api_key = find_shared_workspace_dataset_key(
+            existing,
+            base_url=dify_base_url,
+            console_email=dify_admin_email,
         )
-    except DifyUpstreamError as exc:
-        click.echo(f"ERROR: Dify rejected onboarding request: {exc}", err=True)
+
+    if reused_dataset_api_key is not None:
         click.echo(
-            "Common causes: wrong console password, Dify container down, "
-            "or workspace doesn't allow programmatic key creation. Verify "
-            "the credentials work in the Dify Web UI first.",
+            f"Reusing existing workspace dataset key "
+            f"({reused_dataset_api_key[:16]}...) from a shared-mode peer. "
+            f"Dify caps each workspace at 10 dataset keys; reuse keeps the "
+            f"quota intact and skips the network round-trip.",
             err=True,
         )
-        sys.exit(2)
-    except Exception as exc:
-        click.echo(f"ERROR: could not reach Dify at {dify_base_url}: {exc}", err=True)
-        sys.exit(2)
+        dataset_api_key = reused_dataset_api_key
+    else:
+        # 6. Local validation + filesystem preflight passed — safe to talk to Dify.
+        click.echo(f"Connecting to Dify at {dify_base_url} ...", err=True)
+        try:
+            dataset_api_key = asyncio.run(
+                _provision_dataset_api_key(
+                    base_url=dify_base_url,
+                    console_email=dify_admin_email,
+                    console_password=dify_admin_password,
+                )
+            )
+        except DifyUpstreamError as exc:
+            click.echo(f"ERROR: Dify rejected onboarding request: {exc}", err=True)
+            click.echo(
+                "Common causes: wrong console password, Dify container down, "
+                "or workspace doesn't allow programmatic key creation. Verify "
+                "the credentials work in the Dify Web UI first.",
+                err=True,
+            )
+            sys.exit(2)
+        except Exception as exc:
+            click.echo(f"ERROR: could not reach Dify at {dify_base_url}: {exc}", err=True)
+            sys.exit(2)
 
-    click.echo(
-        f"Dataset API key created: {dataset_api_key[:16]}... (provisioned by gateway-admin)",
-        err=True,
-    )
+        click.echo(
+            f"Dataset API key created: {dataset_api_key[:16]}... (provisioned by gateway-admin)",
+            err=True,
+        )
 
     # 7. Rebuild the entry with the real dataset_api_key and do the
     # final merge + atomic write. The local-validation + writable
@@ -447,15 +475,27 @@ def add_customer(
         write_registry_atomic(registry_path, merged)
     except (RegistryMergeError, OSError) as exc:
         click.echo(f"ERROR: registry write failed after Dify key provisioning: {exc}", err=True)
-        click.echo(
-            f"ORPHAN WARNING: a Dify dataset key was created "
-            f"({dataset_api_key[:16]}...) but the registry write failed. "
-            f"To avoid an orphan credential in Dify, manually revoke this "
-            f"key in Dify Web UI → 知識庫 → 服務 API → 管理金鑰. "
-            f"Re-run 'gateway-admin add-customer' after fixing the "
-            f"filesystem issue.",
-            err=True,
-        )
+        # Only emit the orphan warning when WE created the key in this
+        # invocation. Reused shared-mode keys belong to another customer
+        # already in registry.yaml; revoking would break their datasets.
+        # Codex review-5 P2.
+        if reused_dataset_api_key is None:
+            click.echo(
+                f"ORPHAN WARNING: a Dify dataset key was created "
+                f"({dataset_api_key[:16]}...) but the registry write failed. "
+                f"To avoid an orphan credential in Dify, manually revoke this "
+                f"key in Dify Web UI → 知識庫 → 服務 API → 管理金鑰. "
+                f"Re-run 'gateway-admin add-customer' after fixing the "
+                f"filesystem issue.",
+                err=True,
+            )
+        else:
+            click.echo(
+                "No orphan key to revoke — the dataset key was reused from "
+                "an existing shared-mode peer. Re-run 'gateway-admin "
+                "add-customer' after fixing the filesystem issue.",
+                err=True,
+            )
         sys.exit(4)
 
     # 8. Success. The SDK key is the ONE secret value the operator
