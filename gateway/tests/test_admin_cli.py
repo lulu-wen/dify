@@ -594,6 +594,78 @@ class TestNoDifyOrphanOnLocalFailure:
             "Slug validation must fail BEFORE Dify is touched."
         )
 
+    def test_registry_with_non_mapping_customer_entry_fails_cleanly(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Codex review-3 P3: ``customers: [null]`` or
+        ``customers: [- "bad-string"]`` previously crashed in
+        ``_find_customer_index`` with AttributeError when ``.get()``
+        was called on a non-dict. Now must surface as a clean
+        RegistryMergeError before any network call."""
+        registry_path = tmp_path / "registry.yaml"
+        # A list with a non-mapping entry (None / string instead of dict)
+        registry_path.write_text(
+            "customers:\n  - null\n",
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code != 0
+        assert "must be a mapping" in result.output
+        assert "Traceback" not in result.output
+        assert mock_provision_dataset_key.call_count == 0
+
+    def test_unwritable_registry_path_fails_before_network(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Codex review-3 P2: if the registry's parent dir cannot be
+        created (e.g., parent path is itself a regular file), the
+        writable preflight must catch it BEFORE the network call.
+        Otherwise ``write_registry_atomic`` raises OSError post-network
+        and we leave an orphan dataset key on Dify side.
+
+        Click's own ``type=click.Path(dir_okay=False)`` catches the
+        simpler "path is a directory" case at flag-parsing time — this
+        test exercises the case Click doesn't see: parent that can't
+        be turned into a writable directory.
+        """
+        # ``blockage`` is a regular file. Asking the CLI to write a
+        # registry "inside" it can't work because the parent isn't a
+        # directory and ``parent.mkdir`` would fail.
+        blockage = tmp_path / "blockage"
+        blockage.write_text("not a directory", encoding="utf-8")
+        registry_path = blockage / "registry.yaml"
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code != 0
+        assert "registry path not writable" in result.output
+        assert "Traceback" not in result.output
+        # The preflight must run BEFORE Dify is touched.
+        assert mock_provision_dataset_key.call_count == 0, (
+            "Writable preflight must fire BEFORE Dify is touched "
+            "(codex review-3 P2 — orphan-key avoidance)."
+        )
+
     def test_malformed_yaml_gives_clean_error_not_traceback(
         self, tmp_path: Path, mock_provision_dataset_key: Any
     ) -> None:

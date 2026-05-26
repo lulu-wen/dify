@@ -40,6 +40,7 @@ import structlog
 
 from gateway.admin.registry_merge import (
     RegistryMergeError,
+    check_writable,
     load_existing_registry,
     merge_customer,
     write_registry_atomic,
@@ -391,7 +392,19 @@ def add_customer(
         click.echo(f"ERROR: registry merge would fail: {exc}", err=True)
         sys.exit(4)
 
-    # 6. Local validation passed — safe to talk to Dify.
+    # 5a. Filesystem preflight — if we can't write to ``registry_path``,
+    # fail BEFORE the network call. Catches "parent dir doesn't exist",
+    # "permission denied", "path is a directory" classes of error.
+    # Codex review-3 P2 — without this, write_registry_atomic could
+    # raise OSError post-network and leave an orphan dataset key on
+    # Dify side that the operator never sees.
+    try:
+        check_writable(registry_path)
+    except RegistryMergeError as exc:
+        click.echo(f"ERROR: registry path not writable: {exc}", err=True)
+        sys.exit(4)
+
+    # 6. Local validation + filesystem preflight passed — safe to talk to Dify.
     click.echo(f"Connecting to Dify at {dify_base_url} ...", err=True)
     try:
         dataset_api_key = asyncio.run(
@@ -420,17 +433,29 @@ def add_customer(
     )
 
     # 7. Rebuild the entry with the real dataset_api_key and do the
-    # final merge + atomic write. The local-validation pass above
-    # already proved this will succeed, so the only way the writes
-    # below can fail is filesystem-level (disk full, permission
-    # denied), which is a separate operator concern.
+    # final merge + atomic write. The local-validation + writable
+    # preflight passes already proved this should succeed; the only
+    # way the writes below can fail now is a rare race (disk filled
+    # up between preflight and write, parent dir deleted, etc.).
+    # Codex review-3 P2: catching OSError here is defence in depth.
+    # If the write does fail post-network, log the dataset key prefix
+    # so the operator can find + delete the orphan in Dify Web UI.
     try:
         new_entry = _build_entry(dataset_api_key)
         existing = load_existing_registry(registry_path)
         merged = merge_customer(existing, new_entry, force=force)
         write_registry_atomic(registry_path, merged)
-    except RegistryMergeError as exc:
-        click.echo(f"ERROR: registry merge failed: {exc}", err=True)
+    except (RegistryMergeError, OSError) as exc:
+        click.echo(f"ERROR: registry write failed after Dify key provisioning: {exc}", err=True)
+        click.echo(
+            f"ORPHAN WARNING: a Dify dataset key was created "
+            f"({dataset_api_key[:16]}...) but the registry write failed. "
+            f"To avoid an orphan credential in Dify, manually revoke this "
+            f"key in Dify Web UI → 知識庫 → 服務 API → 管理金鑰. "
+            f"Re-run 'gateway-admin add-customer' after fixing the "
+            f"filesystem issue.",
+            err=True,
+        )
         sys.exit(4)
 
     # 8. Success. The SDK key is the ONE secret value the operator

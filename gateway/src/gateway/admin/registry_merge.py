@@ -101,7 +101,70 @@ def load_existing_registry(path: Path) -> dict[str, Any]:
         raise RegistryMergeError(
             f"registry.yaml 'customers' must be a list (got {type(raw['customers']).__name__})"
         )
+
+    # Codex review-3 P3: each customer entry must itself be a mapping.
+    # ``customers: [null]`` or ``customers: [- "bad string"]`` previously
+    # escaped as ``AttributeError`` (from ``.get()`` on a non-dict) instead
+    # of the intended ``RegistryMergeError``. Validate up front so the CLI
+    # handler reports a clean error and no network call fires.
+    for i, item in enumerate(raw["customers"]):
+        if not isinstance(item, dict):
+            raise RegistryMergeError(
+                f"registry.yaml customers[{i}] must be a mapping "
+                f"(got {type(item).__name__}: {item!r}). "
+                f"Fix the file by hand — each customer entry is an object "
+                f"with sdk_key / customer_id / dify / models fields."
+            )
     return raw
+
+
+def check_writable(path: Path) -> None:
+    """Preflight check that ``path`` can be written to.
+
+    Raises :class:`RegistryMergeError` for the common causes of "I called
+    Dify, then the write blew up" — the CLI invokes this BEFORE the Dify
+    network call so a misconfigured filesystem doesn't leave us with an
+    orphan ``dataset-*`` key on the Dify side.
+
+    Codex review-3 P2. Covers:
+    - Path exists but is not a regular file (e.g., directory)
+    - Parent directory doesn't exist and cannot be created
+    - Parent directory exists but is read-only
+
+    Does NOT cover: "disk full at write time". That race is rare and
+    unrecoverable; the CLI's post-network ``except OSError`` block
+    handles it by logging the dataset key prefix so the operator can
+    find + delete the orphan in Dify Web UI.
+    """
+    if path.exists() and not path.is_file():
+        raise RegistryMergeError(
+            f"registry path {path} exists but is not a regular file"
+        )
+
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RegistryMergeError(
+            f"cannot create parent directory {parent}: {exc}"
+        ) from exc
+
+    # Probe-touch a tiny file in the parent. Catches permission
+    # errors without needing to know the OS-specific access bits.
+    probe = parent / f".{path.name}.writable-probe"
+    try:
+        probe.touch()
+    except OSError as exc:
+        raise RegistryMergeError(
+            f"registry parent directory {parent} is not writable: {exc}"
+        ) from exc
+    finally:
+        # Best-effort cleanup; if it failed before touch we wouldn't
+        # have a probe to remove anyway.
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def merge_customer(
