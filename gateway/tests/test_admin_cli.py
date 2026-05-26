@@ -245,6 +245,24 @@ def mock_provision_dataset_key() -> Any:
         yield mocked
 
 
+@pytest.fixture
+def mock_verify_console_credentials() -> Any:
+    """Mock _verify_console_credentials for shared-mode reuse tests.
+
+    Codex review-6 P2 added a login-only verification step that fires
+    when the CLI reuses an existing peer's dataset key (so we don't
+    accept typo'd / stale credentials silently). Tests that exercise
+    the reuse path need to mock this too, otherwise they'd try to
+    actually reach Dify. Default mock: succeeds. Override in tests
+    that simulate invalid credentials.
+    """
+    with patch(
+        "gateway.admin.cli._verify_console_credentials",
+        new=AsyncMock(return_value=None),
+    ) as mocked:
+        yield mocked
+
+
 class TestAddCustomerCommand:
     def test_happy_path_creates_registry_and_prints_sdk_key(
         self, tmp_path: Path, mock_provision_dataset_key: Any
@@ -1007,7 +1025,10 @@ class TestSharedModeKeyReuseEndToEnd:
         return existing_key
 
     def test_second_shared_customer_reuses_peer_key_no_network(
-        self, tmp_path: Path, mock_provision_dataset_key: Any
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_verify_console_credentials: Any,
     ) -> None:
         registry_path = tmp_path / "registry.yaml"
         existing_key = self._seed_shared_peer(registry_path)
@@ -1036,13 +1057,75 @@ class TestSharedModeKeyReuseEndToEnd:
             "(codex review-5 P2 — Dify caps at 10 keys/workspace)."
         )
 
+        # Codex review-6 P2: verification of the supplied console
+        # credentials still happens — login-only, no dataset-key
+        # creation. Without this assertion, a regression that removed
+        # the verify step would slip past.
+        assert mock_verify_console_credentials.call_count == 1, (
+            "_verify_console_credentials was not called on the reuse "
+            "path — operator's password would land in registry.yaml "
+            "unvalidated (codex review-6 P2)."
+        )
+
         # And the new entry's dataset_api_key matches the peer's.
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         new = next(c for c in loaded["customers"] if c["customer_id"] == "peer-two")
         assert new["dify"]["dataset_api_key"] == existing_key
 
-        # User-visible message confirms reuse.
+        # User-visible messages confirm reuse + verification.
         assert "Reusing existing workspace dataset key" in result.output
+        assert "Verifying console credentials" in result.output
+
+    def test_reused_key_path_rejects_invalid_console_credentials(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Codex review-6 P2: a typo'd / stale console_password on the
+        reuse path must surface AT ONBOARDING, not later when the
+        runtime tries to use the new entry. Without verification, the
+        wrong password lands in registry.yaml and the gateway breaks
+        at lazy App build for this customer — pointing the blame at
+        the wrong layer.
+        """
+        registry_path = tmp_path / "registry.yaml"
+        self._seed_shared_peer(registry_path)
+
+        # Mock the verifier to reject the credentials, simulating what
+        # the real DifyClient.console_login would do for a wrong pw.
+        with patch(
+            "gateway.admin.cli._verify_console_credentials",
+            new=AsyncMock(side_effect=DifyUpstreamError(
+                "Dify console login failed: 401 Unauthorized"
+            )),
+        ) as mock_verify:
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "add-customer",
+                "--customer-id", "peer-two",
+                "--dify-base-url", "http://shared-dify",
+                "--dify-admin-email", "ws-admin@example.com",
+                "--dify-admin-password", "WRONG-PASSWORD-TYPO",
+                "--mode", "shared",
+                "--shared-embedding-name", "bge-m3",
+                "--model", "gemma-3n-e4b",
+                "--registry-path", str(registry_path),
+            ])
+
+        # Exit code 2 = Dify-side rejection (same code as
+        # _provision_dataset_api_key failures so operator's mental
+        # model stays consistent).
+        assert result.exit_code == 2
+        # Clear error message, no Python traceback.
+        assert "Dify rejected console credentials" in result.output
+        assert "Traceback" not in result.output
+        # Verification happened (it's how we detected the bad creds).
+        assert mock_verify.call_count == 1
+        # Provisioning still never happened — reuse path, never
+        # touches dataset-key creation regardless of outcome.
+        assert mock_provision_dataset_key.call_count == 0
+        # Critical: the peer-two entry must NOT have been written.
+        # Operator's typo doesn't pollute the registry on the way out.
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        assert all(c["customer_id"] != "peer-two" for c in loaded["customers"])
 
     def test_shared_with_different_workspace_email_still_provisions(
         self, tmp_path: Path, mock_provision_dataset_key: Any

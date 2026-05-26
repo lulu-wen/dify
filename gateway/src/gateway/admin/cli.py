@@ -158,6 +158,33 @@ async def _provision_dataset_api_key(
         return await client.console_create_dataset_api_key(session)
 
 
+async def _verify_console_credentials(
+    *,
+    base_url: str,
+    console_email: str,
+    console_password: str,
+) -> None:
+    """Log into Dify console *only* to validate the supplied credentials.
+
+    Codex review-6 P2: the shared-mode dataset-key reuse path
+    (review-5 P2) deliberately skips ``_provision_dataset_api_key``
+    so we don't burn a slot from Dify's 10-key-per-workspace cap. But
+    that function used to also be the only place the operator's
+    ``console_email`` + ``console_password`` got validated against
+    Dify — and those credentials still land in the new registry
+    entry. Without a separate verification step, a typo'd or stale
+    password would write through to ``registry.yaml``, the CLI would
+    report success, and the gateway runtime would fail later at
+    lazy AppManager build (when it does its own ``console_login``).
+
+    This helper does just the login — no dataset-key creation, no
+    side-effects on the Dify side beyond a session cookie that gets
+    GC'd when the client context exits.
+    """
+    async with DifyClient(base_url=base_url, timeout_s=30.0) as client:
+        await client.console_login(console_email, console_password)
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 def cli() -> None:
     """AI SDK Gateway — admin tasks."""
@@ -423,11 +450,55 @@ def add_customer(
         )
 
     if reused_dataset_api_key is not None:
+        # Codex review-6 P2: verify the operator's supplied
+        # console_email + console_password against THIS workspace
+        # before accepting the reused key. Without this check, a
+        # typo'd or stale password would still get written into the
+        # new registry entry (because reuse skips
+        # ``_provision_dataset_api_key``, which is what otherwise
+        # validates the login as a side effect). The runtime would
+        # then fail later when AppManager lazily logs in to build a
+        # Chat App for the new customer.
+        click.echo(
+            f"Verifying console credentials against {dify_base_url} "
+            "(shared-mode reuse skips dataset-key creation but still "
+            "must validate the login) ...",
+            err=True,
+        )
+        try:
+            asyncio.run(
+                _verify_console_credentials(
+                    base_url=dify_base_url,
+                    console_email=dify_admin_email,
+                    console_password=dify_admin_password,
+                )
+            )
+        except DifyUpstreamError as exc:
+            click.echo(
+                f"ERROR: Dify rejected console credentials: {exc}", err=True
+            )
+            click.echo(
+                "Shared-mode reuse still requires the supplied "
+                "console_email + console_password to be valid for this "
+                "workspace — they land in registry.yaml as the truth the "
+                "runtime uses for lazy App / Dataset creation. Most likely "
+                "cause: mistyped or stale password. Verify against the Dify "
+                "Web UI login screen, then re-run.",
+                err=True,
+            )
+            sys.exit(2)
+        except Exception as exc:
+            click.echo(
+                f"ERROR: could not reach Dify at {dify_base_url}: {exc}",
+                err=True,
+            )
+            sys.exit(2)
+
         click.echo(
             f"Reusing existing workspace dataset key "
             f"({reused_dataset_api_key[:16]}...) from a shared-mode peer. "
             f"Dify caps each workspace at 10 dataset keys; reuse keeps the "
-            f"quota intact and skips the network round-trip.",
+            f"quota intact and skips the dataset-key creation round-trip.",
             err=True,
         )
         dataset_api_key = reused_dataset_api_key
