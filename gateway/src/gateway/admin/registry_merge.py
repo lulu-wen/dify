@@ -71,8 +71,26 @@ def load_existing_registry(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {"customers": []}
-    with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+
+    # Codex review-2 P3: convert ``yaml.YAMLError`` / ``OSError`` into
+    # ``RegistryMergeError`` so the CLI handler gets a clean message
+    # instead of an unhandled traceback. Malformed YAML happens any
+    # time an operator hand-edits the file, which is exactly when a
+    # clear "what went wrong" matters most.
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise RegistryMergeError(
+            f"registry at {path} is not valid YAML: {exc}. "
+            f"Fix the file by hand or move it aside and let "
+            f"gateway-admin start fresh."
+        ) from exc
+    except OSError as exc:
+        raise RegistryMergeError(
+            f"could not read registry at {path}: {exc}"
+        ) from exc
+
     if not isinstance(raw, dict):
         raise RegistryMergeError(
             f"registry at {path} must be a YAML mapping at the top level "

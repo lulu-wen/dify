@@ -226,16 +226,19 @@ def cli() -> None:
     multiple=True,
     default=(),
     help=(
-        "Embedding model. Repeatable. Forms: 'id', 'id:endpoint_url', or "
-        "'id:endpoint_url:provider'. Optional."
+        "Embedding model id. Repeatable. Bare id only (no ':' allowed); "
+        "use --embedding-endpoint-url to set the endpoint and the default "
+        "OpenAI-compatible provider applies. For non-default provider, "
+        "edit registry.yaml after onboarding. Optional."
     ),
 )
 @click.option(
     "--embedding-endpoint-url",
     default=None,
     help=(
-        "Default endpoint URL for shorthand --embedding-model entries. "
-        "Ignored when the explicit form is used."
+        "Endpoint URL for --embedding-model entries (one URL shared by all "
+        "of them in the current invocation; per-model endpoints require "
+        "post-onboarding registry editing)."
     ),
 )
 @click.option(
@@ -337,7 +340,58 @@ def add_customer(
             provider=shared_embedding_provider,
         )
 
-    # 5. Talk to Dify — login + create dataset key.
+    # 5. DRY-RUN validation — build the would-be CustomerEntry with a
+    # PLACEHOLDER dataset_api_key and simulate the registry merge.
+    # This catches every deterministic local failure (bad slug for
+    # shared mode, customer_id collision, base_url cross-customer
+    # conflict, etc.) BEFORE we touch Dify.
+    #
+    # Codex review-2 P2: without this, the CLI would create a real
+    # ``dataset-*`` key on Dify, THEN fail at CustomerEntry/registry
+    # validation, leaving an orphan credential in Dify the operator
+    # has no easy way to discover or clean up. The mode-case fix from
+    # self-review P2-1 only handled one specific input — this
+    # generalises to every local check.
+    #
+    # The placeholder starts with ``dataset-`` so it passes PR #5's
+    # L1 format check; we replace it with the real key on success.
+    _PLACEHOLDER_DATASET_KEY = "dataset-pending-validation-pre-network"
+
+    def _build_entry(dataset_api_key: str) -> CustomerEntry:
+        return CustomerEntry(
+            sdk_key=sdk_key,
+            customer_id=customer_id,
+            dify=DifyConnection(
+                base_url=dify_base_url,
+                console_email=dify_admin_email,
+                console_password=dify_admin_password,
+                dataset_api_key=dataset_api_key,
+                mode=mode,  # type: ignore[arg-type]
+                shared_embedding_model=shared_embedding,
+            ),
+            models=models,
+            embedding_models=embedding_models,
+        )
+
+    try:
+        trial_entry = _build_entry(_PLACEHOLDER_DATASET_KEY)
+    except Exception as exc:
+        click.echo(f"ERROR: customer entry validation failed: {exc}", err=True)
+        sys.exit(3)
+
+    try:
+        existing = load_existing_registry(registry_path)
+        # ``merge_customer`` builds an in-memory ``CustomerRegistry``
+        # via ``from_entries`` which is exactly what the gateway runs
+        # at boot. If the merge raises here, the gateway would refuse
+        # to start, so we'd much rather fail now (zero side-effects)
+        # than after creating a Dify-side key.
+        merge_customer(existing, trial_entry, force=force)
+    except RegistryMergeError as exc:
+        click.echo(f"ERROR: registry merge would fail: {exc}", err=True)
+        sys.exit(4)
+
+    # 6. Local validation passed — safe to talk to Dify.
     click.echo(f"Connecting to Dify at {dify_base_url} ...", err=True)
     try:
         dataset_api_key = asyncio.run(
@@ -365,31 +419,13 @@ def add_customer(
         err=True,
     )
 
-    # 6. Build the CustomerEntry. Pydantic will catch field-level
-    #    issues (slug rule in shared mode, etc.) here.
+    # 7. Rebuild the entry with the real dataset_api_key and do the
+    # final merge + atomic write. The local-validation pass above
+    # already proved this will succeed, so the only way the writes
+    # below can fail is filesystem-level (disk full, permission
+    # denied), which is a separate operator concern.
     try:
-        new_entry = CustomerEntry(
-            sdk_key=sdk_key,
-            customer_id=customer_id,
-            dify=DifyConnection(
-                base_url=dify_base_url,
-                console_email=dify_admin_email,
-                console_password=dify_admin_password,
-                dataset_api_key=dataset_api_key,
-                mode=mode,  # type: ignore[arg-type]
-                shared_embedding_model=shared_embedding,
-            ),
-            models=models,
-            embedding_models=embedding_models,
-        )
-    except Exception as exc:
-        click.echo(f"ERROR: customer entry validation failed: {exc}", err=True)
-        sys.exit(3)
-
-    # 7. Merge into registry.yaml. The merge helper runs the full
-    #    cross-customer validator the gateway uses at boot, so anything
-    #    that would 500 the gateway at startup fails here instead.
-    try:
+        new_entry = _build_entry(dataset_api_key)
         existing = load_existing_registry(registry_path)
         merged = merge_customer(existing, new_entry, force=force)
         write_registry_atomic(registry_path, merged)

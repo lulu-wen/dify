@@ -493,3 +493,131 @@ async def test_console_create_dataset_api_key_extracts_token() -> None:
             session = ConsoleSession(access_token="acc", csrf_token="csrf")
             token = await client.console_create_dataset_api_key(session)
             assert token == "dataset-test-token-xyz"
+
+
+# --------------------------------------------------------------------------- #
+# Codex review-2: local validation must run BEFORE Dify network call
+# --------------------------------------------------------------------------- #
+
+
+class TestNoDifyOrphanOnLocalFailure:
+    """Codex review-2 P2: any deterministic local failure (duplicate
+    customer_id, bad slug for shared mode, malformed registry, etc.)
+    must surface BEFORE we create a real ``dataset-*`` key on Dify.
+    Otherwise the operator gets an orphan credential they have no
+    easy way to discover.
+
+    The mocking strategy: ``mock_provision_dataset_key`` patches the
+    function that does the actual network call. Asserting it was
+    called zero times proves the failure happened before the Dify
+    round-trip.
+    """
+
+    def test_duplicate_customer_id_fails_before_network(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Re-running ``add-customer`` for an existing customer_id (no
+        ``--force``) must fail at registry merge BEFORE the network
+        call — otherwise we'd create a second Dify dataset key that
+        nobody ends up referencing."""
+        registry_path = tmp_path / "registry.yaml"
+
+        # Seed the registry with an existing customer.
+        registry_path.write_text(
+            yaml.safe_dump({
+                "customers": [
+                    {
+                        "sdk_key": "bsa_existing_a",
+                        "customer_id": "tenant-a",
+                        "dify": {
+                            "base_url": "http://localhost",
+                            "console_email": "admin@x",
+                            "console_password": "pw",
+                            "dataset_api_key": "dataset-real-existing",
+                            "mode": "dedicated",
+                        },
+                        "models": [
+                            {"id": "m1", "provider": "prov", "name": "n"},
+                        ],
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",                # duplicate
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        # Non-zero exit, clear merge error
+        assert result.exit_code != 0
+        assert "registry merge would fail" in result.output
+
+        # Critical: Dify network call must NOT have fired.
+        assert mock_provision_dataset_key.call_count == 0, (
+            "_provision_dataset_api_key was called despite local "
+            "validation failure — this creates orphan dataset keys on "
+            "Dify side (codex review-2 P2)."
+        )
+
+    def test_bad_slug_in_shared_mode_fails_before_network(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Shared-mode requires customer_id to match a slug regex
+        (lowercase + hyphens). Uppercase / underscores fail pydantic
+        validation. That failure must happen pre-network so a
+        misspelled customer_id doesn't leave an orphan Dify key."""
+        registry_path = tmp_path / "registry.yaml"
+        runner = CliRunner()
+
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "Tenant_A",                # bad slug for shared mode
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code != 0
+        assert mock_provision_dataset_key.call_count == 0, (
+            "Slug validation must fail BEFORE Dify is touched."
+        )
+
+    def test_malformed_yaml_gives_clean_error_not_traceback(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Codex review-2 P3: a hand-edited registry that ends up as
+        invalid YAML should give the operator a clean ``Error: ...``
+        message, not a python traceback. Also: no network call."""
+        registry_path = tmp_path / "registry.yaml"
+        # Write YAML that breaks the parser (unterminated quote).
+        registry_path.write_text('customers:\n  - sdk_key: "bad_quote', encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code != 0
+        # Clean error message, not a python traceback
+        assert "is not valid YAML" in result.output
+        assert "Traceback" not in result.output
+        # No Dify call
+        assert mock_provision_dataset_key.call_count == 0
