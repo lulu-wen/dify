@@ -158,18 +158,33 @@ def check_writable(path: Path) -> None:
             f"cannot create parent directory {parent}: {exc}"
         ) from exc
 
-    # Probe-touch a tiny file in the parent. Catches permission
-    # errors without needing to know the OS-specific access bits.
-    probe = parent / f".{path.name}.writable-probe"
+    # Probe-create a tiny file in the parent to catch permission /
+    # mount-noexec / read-only-fs errors without needing to know the
+    # OS-specific access bits.
+    #
+    # Codex review-7 P2: the probe filename must NOT be a
+    # deterministic ``.{path.name}.writable-probe`` — if an operator
+    # (or another tool) happens to have a file at that exact name,
+    # the cleanup unlink at the end of this function would silently
+    # delete it. Use :func:`tempfile.mkstemp` so the probe name is
+    # uniquely generated and only our own file is removed. Same
+    # pattern as :func:`write_registry_atomic` (codex review-5 P2 #2).
     try:
-        probe.touch()
+        probe_fd, probe_str = tempfile.mkstemp(
+            prefix=f".{path.name}.writable-probe.",
+            dir=parent,
+        )
     except OSError as exc:
         raise RegistryMergeError(
             f"registry parent directory {parent} is not writable: {exc}"
         ) from exc
+
+    probe = Path(probe_str)
+    try:
+        os.close(probe_fd)
     finally:
-        # Best-effort cleanup; if it failed before touch we wouldn't
-        # have a probe to remove anyway.
+        # Best-effort cleanup of OUR probe — mkstemp guaranteed the
+        # name is unique to this call, so unlinking is safe.
         try:
             probe.unlink(missing_ok=True)
         except OSError:

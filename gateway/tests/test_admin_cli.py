@@ -27,6 +27,7 @@ from gateway.admin.cli import (
 )
 from gateway.admin.registry_merge import (
     RegistryMergeError,
+    check_writable,
     find_shared_workspace_dataset_key,
     load_existing_registry,
     merge_customer,
@@ -1272,3 +1273,95 @@ class TestExclusiveTempFile:
             p for p in tmp_path.iterdir() if ".registry.yaml" in p.name or p.name.endswith(".tmp")
         ]
         assert residue == [], f"unexpected tmp residue: {residue}"
+
+
+# --------------------------------------------------------------------------- #
+# Codex review-7: check_writable probe must not delete unrelated files
+# --------------------------------------------------------------------------- #
+
+
+class TestCheckWritableNoSideEffects:
+    """Codex review-7 P2: ``check_writable`` must not touch any
+    pre-existing file other than the probe it creates itself.
+
+    The old implementation used a deterministic probe filename
+    ``.{registry_name}.writable-probe`` and ``unlink``'d it in a
+    finally block. If an operator (or another tool) happened to have
+    a file at that exact name — legitimate marker, leftover, attacker
+    plant — running ``gateway-admin add-customer`` would silently
+    delete it before the registry write even fires.
+
+    Same fix shape as the round-5 P2 #2 patch for
+    ``write_registry_atomic``: switch to ``tempfile.mkstemp`` so the
+    probe's filename is unique per invocation and cleanup only
+    affects our own file.
+    """
+
+    def test_preexisting_deterministic_probe_name_is_not_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """Plant a file at the OLD deterministic probe path
+        (``.registry.yaml.writable-probe``). Call ``check_writable``.
+        The planted file must survive untouched — neither overwritten
+        nor unlinked."""
+        registry = tmp_path / "registry.yaml"
+        legacy_probe = tmp_path / ".registry.yaml.writable-probe"
+        legacy_probe.write_text(
+            "PRE-EXISTING-CONTENT-FROM-OPERATOR\n", encoding="utf-8"
+        )
+
+        check_writable(registry)
+
+        assert legacy_probe.exists()
+        assert legacy_probe.read_text(encoding="utf-8") == (
+            "PRE-EXISTING-CONTENT-FROM-OPERATOR\n"
+        )
+
+    def test_no_probe_residue_after_successful_call(
+        self, tmp_path: Path
+    ) -> None:
+        """check_writable creates a probe to test writability, then
+        cleans it up. After a successful call there should be no
+        probe-named file (deterministic or random) left behind."""
+        registry = tmp_path / "registry.yaml"
+
+        check_writable(registry)
+
+        residue = [
+            p for p in tmp_path.iterdir() if "writable-probe" in p.name
+        ]
+        assert residue == [], f"unexpected probe residue: {residue}"
+
+    def test_unwritable_parent_still_raises_clean_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Switching to mkstemp must not regress error reporting:
+        when the parent path is a regular file (mkdir can't make a
+        directory there), we still want a clean
+        ``RegistryMergeError`` and no python traceback escaping."""
+        blockage = tmp_path / "blockage"
+        blockage.write_text("not a directory", encoding="utf-8")
+        registry = blockage / "registry.yaml"
+
+        with pytest.raises(
+            RegistryMergeError, match="cannot create parent directory"
+        ):
+            check_writable(registry)
+
+    def test_preexisting_probe_survives_when_target_already_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """Belt-and-braces: even when the registry file already
+        exists at the target path, the probe path stays untouched.
+        The ``path.exists() and not path.is_file()`` check kicks in
+        only for non-file targets, not for files."""
+        registry = tmp_path / "registry.yaml"
+        registry.write_text("customers: []\n", encoding="utf-8")
+
+        legacy_probe = tmp_path / ".registry.yaml.writable-probe"
+        legacy_probe.write_text("MARKER-FILE\n", encoding="utf-8")
+
+        check_writable(registry)
+
+        assert legacy_probe.exists()
+        assert legacy_probe.read_text(encoding="utf-8") == "MARKER-FILE\n"
