@@ -391,7 +391,7 @@ def find_shared_workspace_dataset_key(
     registry_data: dict[str, Any],
     *,
     base_url: str,
-    console_email: str,
+    workspace_id: str,
 ) -> str | None:
     """Return an existing ``dataset_api_key`` for the same shared workspace.
 
@@ -404,15 +404,22 @@ def find_shared_workspace_dataset_key(
     up with a Dify-side limit error even though all previous customers
     already share a perfectly good key.
 
-    Workspace identity is ``(base_url, console_email)`` — same login
-    against the same Dify host = same workspace. ``base_url`` is
-    normalised by ``rstrip("/")`` to match the rule
+    Workspace identity is ``(base_url, workspace_id)`` — Dify ``tenant_id``
+    fetched at login via ``POST /console/api/workspaces/current``. Codex
+    review-9 P1: a Dify *account* (email + password) can be a member of
+    multiple workspaces; the same admin email logged in twice can land
+    in two different tenants. Matching on ``console_email`` instead of
+    the active ``workspace_id`` would silently cross-pollute keys between
+    workspaces and break tenant isolation. ``base_url`` is normalised by
+    ``rstrip("/")`` to match the rule
     :meth:`CustomerRegistry._check_dify_consistency` already uses.
 
     Returns the first matching ``dataset_api_key`` so the CLI can skip
     the network provisioning call entirely. Returns ``None`` when no
     matching shared-mode peer exists (truly new workspace, or only
-    dedicated peers on this base_url).
+    dedicated peers on this base_url, or peers from PR #6
+    pre-codex-review-9 that don't have a stored ``workspace_id`` to
+    compare against).
     """
     normalized = base_url.rstrip("/")
     for entry in registry_data.get("customers", []):
@@ -427,7 +434,14 @@ def find_shared_workspace_dataset_key(
             continue
         if dify["base_url"].rstrip("/") != normalized:
             continue
-        if dify.get("console_email") != console_email:
+        # Codex review-9 P1: match on workspace_id, NOT console_email.
+        # Peer without workspace_id (legacy) is treated as 'unknown
+        # workspace' and skipped — safer to provision a fresh key than
+        # to risk cross-tenant key reuse.
+        peer_workspace_id = dify.get("workspace_id")
+        if not isinstance(peer_workspace_id, str) or not peer_workspace_id:
+            continue
+        if peer_workspace_id != workspace_id:
             continue
         key = dify.get("dataset_api_key")
         if not isinstance(key, str) or not key:

@@ -146,44 +146,58 @@ async def _provision_dataset_api_key(
     base_url: str,
     console_email: str,
     console_password: str,
-) -> str:
+) -> tuple[str, str]:
     """Log into Dify console + create a workspace-scoped dataset API key.
 
-    Returns the freshly-minted ``dataset-*`` token. Network failures
-    propagate to the caller for fail-fast error reporting; we don't
-    wrap them here because the CLI's error handler knows how to render
-    them cleanly.
+    Returns ``(workspace_id, dataset_api_key)``. The workspace id is
+    fetched from ``POST /console/api/workspaces/current`` right after
+    login so the caller knows which Dify tenant the session landed in
+    (codex review-9 P1: a Dify account can be a member of multiple
+    workspaces; the active one is opaque to the caller unless we ask).
+
+    Network failures propagate to the caller for fail-fast error
+    reporting; we don't wrap them here because the CLI's error
+    handler knows how to render them cleanly.
     """
     async with DifyClient(base_url=base_url, timeout_s=30.0) as client:
         session = await client.console_login(console_email, console_password)
-        return await client.console_create_dataset_api_key(session)
+        workspace_id = await client.console_get_current_workspace_id(session)
+        dataset_api_key = await client.console_create_dataset_api_key(session)
+        return workspace_id, dataset_api_key
 
 
-async def _verify_console_credentials(
+async def _login_and_fetch_workspace_id(
     *,
     base_url: str,
     console_email: str,
     console_password: str,
-) -> None:
-    """Log into Dify console *only* to validate the supplied credentials.
+) -> str:
+    """Log in + fetch active workspace id. No dataset-key creation.
 
-    Codex review-6 P2: the shared-mode dataset-key reuse path
-    (review-5 P2) deliberately skips ``_provision_dataset_api_key``
-    so we don't burn a slot from Dify's 10-key-per-workspace cap. But
-    that function used to also be the only place the operator's
-    ``console_email`` + ``console_password`` got validated against
-    Dify — and those credentials still land in the new registry
-    entry. Without a separate verification step, a typo'd or stale
-    password would write through to ``registry.yaml``, the CLI would
-    report success, and the gateway runtime would fail later at
-    lazy AppManager build (when it does its own ``console_login``).
+    Codex review-6 P2 + review-9 P1: replaces the earlier
+    ``_verify_console_credentials`` helper. The shared-mode reuse
+    path (review-5 P2) skips ``_provision_dataset_api_key`` so we
+    don't burn a slot from Dify's 10-key-per-workspace cap. But the
+    skipped call had two jobs:
 
-    This helper does just the login — no dataset-key creation, no
-    side-effects on the Dify side beyond a session cookie that gets
-    GC'd when the client context exits.
+    1. **Validate credentials** — without this, a typo'd or stale
+       password would land in registry.yaml unvalidated and trip the
+       runtime later at lazy AppManager build (review-6 P2).
+    2. **Pin down WHICH workspace the operator is targeting** —
+       without this, ``base_url`` + ``console_email`` are ambiguous
+       when the same admin account belongs to multiple workspaces in
+       one Dify deployment, and the reuse path can cross-pollute
+       keys between tenants (review-9 P1).
+
+    This helper does both in one round trip: ``console_login`` for the
+    creds check, then ``console_get_current_workspace_id`` to capture
+    the active tenant id. Returns the workspace_id; raises
+    :class:`DifyUpstreamError` on auth / network failures so the CLI
+    can render a clean error and exit before touching the registry.
     """
     async with DifyClient(base_url=base_url, timeout_s=30.0) as client:
-        await client.console_login(console_email, console_password)
+        session = await client.console_login(console_email, console_password)
+        return await client.console_get_current_workspace_id(session)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -389,7 +403,9 @@ def add_customer(
     # so the shared-mode reuse path can refuse to propagate it if it ever
     # leaks into a peer entry.
 
-    def _build_entry(dataset_api_key: str) -> CustomerEntry:
+    def _build_entry(
+        dataset_api_key: str, workspace_id: str | None = None
+    ) -> CustomerEntry:
         return CustomerEntry(
             sdk_key=sdk_key,
             customer_id=customer_id,
@@ -398,6 +414,7 @@ def add_customer(
                 console_email=dify_admin_email,
                 console_password=dify_admin_password,
                 dataset_api_key=dataset_api_key,
+                workspace_id=workspace_id,
                 mode=mode,  # type: ignore[arg-type]
                 shared_embedding_model=shared_embedding,
             ),
@@ -435,42 +452,36 @@ def add_customer(
         click.echo(f"ERROR: registry path not writable: {exc}", err=True)
         sys.exit(4)
 
-    # 5b. Shared-mode dataset key reuse. Dify caps
-    # ``/console/api/datasets/api-keys`` at 10 keys per workspace. In
-    # shared mode every customer in a workspace can use the same key
-    # (workspace-scoped), so the 11th onboarding for a workspace would
-    # otherwise blow up on the Dify side even though there is a
-    # perfectly good key already in registry.yaml. Look up the existing
-    # peer here so we can skip ``_provision_dataset_api_key`` entirely
-    # — zero Dify network calls, zero risk of an orphan key.
-    # Codex review-5 P2.
+    # 5b. Shared-mode workspace fingerprint + dataset key reuse.
+    #
+    # Codex review-9 P1: Dify accounts can belong to MULTIPLE workspaces.
+    # ``base_url + console_email`` is not a unique workspace identity —
+    # the same admin can log in twice and land in different tenants.
+    # Before we can decide whether a peer's dataset_api_key is safe to
+    # reuse, we must KNOW which tenant our session is currently in.
+    # So for shared mode we always login + fetch workspace_id first,
+    # match the peer on that, and only THEN decide reuse vs provision.
+    #
+    # This login also covers the credential-verification step that
+    # review-6 P2 added (typo'd password lands in registry otherwise),
+    # since login failure here halts the flow before the registry
+    # write.
+    #
+    # Dedicated mode skips this branch entirely — it always provisions
+    # its own dataset key (review-5 only optimised shared mode), so
+    # the workspace_id capture happens inside
+    # ``_provision_dataset_api_key`` later in step 6.
     reused_dataset_api_key: str | None = None
+    fetched_workspace_id: str | None = None
     if mode == "shared":
-        reused_dataset_api_key = find_shared_workspace_dataset_key(
-            existing,
-            base_url=dify_base_url,
-            console_email=dify_admin_email,
-        )
-
-    if reused_dataset_api_key is not None:
-        # Codex review-6 P2: verify the operator's supplied
-        # console_email + console_password against THIS workspace
-        # before accepting the reused key. Without this check, a
-        # typo'd or stale password would still get written into the
-        # new registry entry (because reuse skips
-        # ``_provision_dataset_api_key``, which is what otherwise
-        # validates the login as a side effect). The runtime would
-        # then fail later when AppManager lazily logs in to build a
-        # Chat App for the new customer.
         click.echo(
-            f"Verifying console credentials against {dify_base_url} "
-            "(shared-mode reuse skips dataset-key creation but still "
-            "must validate the login) ...",
+            f"Verifying console credentials + fetching workspace id "
+            f"against {dify_base_url} ...",
             err=True,
         )
         try:
-            asyncio.run(
-                _verify_console_credentials(
+            fetched_workspace_id = asyncio.run(
+                _login_and_fetch_workspace_id(
                     base_url=dify_base_url,
                     console_email=dify_admin_email,
                     console_password=dify_admin_password,
@@ -481,7 +492,7 @@ def add_customer(
                 f"ERROR: Dify rejected console credentials: {exc}", err=True
             )
             click.echo(
-                "Shared-mode reuse still requires the supplied "
+                "Shared-mode onboarding requires the supplied "
                 "console_email + console_password to be valid for this "
                 "workspace — they land in registry.yaml as the truth the "
                 "runtime uses for lazy App / Dataset creation. Most likely "
@@ -497,19 +508,32 @@ def add_customer(
             )
             sys.exit(2)
 
+        reused_dataset_api_key = find_shared_workspace_dataset_key(
+            existing,
+            base_url=dify_base_url,
+            workspace_id=fetched_workspace_id,
+        )
+
+    if reused_dataset_api_key is not None:
         click.echo(
             f"Reusing existing workspace dataset key "
-            f"({reused_dataset_api_key[:16]}...) from a shared-mode peer. "
-            f"Dify caps each workspace at 10 dataset keys; reuse keeps the "
-            f"quota intact and skips the dataset-key creation round-trip.",
+            f"({reused_dataset_api_key[:16]}...) from a shared-mode peer "
+            f"in workspace {fetched_workspace_id}. Dify caps each "
+            f"workspace at 10 dataset keys; reuse keeps the quota intact "
+            f"and skips the dataset-key creation round-trip.",
             err=True,
         )
         dataset_api_key = reused_dataset_api_key
+        # fetched_workspace_id already set above for shared-mode reuse.
     else:
-        # 6. Local validation + filesystem preflight passed — safe to talk to Dify.
+        # 6. Local validation + filesystem preflight passed — safe to
+        # talk to Dify. ``_provision_dataset_api_key`` returns the
+        # workspace_id alongside the new dataset key so we can pin the
+        # entry to the tenant the session actually landed in
+        # (codex review-9 P1).
         click.echo(f"Connecting to Dify at {dify_base_url} ...", err=True)
         try:
-            dataset_api_key = asyncio.run(
+            fetched_workspace_id, dataset_api_key = asyncio.run(
                 _provision_dataset_api_key(
                     base_url=dify_base_url,
                     console_email=dify_admin_email,
@@ -543,7 +567,7 @@ def add_customer(
     # If the write does fail post-network, log the dataset key prefix
     # so the operator can find + delete the orphan in Dify Web UI.
     try:
-        new_entry = _build_entry(dataset_api_key)
+        new_entry = _build_entry(dataset_api_key, workspace_id=fetched_workspace_id)
         existing = load_existing_registry(registry_path)
         merged = merge_customer(existing, new_entry, force=force)
         write_registry_atomic(registry_path, merged)

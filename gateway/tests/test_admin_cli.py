@@ -237,30 +237,38 @@ def mock_provision_dataset_key() -> Any:
     """Mock _provision_dataset_api_key so tests don't talk to real Dify.
 
     The function is what touches the network — replacing it covers the
-    full DifyClient interaction (login + create_dataset_api_key) without
-    needing a fake HTTP layer.
+    full DifyClient interaction (login + workspace_id fetch +
+    create_dataset_api_key) without needing a fake HTTP layer.
+
+    Codex review-9 P1: the function now returns a tuple of
+    ``(workspace_id, dataset_api_key)`` because the workspace identity
+    has to be captured at login time (a Dify account can be a member
+    of multiple workspaces; the active one is opaque otherwise).
     """
     with patch(
         "gateway.admin.cli._provision_dataset_api_key",
-        new=AsyncMock(return_value="dataset-mocked-key-12345678"),
+        new=AsyncMock(
+            return_value=("workspace-mock-tenant-id", "dataset-mocked-key-12345678")
+        ),
     ) as mocked:
         yield mocked
 
 
 @pytest.fixture
-def mock_verify_console_credentials() -> Any:
-    """Mock _verify_console_credentials for shared-mode reuse tests.
+def mock_login_and_fetch_workspace_id() -> Any:
+    """Mock _login_and_fetch_workspace_id for shared-mode reuse tests.
 
-    Codex review-6 P2 added a login-only verification step that fires
-    when the CLI reuses an existing peer's dataset key (so we don't
-    accept typo'd / stale credentials silently). Tests that exercise
-    the reuse path need to mock this too, otherwise they'd try to
-    actually reach Dify. Default mock: succeeds. Override in tests
-    that simulate invalid credentials.
+    Codex review-9 P1: replaces the earlier
+    ``mock_verify_console_credentials`` fixture (review-6 P2). The
+    shared-mode reuse path now always logs in first to discover which
+    Dify workspace the session lands in — that workspace_id is what
+    the reuse-eligibility match is keyed on. Default mock returns a
+    canonical id; override in tests that simulate invalid credentials
+    or a different workspace.
     """
     with patch(
-        "gateway.admin.cli._verify_console_credentials",
-        new=AsyncMock(return_value=None),
+        "gateway.admin.cli._login_and_fetch_workspace_id",
+        new=AsyncMock(return_value="workspace-mock-tenant-id"),
     ) as mocked:
         yield mocked
 
@@ -429,7 +437,10 @@ class TestAddCustomerCommand:
         assert "--shared-embedding-name is required" in result.output
 
     def test_uppercase_mode_normalised_before_dify_call(
-        self, tmp_path: Path, mock_provision_dataset_key: Any
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
     ) -> None:
         """Self-review P2-1 regression: --mode SHARED (uppercase) must
         be lowercased BEFORE we talk to Dify, not after. If we did the
@@ -826,6 +837,14 @@ class TestFindSharedWorkspaceDatasetKey:
     peer's ``dataset_api_key`` in the on-disk registry so the next
     shared onboarding for the same workspace can reuse it instead of
     burning one of Dify's 10 workspace-scoped keys.
+
+    Codex review-9 P1: matching is now keyed on ``(base_url,
+    workspace_id)``, not ``(base_url, console_email)``. A Dify account
+    can be a member of multiple workspaces; the active workspace is
+    captured at login via ``POST /console/api/workspaces/current``
+    and stored on every ``DifyConnection``. Peer entries without a
+    stored ``workspace_id`` (legacy / hand-written) are treated as
+    'unknown workspace, don't risk cross-tenant reuse' and skipped.
     """
 
     def test_returns_key_for_matching_shared_peer(self) -> None:
@@ -839,6 +858,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "ws-admin@example.com",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-workspace-key-9876",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                         "shared_embedding_model": {
                             "name": "bge-m3",
@@ -852,7 +872,7 @@ class TestFindSharedWorkspaceDatasetKey:
         found = find_shared_workspace_dataset_key(
             registry_data,
             base_url="http://shared-dify",
-            console_email="ws-admin@example.com",
+            workspace_id="tenant-uuid-1",
         )
         assert found == "dataset-workspace-key-9876"
 
@@ -871,6 +891,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "ws-admin@example.com",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-workspace-key",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -880,13 +901,15 @@ class TestFindSharedWorkspaceDatasetKey:
         found = find_shared_workspace_dataset_key(
             registry_data,
             base_url="http://shared-dify",  # no slash
-            console_email="ws-admin@example.com",
+            workspace_id="tenant-uuid-1",
         )
         assert found == "dataset-workspace-key"
 
-    def test_different_console_email_is_different_workspace(self) -> None:
-        """Same Dify host, different login = different workspace.
-        Don't cross-reuse, otherwise tenant boundary leaks."""
+    def test_different_workspace_id_is_not_a_match(self) -> None:
+        """Codex review-9 P1: same Dify host, same admin email, but
+        the session landed in a DIFFERENT workspace this time. Reuse
+        path must NOT cross-pollute — return None and let the caller
+        provision a fresh key for the actual target tenant."""
         registry_data: dict[str, Any] = {
             "customers": [
                 {
@@ -894,21 +917,55 @@ class TestFindSharedWorkspaceDatasetKey:
                     "customer_id": "peer",
                     "dify": {
                         "base_url": "http://shared-dify",
-                        "console_email": "workspace-1@example.com",
+                        "console_email": "ws-admin@example.com",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-ws1-key",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
                 }
             ]
         }
-        # Different email → different Dify workspace.
+        # Same admin, but now logged into workspace 2 → no reuse.
         assert (
             find_shared_workspace_dataset_key(
                 registry_data,
                 base_url="http://shared-dify",
-                console_email="workspace-2@example.com",
+                workspace_id="tenant-uuid-2",
+            )
+            is None
+        )
+
+    def test_peer_without_workspace_id_is_skipped(self) -> None:
+        """Codex review-9 P1: legacy / hand-written entries without
+        a stored workspace_id must be treated as 'unknown workspace'
+        and skipped. The reuse path can't prove they share the same
+        tenant as the caller's session, so it's safer to provision a
+        fresh key for the new entry than risk silent cross-tenant
+        reuse."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_legacy_peer",
+                    "customer_id": "legacy-peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "ws-admin@example.com",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-legacy-no-wid",
+                        # No workspace_id (entry pre-dates codex review-9).
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                workspace_id="tenant-uuid-1",
             )
             is None
         )
@@ -927,6 +984,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@example.com",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-dedicated-key",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "dedicated",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -937,7 +995,7 @@ class TestFindSharedWorkspaceDatasetKey:
             find_shared_workspace_dataset_key(
                 registry_data,
                 base_url="http://dify",
-                console_email="admin@example.com",
+                workspace_id="tenant-uuid-1",
             )
             is None
         )
@@ -947,7 +1005,7 @@ class TestFindSharedWorkspaceDatasetKey:
             find_shared_workspace_dataset_key(
                 {"customers": []},
                 base_url="http://dify",
-                console_email="x@y",
+                workspace_id="any",
             )
             is None
         )
@@ -972,6 +1030,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-real",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -981,7 +1040,7 @@ class TestFindSharedWorkspaceDatasetKey:
         found = find_shared_workspace_dataset_key(
             registry_data,
             base_url="http://dify",
-            console_email="admin@x",
+            workspace_id="tenant-uuid-1",
         )
         assert found == "dataset-real"
 
@@ -999,6 +1058,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": "wrong-family-bsa_xyz",  # missing dataset- prefix
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -1009,7 +1069,7 @@ class TestFindSharedWorkspaceDatasetKey:
             find_shared_workspace_dataset_key(
                 registry_data,
                 base_url="http://shared-dify",
-                console_email="admin@x",
+                workspace_id="tenant-uuid-1",
             )
             is None
         )
@@ -1031,6 +1091,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -1041,7 +1102,7 @@ class TestFindSharedWorkspaceDatasetKey:
             find_shared_workspace_dataset_key(
                 registry_data,
                 base_url="http://shared-dify",
-                console_email="admin@x",
+                workspace_id="tenant-uuid-1",
             )
             is None
         )
@@ -1062,6 +1123,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -1074,6 +1136,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": "app-totally-wrong",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -1086,6 +1149,7 @@ class TestFindSharedWorkspaceDatasetKey:
                         "console_email": "admin@x",
                         "console_password": "pw",
                         "dataset_api_key": "dataset-good-real-key",
+                        "workspace_id": "tenant-uuid-1",
                         "mode": "shared",
                     },
                     "models": [{"id": "m1", "provider": "p", "name": "n"}],
@@ -1096,7 +1160,7 @@ class TestFindSharedWorkspaceDatasetKey:
             find_shared_workspace_dataset_key(
                 registry_data,
                 base_url="http://shared-dify",
-                console_email="admin@x",
+                workspace_id="tenant-uuid-1",
             )
             == "dataset-good-real-key"
         )
@@ -1110,10 +1174,29 @@ class TestSharedModeKeyReuseEndToEnd:
     == 0`` AND the new entry's ``dataset_api_key`` equals the peer's.
     """
 
-    def _seed_shared_peer(self, registry_path: Path) -> str:
+    # Workspace id that the shared-mode reuse fixture
+    # ``mock_login_and_fetch_workspace_id`` returns by default. Peer
+    # entries must use the SAME id so the reuse path matches; tests that
+    # want to simulate "different workspace" override the mock.
+    _PEER_WORKSPACE_ID = "workspace-mock-tenant-id"
+
+    def _seed_shared_peer(
+        self,
+        registry_path: Path,
+        *,
+        workspace_id: str | None = None,
+    ) -> str:
         """Write registry.yaml containing one shared-mode customer.
-        Returns the dataset_api_key that subsequent onboardings should reuse."""
+        Returns the dataset_api_key that subsequent onboardings should reuse.
+
+        ``workspace_id`` defaults to ``_PEER_WORKSPACE_ID`` (the same
+        id the login fixture returns) so the reuse path matches. Tests
+        that want to simulate a peer in a different tenant pass an
+        explicit value (or ``None`` for legacy / unset)."""
         existing_key = "dataset-shared-workspace-key-from-peer"
+        peer_workspace_id = (
+            workspace_id if workspace_id is not None else self._PEER_WORKSPACE_ID
+        )
         registry_path.write_text(
             yaml.safe_dump({
                 "customers": [
@@ -1125,6 +1208,7 @@ class TestSharedModeKeyReuseEndToEnd:
                             "console_email": "ws-admin@example.com",
                             "console_password": "pw",
                             "dataset_api_key": existing_key,
+                            "workspace_id": peer_workspace_id,
                             "mode": "shared",
                             "shared_embedding_model": {
                                 "name": "bge-m3",
@@ -1146,7 +1230,7 @@ class TestSharedModeKeyReuseEndToEnd:
         self,
         tmp_path: Path,
         mock_provision_dataset_key: Any,
-        mock_verify_console_credentials: Any,
+        mock_login_and_fetch_workspace_id: Any,
     ) -> None:
         registry_path = tmp_path / "registry.yaml"
         existing_key = self._seed_shared_peer(registry_path)
@@ -1175,20 +1259,24 @@ class TestSharedModeKeyReuseEndToEnd:
             "(codex review-5 P2 — Dify caps at 10 keys/workspace)."
         )
 
-        # Codex review-6 P2: verification of the supplied console
-        # credentials still happens — login-only, no dataset-key
-        # creation. Without this assertion, a regression that removed
-        # the verify step would slip past.
-        assert mock_verify_console_credentials.call_count == 1, (
-            "_verify_console_credentials was not called on the reuse "
+        # Codex review-6 P2 + review-9 P1: login + workspace_id fetch
+        # still happens — validates the creds AND pins down which Dify
+        # tenant we're in (the matching key for reuse-eligibility).
+        # Without this assertion, a regression that removed the step
+        # would slip past either guarantee.
+        assert mock_login_and_fetch_workspace_id.call_count == 1, (
+            "_login_and_fetch_workspace_id was not called on the reuse "
             "path — operator's password would land in registry.yaml "
-            "unvalidated (codex review-6 P2)."
+            "unvalidated and the workspace identity would be unknown "
+            "(codex review-6 P2 + review-9 P1)."
         )
 
-        # And the new entry's dataset_api_key matches the peer's.
+        # And the new entry's dataset_api_key + workspace_id match
+        # what the reuse path captured.
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         new = next(c for c in loaded["customers"] if c["customer_id"] == "peer-two")
         assert new["dify"]["dataset_api_key"] == existing_key
+        assert new["dify"]["workspace_id"] == self._PEER_WORKSPACE_ID
 
         # User-visible messages confirm reuse + verification.
         assert "Reusing existing workspace dataset key" in result.output
@@ -1207,14 +1295,14 @@ class TestSharedModeKeyReuseEndToEnd:
         registry_path = tmp_path / "registry.yaml"
         self._seed_shared_peer(registry_path)
 
-        # Mock the verifier to reject the credentials, simulating what
-        # the real DifyClient.console_login would do for a wrong pw.
+        # Mock the login+fetch to reject the credentials, simulating
+        # what the real DifyClient.console_login would do for a wrong pw.
         with patch(
-            "gateway.admin.cli._verify_console_credentials",
+            "gateway.admin.cli._login_and_fetch_workspace_id",
             new=AsyncMock(side_effect=DifyUpstreamError(
                 "Dify console login failed: 401 Unauthorized"
             )),
-        ) as mock_verify:
+        ) as mock_login:
             runner = CliRunner()
             result = runner.invoke(cli, [
                 "add-customer",
@@ -1235,8 +1323,8 @@ class TestSharedModeKeyReuseEndToEnd:
         # Clear error message, no Python traceback.
         assert "Dify rejected console credentials" in result.output
         assert "Traceback" not in result.output
-        # Verification happened (it's how we detected the bad creds).
-        assert mock_verify.call_count == 1
+        # Login attempt happened (it's how we detected the bad creds).
+        assert mock_login.call_count == 1
         # Provisioning still never happened — reuse path, never
         # touches dataset-key creation regardless of outcome.
         assert mock_provision_dataset_key.call_count == 0
@@ -1249,7 +1337,7 @@ class TestSharedModeKeyReuseEndToEnd:
         self,
         tmp_path: Path,
         mock_provision_dataset_key: Any,
-        mock_verify_console_credentials: Any,
+        mock_login_and_fetch_workspace_id: Any,
     ) -> None:
         """Codex review-8 P2: when the existing shared-mode peer is
         holding a token that doesn't pass L1 (legacy placeholder, wrong
@@ -1262,6 +1350,9 @@ class TestSharedModeKeyReuseEndToEnd:
         # prefix). This is exactly the legacy state PR #6's CLI is
         # supposed to clean up — but the cleanup must not be by
         # propagating the bad key to a NEW customer.
+        # The peer's workspace_id matches the login fixture's value so
+        # the workspace match alone wouldn't disqualify it — the only
+        # reason for skip here is the malformed dataset_api_key.
         registry_path.write_text(
             yaml.safe_dump({
                 "customers": [
@@ -1273,6 +1364,7 @@ class TestSharedModeKeyReuseEndToEnd:
                             "console_email": "ws-admin@example.com",
                             "console_password": "pw",
                             "dataset_api_key": "wrong-family-no-prefix",
+                            "workspace_id": self._PEER_WORKSPACE_ID,
                             "mode": "shared",
                             "shared_embedding_model": {
                                 "name": "bge-m3",
@@ -1304,6 +1396,10 @@ class TestSharedModeKeyReuseEndToEnd:
 
         assert result.exit_code == 0, result.output
 
+        # Shared-mode always logs in to capture the workspace_id (the
+        # match key for reuse). That happens BEFORE the reuse decision.
+        assert mock_login_and_fetch_workspace_id.call_count == 1
+
         # Critical: provisioning DID fire — we fell through to the
         # real Dify call instead of reusing the legacy bad key.
         assert mock_provision_dataset_key.call_count == 1, (
@@ -1312,15 +1408,13 @@ class TestSharedModeKeyReuseEndToEnd:
             "reuse path silently propagated bad data (codex review-8 P2)."
         )
 
-        # Verify path also not used — we never claimed to reuse
-        # anything, so no verify-only login was needed either.
-        assert mock_verify_console_credentials.call_count == 0
-
         # The new entry has the freshly-provisioned (mocked) key,
-        # NOT the peer's malformed string.
+        # NOT the peer's malformed string. workspace_id is from the
+        # provision tuple (matches the seed value).
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         new = next(c for c in loaded["customers"] if c["customer_id"] == "fresh-customer")
         assert new["dify"]["dataset_api_key"] == "dataset-mocked-key-12345678"
+        assert new["dify"]["workspace_id"] == self._PEER_WORKSPACE_ID
         # The legacy peer's bad data is left as-is — the CLI's job is
         # not to fix unrelated entries; the gateway's startup check
         # will surface it explicitly.
@@ -1331,7 +1425,7 @@ class TestSharedModeKeyReuseEndToEnd:
         self,
         tmp_path: Path,
         mock_provision_dataset_key: Any,
-        mock_verify_console_credentials: Any,
+        mock_login_and_fetch_workspace_id: Any,
     ) -> None:
         """Defense-in-depth: even though the dry-run sentinel passes
         the ``dataset-`` prefix check (it starts with ``dataset-``),
@@ -1351,6 +1445,7 @@ class TestSharedModeKeyReuseEndToEnd:
                             "console_email": "ws-admin@example.com",
                             "console_password": "pw",
                             "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                            "workspace_id": self._PEER_WORKSPACE_ID,
                             "mode": "shared",
                             "shared_embedding_model": {
                                 "name": "bge-m3",
@@ -1382,26 +1477,166 @@ class TestSharedModeKeyReuseEndToEnd:
 
         assert result.exit_code == 0, result.output
         # Sentinel was rejected → fell through to provision.
+        assert mock_login_and_fetch_workspace_id.call_count == 1
         assert mock_provision_dataset_key.call_count == 1
-        assert mock_verify_console_credentials.call_count == 0
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         new = next(c for c in loaded["customers"] if c["customer_id"] == "fresh-customer")
         assert new["dify"]["dataset_api_key"] == "dataset-mocked-key-12345678"
 
+    def test_peer_in_different_workspace_falls_through_to_provision(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
+    ) -> None:
+        """Codex review-9 P1 e2e: the same admin email can be a member
+        of multiple workspaces. When the operator logs in and the
+        session lands in workspace B but the peer entry is for
+        workspace A, the reuse path must NOT cross-pollute the key.
+
+        Simulate by seeding peer with one workspace_id and having the
+        login mock return a DIFFERENT workspace_id. The new customer
+        must end up with a fresh provisioned key (in their own
+        workspace), and the legacy peer left alone."""
+        registry_path = tmp_path / "registry.yaml"
+        # Peer is in workspace A.
+        self._seed_shared_peer(
+            registry_path, workspace_id="workspace-A-tenant"
+        )
+
+        # Operator logs in and the session lands in workspace B.
+        # Default mock returns "workspace-mock-tenant-id", but we
+        # need to specifically return "workspace-B-tenant" here. The
+        # provision mock should also return that to be self-consistent.
+        mock_login_and_fetch_workspace_id.return_value = "workspace-B-tenant"
+        mock_provision_dataset_key.return_value = (
+            "workspace-B-tenant",
+            "dataset-fresh-for-B",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "new-in-workspace-b",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",  # same admin email!
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+
+        # Login fired (workspace fingerprint capture).
+        assert mock_login_and_fetch_workspace_id.call_count == 1
+
+        # Critical: provisioning DID fire — workspace mismatch must
+        # NOT lead to cross-tenant key reuse.
+        assert mock_provision_dataset_key.call_count == 1, (
+            "_provision_dataset_api_key was NOT called even though the "
+            "peer is in a different workspace (codex review-9 P1 — "
+            "same admin email, different tenant)."
+        )
+
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "new-in-workspace-b")
+        # New entry has the fresh key for workspace B.
+        assert new["dify"]["dataset_api_key"] == "dataset-fresh-for-B"
+        assert new["dify"]["workspace_id"] == "workspace-B-tenant"
+        # Peer in workspace A unchanged.
+        peer = next(c for c in loaded["customers"] if c["customer_id"] == "peer-one")
+        assert peer["dify"]["workspace_id"] == "workspace-A-tenant"
+        assert peer["dify"]["dataset_api_key"] == "dataset-shared-workspace-key-from-peer"
+
+    def test_peer_without_workspace_id_falls_through_to_provision(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
+    ) -> None:
+        """Codex review-9 P1: legacy peer entries (written by an
+        earlier PR #6 version, before workspace_id was added) have no
+        stored workspace_id. We can't prove they share the active
+        tenant, so safest is to skip reuse and provision a fresh key."""
+        registry_path = tmp_path / "registry.yaml"
+        # Seed peer with NO workspace_id (legacy entry).
+        registry_path.write_text(
+            yaml.safe_dump({
+                "customers": [
+                    {
+                        "sdk_key": "bsa_legacy_peer",
+                        "customer_id": "legacy-peer",
+                        "dify": {
+                            "base_url": "http://shared-dify",
+                            "console_email": "ws-admin@example.com",
+                            "console_password": "pw",
+                            "dataset_api_key": "dataset-legacy-key",
+                            # NO workspace_id — pre-review-9 entry.
+                            "mode": "shared",
+                            "shared_embedding_model": {
+                                "name": "bge-m3",
+                                "provider": (
+                                    "langgenius/openai_api_compatible/"
+                                    "openai_api_compatible"
+                                ),
+                            },
+                        },
+                        "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "fresh-customer",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        assert mock_login_and_fetch_workspace_id.call_count == 1
+        # Legacy peer skipped → provision fired.
+        assert mock_provision_dataset_key.call_count == 1
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "fresh-customer")
+        # New entry stores the workspace_id captured by the fresh login.
+        assert new["dify"]["workspace_id"] == "workspace-mock-tenant-id"
+
     def test_shared_with_different_workspace_email_still_provisions(
-        self, tmp_path: Path, mock_provision_dataset_key: Any
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
     ) -> None:
         """Different console_email = different Dify workspace even on
         the same host. Must provision a fresh key, not cross-reuse."""
         registry_path = tmp_path / "registry.yaml"
         self._seed_shared_peer(registry_path)  # admin = ws-admin@example.com
 
+        # Login mock returns a different workspace_id to simulate the
+        # different-email-different-workspace scenario coherently.
+        mock_login_and_fetch_workspace_id.return_value = "different-workspace-tenant"
+        mock_provision_dataset_key.return_value = (
+            "different-workspace-tenant",
+            "dataset-fresh-different",
+        )
+
         runner = CliRunner()
         result = runner.invoke(cli, [
             "add-customer",
             "--customer-id", "peer-two",
             "--dify-base-url", "http://shared-dify",
-            "--dify-admin-email", "OTHER-ws-admin@example.com",  # different ws
+            "--dify-admin-email", "OTHER-ws-admin@example.com",  # different login
             "--dify-admin-password", "pw",
             "--mode", "shared",
             "--shared-embedding-name", "bge-m3",
