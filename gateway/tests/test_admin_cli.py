@@ -9,6 +9,8 @@ Coverage:
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -693,3 +695,101 @@ class TestNoDifyOrphanOnLocalFailure:
         assert "Traceback" not in result.output
         # No Dify call
         assert mock_provision_dataset_key.call_count == 0
+
+
+# --------------------------------------------------------------------------- #
+# Codex review-4: registry.yaml must NOT end up world-readable
+# --------------------------------------------------------------------------- #
+
+
+class TestRegistryFilePermissions:
+    """Codex review-4 P2: ``registry.yaml`` contains plaintext secrets
+    (``console_password``, ``dataset_api_key``, ``sdk_key``). The
+    atomic write path used to call ``tmp.open("w")`` which honours the
+    umask — on a typical Linux box (umask 022) that produces a
+    ``0644`` (world-readable) file. ``os.replace`` then made the new
+    perms the registry's, silently widening a previously-private file.
+
+    These tests assert the post-write mode is ``0600`` (owner-only)
+    and that an existing stricter mode is preserved. POSIX-only —
+    Windows file ACLs use a different model.
+    """
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="POSIX file mode bits"
+    )
+    def test_newly_created_registry_is_owner_only(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Fresh registry from add-customer must be 0600 — even when
+        the operator's shell umask is 022."""
+        registry_path = tmp_path / "registry.yaml"
+        runner = CliRunner()
+
+        # Force a permissive umask so we'd FAIL if the code didn't
+        # explicitly set restrictive mode.
+        old_umask = os.umask(0o022)
+        try:
+            result = runner.invoke(cli, [
+                "add-customer",
+                "--customer-id", "tenant-a",
+                "--dify-base-url", "http://localhost",
+                "--dify-admin-email", "admin@x",
+                "--dify-admin-password", "pw",
+                "--model", "gemma-3n-e4b",
+                "--registry-path", str(registry_path),
+            ])
+        finally:
+            os.umask(old_umask)
+
+        assert result.exit_code == 0, result.output
+        mode_bits = stat.S_IMODE(registry_path.stat().st_mode)
+        # Group + other must have ZERO bits.
+        assert mode_bits & 0o077 == 0, (
+            f"registry.yaml is mode {oct(mode_bits)}; expected 0600-like "
+            f"(no group/other bits). Plaintext credentials cannot be "
+            f"world-readable."
+        )
+        # And specifically owner-read+write (not e.g. owner-execute).
+        assert mode_bits & 0o600 == 0o600
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="POSIX file mode bits"
+    )
+    def test_existing_stricter_mode_is_preserved(
+        self, tmp_path: Path, mock_provision_dataset_key: Any
+    ) -> None:
+        """Some ops keep registry.yaml at 0400 (owner-read-only)
+        between updates and ``chmod u+w`` before running the CLI.
+        After the CLI write, if the file was ALREADY stricter than
+        0600 we shouldn't widen it back to 0600."""
+        registry_path = tmp_path / "registry.yaml"
+        # Seed with a valid empty registry at 0400.
+        registry_path.write_text("customers: []\n", encoding="utf-8")
+        os.chmod(registry_path, 0o400)
+        # Then re-enable owner write so the CLI can replace it.
+        # (Real ops would chmod u+w manually too.)
+        os.chmod(registry_path, 0o600)
+        # Drop it back to 0400 — what the post-write should preserve.
+        os.chmod(registry_path, 0o400)
+        # Now make it writable just for the test's restore step:
+        # actually, write_registry_atomic uses os.replace (not in-place
+        # open), so target perms don't need to allow write. The 0400
+        # is exactly the case we want to test.
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "tenant-a",
+            "--dify-base-url", "http://localhost",
+            "--dify-admin-email", "admin@x",
+            "--dify-admin-password", "pw",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        mode_bits = stat.S_IMODE(registry_path.stat().st_mode)
+        assert mode_bits == 0o400, (
+            f"existing mode 0400 was widened to {oct(mode_bits)} on write"
+        )

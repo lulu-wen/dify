@@ -42,12 +42,20 @@ or commit messages rather than as inline YAML comments.
 from __future__ import annotations
 
 import os
+import stat
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from gateway.registry import CustomerEntry, CustomerRegistry
+
+# Restrictive file mode for ``registry.yaml`` — the file holds
+# ``console_password`` / ``dataset_api_key`` / ``sdk_key`` in plaintext,
+# so it must NEVER end up world-readable. ``0o600`` = owner read+write,
+# nothing for group / other. Codex review-4 P2.
+_REGISTRY_FILE_MODE = 0o600
 
 
 class RegistryMergeError(Exception):
@@ -232,15 +240,54 @@ def write_registry_atomic(path: Path, registry_data: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+
+    # Codex review-4 P2: pick the most restrictive file mode we can
+    # justify. Default is ``0600`` (owner-only). If the existing
+    # registry already has stricter perms — e.g. ``0400`` (owner
+    # read-only, used by some ops who prefer immutable-until-explicit
+    # writes) — preserve that. POSIX-only; Windows file ACLs work
+    # differently so the chmod is a no-op there.
+    target_mode = _secret_file_mode(path)
+
     try:
-        with tmp.open("w", encoding="utf-8") as f:
+        # Use ``os.open`` with explicit mode rather than ``tmp.open("w")``
+        # so the file is created with the restrictive perms from the
+        # start — not "open at 0644 then chmod down", which would leave
+        # a tiny window where another process could read the secrets.
+        if target_mode is not None:
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                target_mode,
+            )
+            file_obj = os.fdopen(fd, "w", encoding="utf-8")
+        else:
+            file_obj = tmp.open("w", encoding="utf-8")
+
+        try:
             yaml.safe_dump(
                 registry_data,
-                f,
+                file_obj,
                 sort_keys=False,
                 allow_unicode=True,
                 default_flow_style=False,
             )
+        finally:
+            file_obj.close()
+
+        # Belt and braces: chmod again post-write. ``os.open`` with mode
+        # is supposed to honour the mode but is subject to umask on
+        # some platforms; an explicit chmod closes that gap. No-op on
+        # Windows.
+        if target_mode is not None:
+            try:
+                os.chmod(tmp, target_mode)
+            except OSError:
+                # Some filesystems (e.g. FAT32, certain network mounts)
+                # don't support chmod. Don't fail the write over it —
+                # the data is still going to land. Best we can do.
+                pass
+
         os.replace(tmp, path)
     except Exception:
         # Best-effort cleanup so a partial write doesn't leave .tmp
@@ -251,6 +298,40 @@ def write_registry_atomic(path: Path, registry_data: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _secret_file_mode(existing_path: Path) -> int | None:
+    """Return the mode to apply to a secret-bearing file write.
+
+    Codex review-4 P2: ``registry.yaml`` contains plaintext credentials
+    (``console_password`` / ``dataset_api_key`` / ``sdk_key``) and must
+    NEVER end up world-readable. ``open("w")`` with the default umask
+    (often 022) creates files at ``0644``; if a previous registry was
+    ``0600`` an atomic tmp+replace would silently widen perms.
+
+    Strategy:
+    - Default to ``0600`` (owner read+write only).
+    - If an existing registry file is even stricter (e.g. ``0400``),
+      preserve that — some operators set the registry read-only on
+      purpose between updates.
+    - On Windows, return ``None`` — Win32 file ACLs aren't expressible
+      as POSIX mode bits; let the caller use the platform default and
+      trust filesystem ACLs / parent dir perms.
+    """
+    if sys.platform == "win32":
+        return None
+
+    target = _REGISTRY_FILE_MODE
+    if existing_path.exists():
+        try:
+            existing_mode = stat.S_IMODE(existing_path.stat().st_mode)
+            # "Stricter" means group + other have no bits set.
+            if existing_mode & 0o077 == 0:
+                target = existing_mode
+        except OSError:
+            # Can't stat — fall back to the default.
+            pass
+    return target
 
 
 def _find_customer_index(
