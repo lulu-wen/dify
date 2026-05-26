@@ -26,6 +26,7 @@ from gateway.admin.cli import (
     cli,
 )
 from gateway.admin.registry_merge import (
+    PLACEHOLDER_DATASET_KEY,
     RegistryMergeError,
     check_writable,
     find_shared_workspace_dataset_key,
@@ -984,6 +985,122 @@ class TestFindSharedWorkspaceDatasetKey:
         )
         assert found == "dataset-real"
 
+    def test_peer_key_missing_dataset_prefix_returns_none(self) -> None:
+        """Codex review-8 P2: peer holding a token that doesn't even
+        pass L1 (no ``dataset-`` prefix) must not be propagated. Fall
+        through so the CLI provisions a fresh key for the new entry."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_legacy_peer",
+                    "customer_id": "legacy-peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": "wrong-family-bsa_xyz",  # missing dataset- prefix
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                console_email="admin@x",
+            )
+            is None
+        )
+
+    def test_peer_key_is_dry_run_sentinel_returns_none(self) -> None:
+        """Codex review-8 P2 defense-in-depth: if the trial-merge
+        sentinel ever leaks into registry.yaml (some future regression
+        writing the dry-run entry instead of the real one), shared-mode
+        reuse must NOT propagate it. The sentinel passes the ``dataset-``
+        prefix check on purpose (so L1 startup doesn't trip), but it
+        is never a valid Dify token."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_leaked_peer",
+                    "customer_id": "leaked-peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                console_email="admin@x",
+            )
+            is None
+        )
+
+    def test_first_valid_peer_wins_when_mixed_with_invalid(self) -> None:
+        """If the workspace has multiple shared-mode peers and SOME
+        have invalid keys (legacy placeholder, wrong family), the
+        lookup must skip past those and return the first valid key
+        — not return None just because there's any bad data in the
+        registry."""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {  # bad: dry-run sentinel
+                    "sdk_key": "bsa_p1",
+                    "customer_id": "p1",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                },
+                {  # bad: wrong family
+                    "sdk_key": "bsa_p2",
+                    "customer_id": "p2",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": "app-totally-wrong",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                },
+                {  # good
+                    "sdk_key": "bsa_p3",
+                    "customer_id": "p3",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-good-real-key",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                },
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                console_email="admin@x",
+            )
+            == "dataset-good-real-key"
+        )
+
 
 class TestSharedModeKeyReuseEndToEnd:
     """Codex review-5 P2 #1 e2e tests: the CLI must skip
@@ -1127,6 +1244,149 @@ class TestSharedModeKeyReuseEndToEnd:
         # Operator's typo doesn't pollute the registry on the way out.
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         assert all(c["customer_id"] != "peer-two" for c in loaded["customers"])
+
+    def test_peer_with_invalid_dataset_key_falls_through_to_provision(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_verify_console_credentials: Any,
+    ) -> None:
+        """Codex review-8 P2: when the existing shared-mode peer is
+        holding a token that doesn't pass L1 (legacy placeholder, wrong
+        family, etc.), the reuse path must NOT propagate that bad data.
+        Fall through to ``_provision_dataset_api_key`` so the new
+        customer gets a fresh, real key — even though that costs one
+        of the workspace's 10 dataset-key slots."""
+        registry_path = tmp_path / "registry.yaml"
+        # Seed with a peer holding a malformed key (missing dataset-
+        # prefix). This is exactly the legacy state PR #6's CLI is
+        # supposed to clean up — but the cleanup must not be by
+        # propagating the bad key to a NEW customer.
+        registry_path.write_text(
+            yaml.safe_dump({
+                "customers": [
+                    {
+                        "sdk_key": "bsa_legacy_peer",
+                        "customer_id": "legacy-peer",
+                        "dify": {
+                            "base_url": "http://shared-dify",
+                            "console_email": "ws-admin@example.com",
+                            "console_password": "pw",
+                            "dataset_api_key": "wrong-family-no-prefix",
+                            "mode": "shared",
+                            "shared_embedding_model": {
+                                "name": "bge-m3",
+                                "provider": (
+                                    "langgenius/openai_api_compatible/"
+                                    "openai_api_compatible"
+                                ),
+                            },
+                        },
+                        "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "fresh-customer",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+
+        # Critical: provisioning DID fire — we fell through to the
+        # real Dify call instead of reusing the legacy bad key.
+        assert mock_provision_dataset_key.call_count == 1, (
+            "_provision_dataset_api_key was NOT called even though the "
+            "peer's key would have failed the L1 prefix check. The "
+            "reuse path silently propagated bad data (codex review-8 P2)."
+        )
+
+        # Verify path also not used — we never claimed to reuse
+        # anything, so no verify-only login was needed either.
+        assert mock_verify_console_credentials.call_count == 0
+
+        # The new entry has the freshly-provisioned (mocked) key,
+        # NOT the peer's malformed string.
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "fresh-customer")
+        assert new["dify"]["dataset_api_key"] == "dataset-mocked-key-12345678"
+        # The legacy peer's bad data is left as-is — the CLI's job is
+        # not to fix unrelated entries; the gateway's startup check
+        # will surface it explicitly.
+        legacy = next(c for c in loaded["customers"] if c["customer_id"] == "legacy-peer")
+        assert legacy["dify"]["dataset_api_key"] == "wrong-family-no-prefix"
+
+    def test_peer_with_placeholder_sentinel_falls_through_to_provision(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_verify_console_credentials: Any,
+    ) -> None:
+        """Defense-in-depth: even though the dry-run sentinel passes
+        the ``dataset-`` prefix check (it starts with ``dataset-``),
+        ``find_shared_workspace_dataset_key`` must explicitly skip it.
+        Otherwise a regression that wrote the trial entry to disk
+        would poison every subsequent shared-mode onboarding for that
+        workspace."""
+        registry_path = tmp_path / "registry.yaml"
+        registry_path.write_text(
+            yaml.safe_dump({
+                "customers": [
+                    {
+                        "sdk_key": "bsa_leaked_peer",
+                        "customer_id": "leaked-peer",
+                        "dify": {
+                            "base_url": "http://shared-dify",
+                            "console_email": "ws-admin@example.com",
+                            "console_password": "pw",
+                            "dataset_api_key": PLACEHOLDER_DATASET_KEY,
+                            "mode": "shared",
+                            "shared_embedding_model": {
+                                "name": "bge-m3",
+                                "provider": (
+                                    "langgenius/openai_api_compatible/"
+                                    "openai_api_compatible"
+                                ),
+                            },
+                        },
+                        "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "add-customer",
+            "--customer-id", "fresh-customer",
+            "--dify-base-url", "http://shared-dify",
+            "--dify-admin-email", "ws-admin@example.com",
+            "--dify-admin-password", "pw",
+            "--mode", "shared",
+            "--shared-embedding-name", "bge-m3",
+            "--model", "gemma-3n-e4b",
+            "--registry-path", str(registry_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        # Sentinel was rejected → fell through to provision.
+        assert mock_provision_dataset_key.call_count == 1
+        assert mock_verify_console_credentials.call_count == 0
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "fresh-customer")
+        assert new["dify"]["dataset_api_key"] == "dataset-mocked-key-12345678"
 
     def test_shared_with_different_workspace_email_still_provisions(
         self, tmp_path: Path, mock_provision_dataset_key: Any

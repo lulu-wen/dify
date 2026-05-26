@@ -58,6 +58,22 @@ from gateway.registry import CustomerEntry, CustomerRegistry
 # nothing for group / other. Codex review-4 P2.
 _REGISTRY_FILE_MODE = 0o600
 
+# Prefix every valid Dify dataset API key starts with. Mirrors
+# ``startup_check._DATASET_KEY_PREFIX`` — duplicated here so the
+# admin CLI can do its own L1 validation without depending on the
+# runtime startup-check module. If Dify ever changes the prefix,
+# both constants must move together (and the startup_check tests
+# pin the expectation).
+_DATASET_KEY_PREFIX = "dataset-"
+
+# Sentinel value used by the CLI's dry-run merge phase as a stand-in
+# for the real ``dataset_api_key`` before the Dify network call. It
+# starts with ``dataset-`` so it passes L1, but it is NEVER a valid
+# Dify key — refusing to propagate it from a stray peer entry is
+# belt-and-braces against the dry-run trial entry accidentally
+# getting written to disk by some future regression. Codex review-8 P2.
+PLACEHOLDER_DATASET_KEY = "dataset-pending-validation-pre-network"
+
 
 class RegistryMergeError(Exception):
     """Raised when a customer cannot be merged into the registry.
@@ -414,6 +430,21 @@ def find_shared_workspace_dataset_key(
         if dify.get("console_email") != console_email:
             continue
         key = dify.get("dataset_api_key")
-        if isinstance(key, str) and key:
-            return key
+        if not isinstance(key, str) or not key:
+            continue
+        # Codex review-8 P2: only propagate keys that would pass the
+        # gateway's L1 startup format check. If the peer is sitting
+        # on a legacy placeholder (``dataset-not-used-in-pr1``-style),
+        # a token from a different key family, or — worst case — the
+        # CLI's own dry-run sentinel that should never have landed
+        # on disk, reusing it just propagates the brokenness to the
+        # new customer. Falling through to the provisioning path
+        # gives the new entry a fresh, real key, and leaves the peer's
+        # bad state for the gateway's startup check to surface
+        # explicitly.
+        if not key.startswith(_DATASET_KEY_PREFIX):
+            continue
+        if key == PLACEHOLDER_DATASET_KEY:
+            continue
+        return key
     return None

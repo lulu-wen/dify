@@ -39,6 +39,7 @@ import click
 import structlog
 
 from gateway.admin.registry_merge import (
+    PLACEHOLDER_DATASET_KEY,
     RegistryMergeError,
     check_writable,
     find_shared_workspace_dataset_key,
@@ -384,7 +385,9 @@ def add_customer(
     #
     # The placeholder starts with ``dataset-`` so it passes PR #5's
     # L1 format check; we replace it with the real key on success.
-    _PLACEHOLDER_DATASET_KEY = "dataset-pending-validation-pre-network"
+    # Codex review-8 P2: moved to ``registry_merge.PLACEHOLDER_DATASET_KEY``
+    # so the shared-mode reuse path can refuse to propagate it if it ever
+    # leaks into a peer entry.
 
     def _build_entry(dataset_api_key: str) -> CustomerEntry:
         return CustomerEntry(
@@ -403,7 +406,7 @@ def add_customer(
         )
 
     try:
-        trial_entry = _build_entry(_PLACEHOLDER_DATASET_KEY)
+        trial_entry = _build_entry(PLACEHOLDER_DATASET_KEY)
     except Exception as exc:
         click.echo(f"ERROR: customer entry validation failed: {exc}", err=True)
         sys.exit(3)
