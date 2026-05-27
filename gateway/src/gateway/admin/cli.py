@@ -48,7 +48,7 @@ from gateway.admin.registry_merge import (
     write_registry_atomic,
 )
 from gateway.dify.client import DifyClient
-from gateway.errors import DifyUpstreamError
+from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
 from gateway.registry import (
     CustomerEntry,
     DifyConnection,
@@ -56,6 +56,7 @@ from gateway.registry import (
     ModelEntry,
     SharedEmbeddingModel,
 )
+from gateway.startup_check import is_network_failure
 
 logger = structlog.get_logger(__name__)
 
@@ -198,6 +199,45 @@ async def _login_and_fetch_workspace_id(
     async with DifyClient(base_url=base_url, timeout_s=30.0) as client:
         session = await client.console_login(console_email, console_password)
         return await client.console_get_current_workspace_id(session)
+
+
+async def _verify_dataset_api_key(
+    *,
+    base_url: str,
+    dataset_api_key: str,
+) -> bool:
+    """Return ``True`` iff Dify accepts ``dataset_api_key``, ``False`` if rejected.
+
+    Codex review-10 P2: the shared-mode reuse path's string-level
+    checks (``dataset-`` prefix + a known-placeholder blocklist) can't
+    tell a *valid* dataset key from a *documented legacy placeholder*
+    like ``dataset-not-used-in-pr1`` — both start with ``dataset-`` and
+    the placeholder space is explicitly open-ended ("or any
+    placeholder", startup_check.py). The only authoritative test is
+    asking Dify, which is exactly what the L4 startup check does:
+    list one dataset row with the key.
+
+    - HTTP 4xx auth / permission rejection → ``False``. The caller
+      falls through to provisioning a fresh key rather than copying
+      a dead one into the new customer.
+    - Network / timeout errors → re-raised, so the CLI fails fast
+      instead of silently burning a dataset-key slot on an uncertain
+      reuse. (We've already logged in successfully against this
+      ``base_url`` moments earlier, so a network failure here is rare
+      and worth surfacing.)
+    """
+    async with DifyClient(base_url=base_url, timeout_s=30.0) as client:
+        try:
+            await client.list_datasets(
+                dataset_api_key=dataset_api_key, page=1, limit=1
+            )
+        except (DifyUpstreamError, DifyTimeoutError, UpstreamClientError) as exc:
+            if is_network_failure(exc):
+                raise
+            # A non-network upstream error == Dify rejected the key
+            # (401/403 placeholder / revoked / wrong-workspace token).
+            return False
+    return True
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -508,11 +548,54 @@ def add_customer(
             )
             sys.exit(2)
 
-        reused_dataset_api_key = find_shared_workspace_dataset_key(
+        candidate_dataset_api_key = find_shared_workspace_dataset_key(
             existing,
             base_url=dify_base_url,
             workspace_id=fetched_workspace_id,
         )
+
+        # Codex review-10 P2: the candidate passed cheap string checks
+        # (prefix + known-placeholder blocklist), but the placeholder
+        # space is open-ended — a peer could be holding a legacy
+        # ``dataset-not-used-in-pr1``-shaped string we don't have in
+        # the blocklist, or a revoked / wrong-workspace token. Before
+        # committing to reuse, verify the candidate actually works
+        # against Dify (same check as L4 startup). A rejection means
+        # the peer's key is dead → fall through to provisioning a
+        # fresh real key rather than copying the dead one forward.
+        if candidate_dataset_api_key is not None:
+            click.echo(
+                f"Verifying candidate dataset key "
+                f"({candidate_dataset_api_key[:16]}...) against Dify "
+                f"before reuse ...",
+                err=True,
+            )
+            try:
+                key_is_valid = asyncio.run(
+                    _verify_dataset_api_key(
+                        base_url=dify_base_url,
+                        dataset_api_key=candidate_dataset_api_key,
+                    )
+                )
+            except Exception as exc:
+                click.echo(
+                    f"ERROR: could not verify candidate dataset key against "
+                    f"Dify at {dify_base_url}: {exc}",
+                    err=True,
+                )
+                sys.exit(2)
+
+            if key_is_valid:
+                reused_dataset_api_key = candidate_dataset_api_key
+            else:
+                click.echo(
+                    "Candidate dataset key was rejected by Dify (likely a "
+                    "legacy placeholder or revoked token in the peer entry). "
+                    "Provisioning a fresh key for this customer instead; the "
+                    "peer's stale key is left untouched for the gateway "
+                    "startup check to flag.",
+                    err=True,
+                )
 
     if reused_dataset_api_key is not None:
         click.echo(

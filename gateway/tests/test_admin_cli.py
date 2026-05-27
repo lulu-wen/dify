@@ -273,6 +273,25 @@ def mock_login_and_fetch_workspace_id() -> Any:
         yield mocked
 
 
+@pytest.fixture
+def mock_verify_dataset_api_key() -> Any:
+    """Mock _verify_dataset_api_key for shared-mode reuse tests.
+
+    Codex review-10 P2: before committing to reuse a peer's dataset
+    key, the CLI live-verifies it against Dify (list one dataset row).
+    Tests that exercise the reuse path need this mocked, else they'd
+    hit the network. Default: returns True (key valid → reuse). Tests
+    that simulate a rejected / placeholder key override with
+    return_value=False; tests that simulate a verify-time network error
+    override with side_effect.
+    """
+    with patch(
+        "gateway.admin.cli._verify_dataset_api_key",
+        new=AsyncMock(return_value=True),
+    ) as mocked:
+        yield mocked
+
+
 class TestAddCustomerCommand:
     def test_happy_path_creates_registry_and_prints_sdk_key(
         self, tmp_path: Path, mock_provision_dataset_key: Any
@@ -1107,6 +1126,42 @@ class TestFindSharedWorkspaceDatasetKey:
             is None
         )
 
+    def test_documented_legacy_placeholder_returns_none(self) -> None:
+        """Codex review-10 P2: the documented legacy placeholder
+        ``dataset-not-used-in-pr1`` (referenced throughout
+        startup_check.py) starts with ``dataset-`` and is NOT the
+        dry-run sentinel — R8's check let it through. It must be
+        rejected by the known-placeholder pre-filter so the reuse
+        path doesn't propagate it. (The live verification in cli.py
+        is the authoritative backstop for placeholders not in the
+        blocklist; this test pins the cheap pre-filter for the
+        documented one.)"""
+        registry_data: dict[str, Any] = {
+            "customers": [
+                {
+                    "sdk_key": "bsa_legacy_peer",
+                    "customer_id": "legacy-peer",
+                    "dify": {
+                        "base_url": "http://shared-dify",
+                        "console_email": "admin@x",
+                        "console_password": "pw",
+                        "dataset_api_key": "dataset-not-used-in-pr1",
+                        "workspace_id": "tenant-uuid-1",
+                        "mode": "shared",
+                    },
+                    "models": [{"id": "m1", "provider": "p", "name": "n"}],
+                }
+            ]
+        }
+        assert (
+            find_shared_workspace_dataset_key(
+                registry_data,
+                base_url="http://shared-dify",
+                workspace_id="tenant-uuid-1",
+            )
+            is None
+        )
+
     def test_first_valid_peer_wins_when_mixed_with_invalid(self) -> None:
         """If the workspace has multiple shared-mode peers and SOME
         have invalid keys (legacy placeholder, wrong family), the
@@ -1231,6 +1286,7 @@ class TestSharedModeKeyReuseEndToEnd:
         tmp_path: Path,
         mock_provision_dataset_key: Any,
         mock_login_and_fetch_workspace_id: Any,
+        mock_verify_dataset_api_key: Any,
     ) -> None:
         registry_path = tmp_path / "registry.yaml"
         existing_key = self._seed_shared_peer(registry_path)
@@ -1271,6 +1327,14 @@ class TestSharedModeKeyReuseEndToEnd:
             "(codex review-6 P2 + review-9 P1)."
         )
 
+        # Codex review-10 P2: the candidate key is live-verified against
+        # Dify before reuse, so a legacy placeholder / revoked token
+        # isn't copied into the new customer.
+        assert mock_verify_dataset_api_key.call_count == 1, (
+            "_verify_dataset_api_key was not called — a dead peer key "
+            "could be propagated to the new customer (codex review-10 P2)."
+        )
+
         # And the new entry's dataset_api_key + workspace_id match
         # what the reuse path captured.
         loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
@@ -1281,6 +1345,96 @@ class TestSharedModeKeyReuseEndToEnd:
         # User-visible messages confirm reuse + verification.
         assert "Reusing existing workspace dataset key" in result.output
         assert "Verifying console credentials" in result.output
+
+    def test_reuse_falls_through_to_provision_when_candidate_key_rejected(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
+    ) -> None:
+        """Codex review-10 P2: a peer whose key passes the cheap
+        string checks (right prefix, not a blocklisted placeholder,
+        right workspace) but is in fact dead — e.g. an undocumented
+        legacy placeholder or a revoked token — must NOT be reused.
+        The live verification returns False → fall through to
+        provisioning a fresh key for the new customer."""
+        registry_path = tmp_path / "registry.yaml"
+        # Peer key looks fine to the string checks but Dify will reject it.
+        self._seed_shared_peer(registry_path)
+
+        with patch(
+            "gateway.admin.cli._verify_dataset_api_key",
+            new=AsyncMock(return_value=False),
+        ) as mock_verify:
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "add-customer",
+                "--customer-id", "peer-two",
+                "--dify-base-url", "http://shared-dify",
+                "--dify-admin-email", "ws-admin@example.com",
+                "--dify-admin-password", "pw",
+                "--mode", "shared",
+                "--shared-embedding-name", "bge-m3",
+                "--model", "gemma-3n-e4b",
+                "--registry-path", str(registry_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        # Verification fired and rejected the candidate.
+        assert mock_verify.call_count == 1
+        # Rejection → fell through to provisioning a fresh key.
+        assert mock_provision_dataset_key.call_count == 1, (
+            "Candidate key was rejected by Dify but the CLI didn't "
+            "provision a fresh one — a dead key would be propagated "
+            "(codex review-10 P2)."
+        )
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        new = next(c for c in loaded["customers"] if c["customer_id"] == "peer-two")
+        # New entry has the freshly provisioned key, NOT the peer's.
+        assert new["dify"]["dataset_api_key"] == "dataset-mocked-key-12345678"
+        assert "rejected by Dify" in result.output
+
+    def test_reuse_fails_fast_when_candidate_verify_network_errors(
+        self,
+        tmp_path: Path,
+        mock_provision_dataset_key: Any,
+        mock_login_and_fetch_workspace_id: Any,
+    ) -> None:
+        """Codex review-10 P2: if verifying the candidate key hits a
+        network error (not an auth rejection), the CLI must fail fast
+        rather than guess. We don't want to silently provision a
+        duplicate (burning a quota slot) on a transient blip, nor
+        reuse an unverified key. Exit 2, no registry write."""
+        registry_path = tmp_path / "registry.yaml"
+        self._seed_shared_peer(registry_path)
+
+        with patch(
+            "gateway.admin.cli._verify_dataset_api_key",
+            new=AsyncMock(side_effect=DifyUpstreamError(
+                "Dify list-datasets failed: ConnectError"
+            )),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "add-customer",
+                "--customer-id", "peer-two",
+                "--dify-base-url", "http://shared-dify",
+                "--dify-admin-email", "ws-admin@example.com",
+                "--dify-admin-password", "pw",
+                "--mode", "shared",
+                "--shared-embedding-name", "bge-m3",
+                "--model", "gemma-3n-e4b",
+                "--registry-path", str(registry_path),
+            ])
+
+        assert result.exit_code == 2
+        assert "could not verify candidate dataset key" in result.output
+        assert "Traceback" not in result.output
+        # No fresh key provisioned on a verify-network failure.
+        assert mock_provision_dataset_key.call_count == 0
+        # peer-two never written.
+        loaded = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+        assert all(c["customer_id"] != "peer-two" for c in loaded["customers"])
 
     def test_reused_key_path_rejects_invalid_console_credentials(
         self, tmp_path: Path, mock_provision_dataset_key: Any

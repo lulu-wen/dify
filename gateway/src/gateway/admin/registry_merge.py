@@ -74,6 +74,22 @@ _DATASET_KEY_PREFIX = "dataset-"
 # getting written to disk by some future regression. Codex review-8 P2.
 PLACEHOLDER_DATASET_KEY = "dataset-pending-validation-pre-network"
 
+# Documented placeholder strings that pass the ``dataset-`` prefix
+# check but are NOT real Dify keys. ``dataset-not-used-in-pr1`` is the
+# canonical legacy placeholder referenced throughout startup_check.py
+# (written when only the chat path was being verified). Codex review-10
+# P2: these are a *cheap pre-filter* so the reuse path skips a doomed
+# network verification for the known-bad cases — but the placeholder
+# space is open-ended ("or any placeholder", startup_check.py), so the
+# CLI ALSO live-verifies any candidate against Dify before reuse. This
+# set is the fast path, not the authoritative gate.
+_KNOWN_DATASET_PLACEHOLDERS: frozenset[str] = frozenset(
+    {
+        PLACEHOLDER_DATASET_KEY,
+        "dataset-not-used-in-pr1",
+    }
+)
+
 
 class RegistryMergeError(Exception):
     """Raised when a customer cannot be merged into the registry.
@@ -446,19 +462,21 @@ def find_shared_workspace_dataset_key(
         key = dify.get("dataset_api_key")
         if not isinstance(key, str) or not key:
             continue
-        # Codex review-8 P2: only propagate keys that would pass the
-        # gateway's L1 startup format check. If the peer is sitting
-        # on a legacy placeholder (``dataset-not-used-in-pr1``-style),
-        # a token from a different key family, or — worst case — the
-        # CLI's own dry-run sentinel that should never have landed
-        # on disk, reusing it just propagates the brokenness to the
-        # new customer. Falling through to the provisioning path
-        # gives the new entry a fresh, real key, and leaves the peer's
-        # bad state for the gateway's startup check to surface
-        # explicitly.
+        # Codex review-8 P2 + review-10 P2: only propagate keys that
+        # would pass the gateway's L1 startup format check AND aren't a
+        # known placeholder. If the peer is sitting on a legacy
+        # placeholder (``dataset-not-used-in-pr1``), a token from a
+        # different key family, or the CLI's own dry-run sentinel,
+        # reusing it just propagates the brokenness to the new
+        # customer. This is the cheap string-level pre-filter; the
+        # placeholder space is open-ended, so the CLI ALSO live-verifies
+        # the returned candidate against Dify before committing to
+        # reuse (see ``_verify_dataset_api_key`` in cli.py). Either
+        # rejection here, or a failed live verification there, falls
+        # through to provisioning a fresh real key.
         if not key.startswith(_DATASET_KEY_PREFIX):
             continue
-        if key == PLACEHOLDER_DATASET_KEY:
+        if key in _KNOWN_DATASET_PLACEHOLDERS:
             continue
         return key
     return None
