@@ -73,7 +73,7 @@ _DATASET_KEY_PREFIX = "dataset-"
 _KEY_PREVIEW_LEN = 16
 
 # Exception types that mean "network is unreachable" rather than "Dify
-# rejected the credentials". Used by :func:`_is_network_failure` to
+# rejected the credentials". Used by :func:`is_network_failure` to
 # unwrap the ``DifyUpstreamError`` / ``UpstreamClientError`` wrappers
 # that :class:`DifyClient` applies around raw ``httpx`` failures.
 _NETWORK_EXC_TYPES: tuple[type[BaseException], ...] = (
@@ -83,7 +83,7 @@ _NETWORK_EXC_TYPES: tuple[type[BaseException], ...] = (
 )
 
 
-def _is_network_failure(exc: BaseException) -> bool:
+def is_network_failure(exc: BaseException) -> bool:
     """Return True iff ``exc`` originated from a network-layer failure.
 
     :class:`DifyClient` wraps ``httpx.RequestError`` (including
@@ -255,7 +255,7 @@ async def _check_runtime(
         # still classify correctly here.
         _record_network_l2(exc)
     except DifyUpstreamError as exc:
-        if _is_network_failure(exc):
+        if is_network_failure(exc):
             # The "auth-shaped" wrapper hides a network failure underneath.
             _record_network_l2(exc)
         else:
@@ -294,7 +294,7 @@ async def _check_runtime(
             )
         )
     except (DifyUpstreamError, UpstreamClientError) as exc:
-        if _is_network_failure(exc):
+        if is_network_failure(exc):
             issues.append(
                 CheckIssue(
                     customer_id=customer.customer_id,

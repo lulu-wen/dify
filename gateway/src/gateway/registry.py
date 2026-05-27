@@ -110,6 +110,19 @@ class DifyConnection(BaseModel):
     console_email: str = Field(min_length=1)
     console_password: str = Field(min_length=1)
     dataset_api_key: str = Field(min_length=1)
+    workspace_id: str | None = Field(
+        default=None,
+        description=(
+            "Dify tenant id this customer's session lands in. Captured by "
+            "``gateway-admin add-customer`` from ``POST /console/api/workspaces/"
+            "current`` right after login. ``None`` on entries written by PR #6 "
+            "pre-codex-review-9 (when the field didn't exist yet); the "
+            "shared-mode reuse path treats ``None`` as 'unknown workspace, "
+            "don't risk cross-workspace reuse'. Operators can hand-fill the "
+            "value to opt legacy entries back into reuse, but a clean "
+            "re-run of ``add-customer`` is the recommended path."
+        ),
+    )
     mode: Literal["dedicated", "shared"] = Field(
         default="dedicated",
         description=(

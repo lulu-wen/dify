@@ -588,6 +588,84 @@ class DifyClient:
             raise DifyUpstreamError("Dify api-key response missing token")
         return str(token)
 
+    async def console_create_dataset_api_key(self, session: ConsoleSession) -> str:
+        """Generate a new ``dataset-*`` token scoped to the workspace.
+
+        Dataset API keys (unlike App keys) are workspace-global — one
+        key can list / read / write every dataset visible to the
+        workspace. The gateway uses this during customer onboarding to
+        replace the historically manual "go to Dify Web UI → Knowledge
+        → 服務 API → 建立新的金鑰" step that operators kept skipping,
+        leaving placeholders like ``dataset-not-used-in-pr1`` in the
+        registry and 401'ing on the first KB request.
+
+        The endpoint mirrors the App key path
+        (``POST /console/api/datasets/api-keys``), see Dify source
+        ``api/controllers/console/datasets/datasets.py``.
+        """
+        self._set_session_cookies(session)
+        try:
+            resp = await self._http.post(
+                "/console/api/datasets/api-keys",
+                headers=_console_headers(session),
+            )
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(f"Dify dataset api-key creation failed: {e}") from e
+        _raise_for_dify_status(resp)
+        data = resp.json()
+        token = data.get("token")
+        if not token:
+            raise DifyUpstreamError("Dify dataset api-key response missing token")
+        return str(token)
+
+    async def console_get_current_workspace_id(self, session: ConsoleSession) -> str:
+        """Return the ``tenant_id`` of the workspace the session is bound to.
+
+        Codex review-9 P1: Dify accounts can be members of multiple
+        workspaces (a single email can map to several tenants). A
+        login session lands in *one* of them (the user's "current
+        tenant"), which is what every subsequent console call operates
+        against. Without capturing this id, gateway-admin can't tell
+        whether two onboardings against the same ``base_url`` /
+        ``console_email`` are pointing at the *same* workspace or two
+        different workspaces under the same account — and the
+        shared-mode dataset-key reuse path would happily propagate a
+        workspace-A key into a workspace-B customer.
+
+        Wire endpoint: ``POST /console/api/workspaces/current`` (Dify
+        registers this on POST, not GET — see
+        ``api/controllers/console/workspace/workspace.py``). The
+        response marshals the ``Tenant`` row through ``tenant_fields``,
+        whose ``id`` field is the tenant uuid we want. Some Dify
+        versions wrap the body in ``{"tenant": ...}``; we accept both
+        shapes to stay resilient across minor upgrades.
+        """
+        self._set_session_cookies(session)
+        try:
+            resp = await self._http.post(
+                "/console/api/workspaces/current",
+                headers=_console_headers(session),
+            )
+        except httpx.RequestError as e:
+            raise DifyUpstreamError(
+                f"Dify workspaces/current request failed: {e}"
+            ) from e
+        _raise_for_dify_status(resp)
+        data = resp.json()
+        # Accept either {"id": "..."} (direct marshal) or
+        # {"tenant": {"id": "..."}} (wrapped) — Dify's response shape
+        # differs between minor versions.
+        if isinstance(data, dict):
+            tenant = data.get("tenant") if isinstance(data.get("tenant"), dict) else data
+            if isinstance(tenant, dict):
+                tenant_id = tenant.get("id")
+                if isinstance(tenant_id, str) and tenant_id:
+                    return tenant_id
+        raise DifyUpstreamError(
+            "Dify workspaces/current response missing 'id' "
+            f"(got keys: {sorted(data.keys()) if isinstance(data, dict) else type(data).__name__})"
+        )
+
     async def console_delete_app(self, session: ConsoleSession, app_id: str) -> None:
         """Delete an App (used by the GC sweep)."""
         self._set_session_cookies(session)
