@@ -107,3 +107,53 @@ class Settings(BaseSettings):
             "still capping sustained rate at default_rpm."
         ),
     )
+
+    # --- Cost-based admission + TPM (PR #8 / Phase 1b) ------------------ #
+    # The OOM guard: edge nodes are bottlenecked by KV-cache memory, not
+    # request rate. A single huge-context request can OOM the box while RPM
+    # looks fine — so we also meter token cost (TPM) and gate concurrent
+    # in-flight token reservation (node_token_budget). See the Edge AI Rate
+    # Limiting design doc, appendix B.
+    default_tpm: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Default per-customer tokens-per-minute. 0 = unlimited (TPM is "
+            "opt-in); the node_token_budget admission gate still protects "
+            "against OOM. Set a positive value (or per-customer tpm_limit) "
+            "to also cap sustained token throughput per tenant."
+        ),
+    )
+    default_tpm_burst: int = Field(
+        default=40_000,
+        ge=1,
+        description=(
+            "Token-bucket capacity for the TPM limit. Should be >= the "
+            "largest single request's token_cost (input + max_output) you "
+            "want to allow, else such a request can never pass TPM. Generous "
+            "by default so only sustained heavy throughput trips it."
+        ),
+    )
+    node_token_budget: int = Field(
+        default=200_000,
+        ge=1,
+        description=(
+            "Max concurrent in-flight token cost (sum of input + "
+            "max_output across all active chat requests) admitted on this "
+            "node. The OOM ceiling — a new request that would push the sum "
+            "over this is rejected with 503 REJECTED_OVERLOAD. Tune to the "
+            "Jetson's actual KV-cache capacity via E2E; 200k is a "
+            "conservative starting point."
+        ),
+    )
+    default_max_output_tokens: int = Field(
+        default=1024,
+        ge=1,
+        description=(
+            "Fallback max-output used for cost estimation when a chat "
+            "request omits max_tokens. Without it, pre-charge would be "
+            "unbounded for unbounded-output requests. A conservative cap "
+            "for estimation only — it does not change what the client asked "
+            "Dify/vLLM for."
+        ),
+    )

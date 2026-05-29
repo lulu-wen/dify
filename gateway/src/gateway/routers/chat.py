@@ -33,6 +33,12 @@ from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
 from gateway.errors import InvalidRequestError
 from gateway.registry import CustomerEntry
+from gateway.routers.ratelimit_guard import (
+    admit,
+    enforce_tpm,
+    estimate_request_cost,
+    settle,
+)
 from gateway.schemas import (
     ChatChoice,
     ChatCompletionRequest,
@@ -59,6 +65,13 @@ def _last_user_message(messages: list[ChatMessage]) -> str:
         if msg.role == "user" and msg.content:
             return msg.content
     raise InvalidRequestError("messages must contain at least one user message", param="messages")
+
+
+def _messages_chars(messages: list[ChatMessage]) -> int:
+    """Total character count across all message contents — input to the
+    chars/4 token-cost heuristic (Phase 1b). Counts the whole conversation
+    (system + history + user) since all of it is sent to the model."""
+    return sum(len(m.content) for m in messages if m.content)
 
 
 def _build_system_prompt(messages: list[ChatMessage]) -> str:
@@ -159,14 +172,38 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     # Fall back to ``body.model`` when not provided.
     selected_model = body.llm_model or body.model
 
+    # Phase 1b rate limiting (TPM + cost-based admission). Cost is estimated
+    # from the parsed body here (middleware can't see it). Order:
+    #   1. estimate cost (cheap, local)
+    #   2. TPM check — reject over-rate BEFORE any network work; no reservation
+    #      to leak if it raises.
+    #   3. get_app_key — validates the model (so an invalid model 404s rather
+    #      than holding a reservation).
+    #   4. admit — reserve node budget as late as possible, AFTER all
+    #      can-raise local prep (query/inputs/user), so the only failure
+    #      window between admit and settle is the generation call itself
+    #      (stream pre-flight / blocking call — both settle on error below).
+    #      Reserving earlier would leak the reservation if e.g.
+    #      ``_last_user_message`` rejected a body with no user message.
+    cost = estimate_request_cost(
+        request,
+        input_chars=_messages_chars(body.messages),
+        max_output_tokens=body.effective_max_tokens,
+        model_id=selected_model,
+    )
+    enforce_tpm(request, customer, cost)
+
     # Validate model + obtain App key (lazy-build).
     app_key = await app_manager.get_app_key(customer, selected_model)
     dify_client: DifyClient = dify_factory(customer)
 
     query = _last_user_message(body.messages)
     inputs: dict[str, Any] = {"system_prompt": _build_system_prompt(body.messages)}
-
     user = _user_id(body, customer, request_id)
+
+    # Reserve node budget now — everything above could still reject without a
+    # reservation to release; everything below settles on success or error.
+    grant = admit(request, customer, cost)
 
     # ---- streaming branch ----
     #
@@ -186,7 +223,14 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         )
         # Enter the context here; raises DifyUpstreamError / DifyTimeoutError
         # synchronously which is exactly what we want before sending headers.
-        dify_lines = await stream_cm.__aenter__()
+        # If the pre-flight raises after we've reserved node budget, release
+        # the reservation before propagating — otherwise it leaks (the
+        # event_source finally below never runs because no response started).
+        try:
+            dify_lines = await stream_cm.__aenter__()
+        except BaseException:
+            settle(request, grant, actual_output_tokens=0)
+            raise
 
         async def event_source() -> AsyncIterator[str]:
             try:
@@ -195,6 +239,14 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                 ):
                     yield chunk
             finally:
+                # Release the node-budget reservation on stream end AND on
+                # client disconnect (GeneratorExit reaches this finally), so a
+                # dropped long generation doesn't hold KV budget forever.
+                # actual_output_tokens=0: the streaming path doesn't extract
+                # Dify usage; the full reservation is released regardless (the
+                # count is telemetry only — see QuotaStore.settle). settle is
+                # idempotent, so the pre-flight path above is safe too.
+                settle(request, grant, actual_output_tokens=0)
                 # Best-effort close; errors inside cleanup are swallowed because
                 # the response has already started streaming.
                 try:
@@ -213,18 +265,26 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         )
 
     # ---- blocking branch ----
-    dify_resp = await dify_client.chat_messages_blocking(
-        app_key=app_key,
-        query=query,
-        user=user,
-        inputs=inputs,
-        conversation_id=body.conversation_id,
-    )
+    # Release the node-budget reservation once the call returns or errors.
+    # finally (not just on success) so a Dify failure mid-request doesn't
+    # leak the reservation.
+    try:
+        dify_resp = await dify_client.chat_messages_blocking(
+            app_key=app_key,
+            query=query,
+            user=user,
+            inputs=inputs,
+            conversation_id=body.conversation_id,
+        )
+        usage = _extract_usage(dify_resp.get("metadata") or {})
+    except BaseException:
+        settle(request, grant, actual_output_tokens=0)
+        raise
+    settle(request, grant, actual_output_tokens=usage.completion_tokens)
 
     answer: str = dify_resp.get("answer") or ""
     metadata = dify_resp.get("metadata") or {}
     references = _extract_references(metadata)
-    usage = _extract_usage(metadata)
     conversation_id = dify_resp.get("conversation_id")
 
     response = ChatCompletionResponse(

@@ -38,7 +38,9 @@ from fastapi.responses import JSONResponse
 
 from gateway.embeddings.client import invoke_embeddings
 from gateway.errors import UnknownModelError
+from gateway.ratelimit import estimate_cost
 from gateway.registry import CustomerEntry, EmbeddingModelEntry
+from gateway.routers.ratelimit_guard import enforce_tpm
 from gateway.schemas import EmbeddingsRequest
 
 logger = structlog.get_logger(__name__)
@@ -52,6 +54,18 @@ async def create_embeddings(request: Request, body: EmbeddingsRequest) -> Any:
     request_id: str = request.state.request_id
 
     model_entry = _resolve_model(customer, body.model)
+
+    # Phase 1b: meter token throughput (TPM) for embeddings too — they
+    # consume input tokens and should count against a tenant's token budget.
+    # No node-budget admission here: embeddings don't grow KV cache the way
+    # generation does, so they aren't the OOM risk that admission guards.
+    # cost = input tokens only (max_output 0 — no generation, no fallback).
+    cost = estimate_cost(
+        input_chars=_input_chars(body.input),
+        max_output_tokens=0,
+        model_id=body.model,
+    )
+    enforce_tpm(request, customer, cost)
 
     # Build upstream request body. Forward only OpenAI-standard fields;
     # the upstream may accept extras (e.g. ``dimensions``) and will ignore
@@ -88,6 +102,14 @@ async def create_embeddings(request: Request, body: EmbeddingsRequest) -> Any:
         prompt_tokens=upstream_response.get("usage", {}).get("prompt_tokens", 0),
     )
     return JSONResponse(content=upstream_response)
+
+
+def _input_chars(value: str | list[str]) -> int:
+    """Total characters across the embeddings ``input`` (str or list of str)
+    — input to the chars/4 token-cost heuristic (Phase 1b)."""
+    if isinstance(value, str):
+        return len(value)
+    return sum(len(s) for s in value)
 
 
 def _resolve_model(customer: CustomerEntry, model_id: str) -> EmbeddingModelEntry:

@@ -1,0 +1,373 @@
+"""Tests for PR #8 / Phase 1b — cost-based admission + TPM + pre-charge/refund.
+
+Layers:
+- Unit: cost estimator, InMemoryQuotaStore ledger, token-bucket cost>burst,
+  jitter helper.
+- Integration: chat router (TPM 429, admission 503, settle releases on
+  blocking success / streaming completion / streaming disconnect) and
+  embeddings router (TPM) via httpx ASGITransport with a fake Dify client.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from gateway.config import Settings
+from gateway.errors import RateLimitError
+from gateway.main import create_app
+from gateway.ratelimit import InMemoryQuotaStore, InMemoryTokenBucketLimiter, estimate_cost
+from gateway.ratelimit.retry import jittered_retry_after
+from gateway.ratelimit.types import ActionCode
+from gateway.registry import CustomerRegistry
+from tests.conftest import FakeDifyClient, make_customer
+
+_AUTH = {"Authorization": "Bearer bsa_test_a"}
+
+
+# --------------------------------------------------------------------------- #
+# Unit: cost estimator
+# --------------------------------------------------------------------------- #
+
+
+class TestEstimateCost:
+    def test_chars_over_four_plus_max_output(self) -> None:
+        c = estimate_cost(input_chars=400, max_output_tokens=100, model_id="m1")
+        assert c.input_tokens == 100  # 400 // 4
+        assert c.max_output_tokens == 100
+        assert c.token_cost == 200
+        assert c.model_id == "m1"
+        assert c.est_kv_bytes > 0
+
+    def test_zero_max_output_is_input_only(self) -> None:
+        c = estimate_cost(input_chars=40, max_output_tokens=0, model_id="emb")
+        assert c.input_tokens == 10
+        assert c.token_cost == 10  # no generation term
+
+    def test_negatives_clamped(self) -> None:
+        c = estimate_cost(input_chars=-5, max_output_tokens=-9, model_id="m")
+        assert c.input_tokens == 0
+        assert c.max_output_tokens == 0
+        assert c.token_cost == 0
+
+
+# --------------------------------------------------------------------------- #
+# Unit: InMemoryQuotaStore
+# --------------------------------------------------------------------------- #
+
+
+def _cost(token_cost: int) -> object:
+    # token_cost is the only field admission uses; build via estimate_cost so
+    # the dataclass stays the single source of truth.
+    return estimate_cost(input_chars=token_cost * 4, max_output_tokens=0, model_id="m")
+
+
+class TestQuotaStore:
+    def test_admit_until_budget_then_reject(self) -> None:
+        q = InMemoryQuotaStore(node_token_budget=100)
+        g1 = q.try_admit(tenant="t", cost=_cost(60))
+        assert g1.admitted and g1.charge_id is not None
+        assert q.in_flight == 60
+        # 60 + 60 = 120 > 100 → reject, no reservation, action set.
+        g2 = q.try_admit(tenant="t", cost=_cost(60))
+        assert not g2.admitted
+        assert g2.charge_id is None
+        assert g2.action == ActionCode.REJECTED_OVERLOAD
+        assert q.in_flight == 60  # unchanged by the rejected admit
+
+    def test_admit_exactly_at_budget_boundary(self) -> None:
+        q = InMemoryQuotaStore(node_token_budget=100)
+        assert q.try_admit(tenant="t", cost=_cost(100)).admitted  # == budget, ok
+        assert not q.try_admit(tenant="t", cost=_cost(1)).admitted  # 1 over
+
+    def test_settle_releases_then_readmit(self) -> None:
+        q = InMemoryQuotaStore(node_token_budget=100)
+        g = q.try_admit(tenant="t", cost=_cost(100))
+        assert q.in_flight == 100
+        q.settle(g.charge_id, actual_output_tokens=5)  # type: ignore[arg-type]
+        assert q.in_flight == 0
+        # Budget freed → a fresh full request admits again.
+        assert q.try_admit(tenant="t", cost=_cost(100)).admitted
+
+    def test_settle_is_idempotent(self) -> None:
+        q = InMemoryQuotaStore(node_token_budget=100)
+        g = q.try_admit(tenant="t", cost=_cost(40))
+        q.settle(g.charge_id, actual_output_tokens=0)  # type: ignore[arg-type]
+        # Double settle + unknown id are both no-ops (keeps streaming +
+        # pre-flight-failure paths safe to both call settle).
+        q.settle(g.charge_id, actual_output_tokens=0)  # type: ignore[arg-type]
+        q.settle("never-issued", actual_output_tokens=0)
+        assert q.in_flight == 0
+
+
+# --------------------------------------------------------------------------- #
+# Unit: token bucket cost > burst (1a deferred P3, handled in 1b)
+# --------------------------------------------------------------------------- #
+
+
+class TestCostExceedsBurst:
+    def test_unsatisfiable_cost_has_no_retry_after(self) -> None:
+        limiter = InMemoryTokenBucketLimiter()
+        # cost (50) > burst (10): even a full bucket can't admit it; waiting
+        # never helps, so retry_after must be None (not a misleading finite).
+        d = limiter.check("t:tpm", units_per_min=600, burst=10, cost=50.0)
+        assert not d.allowed
+        assert d.retry_after_s is None
+
+
+# --------------------------------------------------------------------------- #
+# Unit: jitter helper
+# --------------------------------------------------------------------------- #
+
+
+class TestJitter:
+    def test_adds_base_plus_jitter(self) -> None:
+        assert jittered_retry_after(5.0, rng=lambda a, b: 0.5) == 5.5
+
+    def test_none_base_is_just_jitter(self) -> None:
+        assert jittered_retry_after(None, rng=lambda a, b: 0.7) == 0.7
+
+    def test_nonpositive_base_floored(self) -> None:
+        assert jittered_retry_after(-3.0, rng=lambda a, b: 0.2) == 0.2
+
+
+# --------------------------------------------------------------------------- #
+# Integration helpers
+# --------------------------------------------------------------------------- #
+
+
+def _build_app(fake_dify: FakeDifyClient, **settings_kwargs: object) -> FastAPI:
+    settings = Settings(registry_path="unused.yaml", log_json=False, **settings_kwargs)  # type: ignore[arg-type]
+    registry = CustomerRegistry.from_entries([make_customer(model_ids=("m1",))])
+    app = create_app(settings=settings, registry=registry)
+
+    def factory(_: object) -> object:
+        return fake_dify
+
+    app.state.dify_client_factory = factory
+    app.state.app_manager._client_factory = factory
+    return app
+
+
+def _client(app: FastAPI) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+# --------------------------------------------------------------------------- #
+# Integration: chat admission (node budget)
+# --------------------------------------------------------------------------- #
+
+
+class TestChatAdmission:
+    @pytest.mark.asyncio
+    async def test_request_over_node_budget_returns_503(self, fake_dify: FakeDifyClient) -> None:
+        # Budget of 5 tokens; a request with no max_tokens estimates
+        # token_cost = input//4 + default_max_output_tokens (1024) >> 5.
+        app = _build_app(fake_dify, node_token_budget=5)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 503
+        body = r.json()
+        assert body["error"]["type"] == "overload_error"
+        assert body["error"]["code"] == "overloaded"
+        assert body["error"]["action"] == ActionCode.REJECTED_OVERLOAD
+        assert int(r.headers["Retry-After"]) >= 1
+        # Rejected admit holds no reservation.
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_blocking_success_releases_reservation(self, fake_dify: FakeDifyClient) -> None:
+        fake_dify.blocking_response = {
+            "id": "m",
+            "answer": "ok",
+            "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 3, "completion_tokens": 7, "total_tokens": 10}},
+        }
+        app = _build_app(fake_dify, node_token_budget=200_000)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50},
+            )
+        assert r.status_code == 200
+        # settle ran → budget fully released after the blocking call.
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_disabled_bypasses_admission(self, fake_dify: FakeDifyClient) -> None:
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        # Tiny budget BUT rate limiting off → request still succeeds.
+        app = _build_app(fake_dify, node_token_budget=1, rate_limit_enabled=False)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_local_rejection_after_admit_window_does_not_leak(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Regression: a body with no user message is rejected by
+        ``_last_user_message`` (400). That validation runs BEFORE admit, so
+        the reservation must never have been taken — in_flight stays 0.
+        Guards the admit-ordering (admit must come after can-raise prep)."""
+        app = _build_app(fake_dify, node_token_budget=200_000)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                # Only a system message → no user message → 400.
+                json={"model": "m1", "messages": [{"role": "system", "content": "be brief"}]},
+            )
+        assert r.status_code == 400
+        assert app.state.quota_store.in_flight == 0
+
+
+# --------------------------------------------------------------------------- #
+# Integration: chat TPM
+# --------------------------------------------------------------------------- #
+
+
+class TestChatTpm:
+    @pytest.mark.asyncio
+    async def test_over_tpm_returns_429_reduce_max_tokens(self, fake_dify: FakeDifyClient) -> None:
+        # tpm enabled, burst tiny (10) — a request costing ~1024 (default
+        # max_output fallback) exceeds burst → unsatisfiable → 429.
+        app = _build_app(fake_dify, default_tpm=600, default_tpm_burst=10, node_token_budget=10_000_000)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 429
+        body = r.json()
+        assert body["error"]["type"] == "rate_limit_error"
+        assert body["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+        # TPM rejected BEFORE admission → no reservation held.
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_tpm_unlimited_by_default(self, fake_dify: FakeDifyClient) -> None:
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        # default_tpm=0 → TPM check skipped entirely.
+        app = _build_app(fake_dify, default_tpm=0)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Integration: streaming settle (completion + disconnect)
+# --------------------------------------------------------------------------- #
+
+
+class TestStreamingSettle:
+    @pytest.mark.asyncio
+    async def test_stream_completion_releases_reservation(self, fake_dify: FakeDifyClient) -> None:
+        app = _build_app(fake_dify, node_token_budget=200_000)
+        async with _client(app) as cli:
+            async with cli.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            ) as resp:
+                assert resp.status_code == 200
+                async for _ in resp.aiter_lines():
+                    pass
+        await asyncio.sleep(0)  # let the generator finally run
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_disconnect_releases_reservation(self, fake_dify: FakeDifyClient) -> None:
+        # Many lines so the stream is still open when we bail out early —
+        # exercises the GeneratorExit → finally → settle path (the edge's
+        # biggest waste: a dropped long generation holding KV budget).
+        fake_dify.streaming_lines = [
+            'data: {"event":"message","answer":"chunk"}' for _ in range(50)
+        ] + ['data: {"event":"message_end","metadata":{},"conversation_id":"c"}']
+        app = _build_app(fake_dify, node_token_budget=200_000)
+        async with _client(app) as cli:
+            async with cli.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            ) as resp:
+                assert resp.status_code == 200
+                async for _ in resp.aiter_lines():
+                    break  # disconnect mid-stream
+        await asyncio.sleep(0)
+        assert app.state.quota_store.in_flight == 0
+
+
+# --------------------------------------------------------------------------- #
+# Integration: embeddings TPM (no admission)
+# --------------------------------------------------------------------------- #
+
+
+class TestEmbeddingsTpm:
+    @pytest.mark.asyncio
+    async def test_embeddings_over_tpm_returns_429(self, fake_dify: FakeDifyClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Stub the embeddings upstream so the request reaches TPM, not network.
+        async def _fake_invoke(**_: object) -> dict[str, object]:
+            return {"data": [], "model": "emb1", "usage": {"prompt_tokens": 0}}
+
+        monkeypatch.setattr("gateway.routers.embeddings.invoke_embeddings", _fake_invoke)
+        # burst tiny so a long input trips TPM.
+        app = _build_app(fake_dify, default_tpm=600, default_tpm_burst=10)
+        long_input = "x" * 1000  # ~250 input tokens > burst 10 → unsatisfiable
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers=_AUTH,
+                json={"model": "emb1", "input": long_input},
+            )
+        assert r.status_code == 429
+        assert r.json()["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_embeddings_unlimited_by_default(self, fake_dify: FakeDifyClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _fake_invoke(**_: object) -> dict[str, object]:
+            return {"data": [{"embedding": [0.1], "index": 0}], "model": "emb1", "usage": {"prompt_tokens": 1}}
+
+        monkeypatch.setattr("gateway.routers.embeddings.invoke_embeddings", _fake_invoke)
+        app = _build_app(fake_dify, default_tpm=0)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/embeddings",
+                headers=_AUTH,
+                json={"model": "emb1", "input": "hello"},
+            )
+        assert r.status_code == 200
+
+
+def test_ratelimit_error_carries_action_and_retry() -> None:
+    """RateLimitError now accepts action + retry_after_s (used by router TPM)."""
+    e = RateLimitError("x", action=ActionCode.REDUCE_MAX_TOKENS, retry_after_s=2.5)
+    env = e.to_openai_envelope()
+    assert env["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+    assert e.retry_after_s == 2.5

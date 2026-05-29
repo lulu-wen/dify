@@ -106,15 +106,31 @@ class InvalidRequestError(GatewayError):
 
 
 class RateLimitError(GatewayError):
-    """Client exceeded its rate limit. → 429.
+    """Client exceeded its rate limit (RPM or TPM). → 429.
 
-    First-version is a placeholder; routing layer raises this when limiter
-    middleware is wired in a future PR.
+    Raised by ``RateLimitMiddleware`` (RPM, PR #7 1a) and by the chat /
+    embeddings routers (TPM, 1b). Carries an optional ``action`` hint
+    (``RETRY_AFTER`` / ``REDUCE_MAX_TOKENS``) and ``retry_after_s``.
     """
 
     status_code = 429
     error_type = "rate_limit_error"
     code = "rate_limited"
+
+
+class OverloadError(GatewayError):
+    """Node is saturated — admission rejected the request. → 503.
+
+    Distinct from :class:`RateLimitError` (429): a 429 means *this client*
+    is over its own limit and should back off; a 503 means *the node* is at
+    capacity (KV-cache / in-flight token budget) regardless of the client's
+    quota. The client should retry later or shed to another node. Raised by
+    the chat router's cost-based admission gate (1b).
+    """
+
+    status_code = 503
+    error_type = "overload_error"
+    code = "overloaded"
 
 
 class DifyUpstreamError(GatewayError):
