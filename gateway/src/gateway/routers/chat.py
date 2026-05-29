@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError
+from gateway.errors import InvalidRequestError, UnknownModelError
 from gateway.registry import CustomerEntry
 from gateway.routers.ratelimit_guard import (
     admit,
@@ -172,37 +172,43 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     # Fall back to ``body.model`` when not provided.
     selected_model = body.llm_model or body.model
 
-    # Phase 1b rate limiting (TPM + cost-based admission). Cost is estimated
-    # from the parsed body here (middleware can't see it). Order:
-    #   1. estimate cost (cheap, local)
-    #   2. TPM check — reject over-rate BEFORE any network work; no reservation
-    #      to leak if it raises.
-    #   3. get_app_key — validates the model (so an invalid model 404s rather
-    #      than holding a reservation).
-    #   4. admit — reserve node budget as late as possible, AFTER all
-    #      can-raise local prep (query/inputs/user), so the only failure
-    #      window between admit and settle is the generation call itself
-    #      (stream pre-flight / blocking call — both settle on error below).
-    #      Reserving earlier would leak the reservation if e.g.
-    #      ``_last_user_message`` rejected a body with no user message.
-    cost = estimate_request_cost(
-        request,
-        input_chars=_messages_chars(body.messages),
-        max_output_tokens=body.effective_max_tokens,
-        model_id=selected_model,
-    )
-    enforce_tpm(request, customer, cost)
-
-    # Validate model + obtain App key (lazy-build).
+    # Validate model + obtain App key (lazy-build) FIRST — before any
+    # rate-limit metering, so an invalid model 404s without draining the
+    # customer's TPM bucket (codex 1b review-2 P2-1). get_app_key checks
+    # model membership synchronously before any network call.
     app_key = await app_manager.get_app_key(customer, selected_model)
     dify_client: DifyClient = dify_factory(customer)
+    model_entry = customer.find_model(selected_model)
+    if model_entry is None:  # pragma: no cover - get_app_key already validated
+        raise UnknownModelError(f"model '{selected_model}' is not enabled for this customer")
 
     query = _last_user_message(body.messages)
     inputs: dict[str, Any] = {"system_prompt": _build_system_prompt(body.messages)}
     user = _user_id(body, customer, request_id)
 
-    # Reserve node budget now — everything above could still reject without a
-    # reservation to release; everything below settles on success or error.
+    # Phase 1b rate limiting, AFTER all validation (model + body) so a
+    # rejected request never consumes TPM or holds a reservation.
+    #
+    # Cost is based on the model's CONFIGURED generation cap
+    # (completion_params.max_tokens), NOT the client's max_tokens: the
+    # gateway doesn't forward per-request max_tokens to Dify — generation is
+    # bounded by the App's DSL completion_params — so the App's cap is the
+    # real upper bound on output. AppManager builds the App with the same
+    # default_max_output_tokens fallback when the model omits a cap, so this
+    # reservation is a genuine upper bound, not an under-count
+    # (codex 1b review-2 P2-2).
+    #
+    # admit() comes last: everything above can still reject without a
+    # reservation to release; everything below (generation) settles on
+    # success AND error/disconnect.
+    configured_max = model_entry.completion_params.get("max_tokens")
+    cost = estimate_request_cost(
+        request,
+        input_chars=_messages_chars(body.messages),
+        max_output_tokens=configured_max if isinstance(configured_max, int) else None,
+        model_id=selected_model,
+    )
+    enforce_tpm(request, customer, cost)
     grant = admit(request, customer, cost)
 
     # ---- streaming branch ----

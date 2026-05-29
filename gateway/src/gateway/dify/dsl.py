@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-DSL_VERSION = "v3-dataset-enabled"
+DSL_VERSION = "v4-output-cap"
 """Bump when ``build_chat_app_dsl`` output changes in a way that requires
 existing cached Apps to be rebuilt. :class:`AppManager` records this on each
 :class:`CachedApp` and forces a rebuild when the constant disagrees with the

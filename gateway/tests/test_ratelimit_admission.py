@@ -14,6 +14,7 @@ import asyncio
 
 import httpx
 import pytest
+import yaml
 from fastapi import FastAPI
 
 from gateway.config import Settings
@@ -22,7 +23,7 @@ from gateway.main import create_app
 from gateway.ratelimit import InMemoryQuotaStore, InMemoryTokenBucketLimiter, estimate_cost
 from gateway.ratelimit.retry import jittered_retry_after
 from gateway.ratelimit.types import ActionCode
-from gateway.registry import CustomerRegistry
+from gateway.registry import CustomerEntry, CustomerRegistry, DifyConnection, ModelEntry
 from tests.conftest import FakeDifyClient, make_customer
 
 _AUTH = {"Authorization": "Bearer bsa_test_a"}
@@ -371,3 +372,88 @@ def test_ratelimit_error_carries_action_and_retry() -> None:
     env = e.to_openai_envelope()
     assert env["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
     assert e.retry_after_s == 2.5
+
+
+# --------------------------------------------------------------------------- #
+# Codex 1b review-2 fixes
+# --------------------------------------------------------------------------- #
+
+
+class TestReviewFixes:
+    @pytest.mark.asyncio
+    async def test_invalid_model_404_not_429(self, fake_dify: FakeDifyClient) -> None:
+        """Codex 1b review-2 P2-1: model validation runs BEFORE TPM metering,
+        so an invalid model 404s without draining the TPM bucket. With burst=1
+        and TPM enabled, if TPM ran first this would be 429 — asserting 404
+        proves the order."""
+        app = _build_app(fake_dify, default_tpm=600, default_tpm_burst=1)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "does-not-exist", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "model_not_found"
+
+    @pytest.mark.asyncio
+    async def test_reservation_uses_model_configured_max_tokens(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Codex 1b review-2 P2-2: the node reservation uses the MODEL's
+        configured generation cap (completion_params.max_tokens), not the
+        client's max_tokens (which Dify ignores). Model caps at 2048; budget
+        is 1500. cost = 0 input + 2048 > 1500 → 503. (Old behaviour used the
+        1024 default → would have admitted.)"""
+        customer = CustomerEntry(
+            sdk_key="bsa_test_a",
+            customer_id="test-a",
+            dify=DifyConnection(
+                base_url="http://dify.test",
+                console_email="a@x",
+                console_password="pw",
+                dataset_api_key="ds-x",
+            ),
+            models=[ModelEntry(id="m1", provider="prov", name="n", completion_params={"max_tokens": 2048})],
+        )
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(registry_path="unused.yaml", log_json=False, node_token_budget=1500)
+        app = create_app(settings=settings, registry=registry)
+        app.state.dify_client_factory = lambda _: fake_dify
+        app.state.app_manager._client_factory = lambda _: fake_dify
+
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                # No max_tokens in the request — reservation still uses the
+                # model's 2048 cap, not the client's omission.
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 503
+        assert r.json()["error"]["action"] == ActionCode.REJECTED_OVERLOAD
+
+    @pytest.mark.asyncio
+    async def test_autobuilt_app_gets_injected_output_cap(self, fake_dify: FakeDifyClient) -> None:
+        """Codex 1b review-2 P2-2: when a model has no configured max_tokens,
+        AppManager injects default_max_output_tokens into the auto-built App's
+        DSL — so generation is genuinely bounded and the reservation is a true
+        upper bound (not just a hopeful estimate)."""
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        # m1 (make_customer) has completion_params={} → injection applies.
+        app = _build_app(fake_dify, default_max_output_tokens=512)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+        # The App import DSL must carry the injected cap.
+        assert fake_dify.calls["import"], "App was not built"
+        _, yaml_content = fake_dify.calls["import"][-1]
+        dsl = yaml.safe_load(yaml_content)
+        assert dsl["model_config"]["model"]["completion_params"]["max_tokens"] == 512

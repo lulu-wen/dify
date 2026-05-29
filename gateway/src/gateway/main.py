@@ -91,6 +91,13 @@ def create_app(
         client_factory=factory,
         ttl_s=settings.app_cache_ttl_s,
         gc_interval_s=settings.app_cache_gc_interval_s,
+        # Bound generation on auto-built Apps so the node-budget admission
+        # reservation is a true upper bound (PR #8 1b). Only injected when
+        # rate limiting is enabled — a disabled limiter shouldn't silently
+        # cap generation length.
+        default_max_output_tokens=(
+            settings.default_max_output_tokens if settings.rate_limit_enabled else 0
+        ),
     )
 
     @asynccontextmanager
