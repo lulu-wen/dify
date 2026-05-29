@@ -233,6 +233,19 @@ class CustomerEntry(BaseModel):
     models: list[ModelEntry] = Field(min_length=1)
     embedding_models: list[EmbeddingModelEntry] = Field(default_factory=list)
     knowledge_bases: list[str] = Field(default_factory=list)
+    rpm_limit: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Per-customer requests-per-minute override (PR #7). None means "
+            "use the gateway-wide ``default_rpm``. Edge nodes share one "
+            "finite vLLM, so this is the per-tenant slice of that capacity; "
+            "tiered plans set a higher/lower value here. Must be positive "
+            "when set — a 0 would silently lock the customer out, which an "
+            "operator almost never intends (use ``rate_limit_enabled=false`` "
+            "to disable limiting wholesale instead)."
+        ),
+    )
 
     @field_validator("models")
     @classmethod

@@ -34,20 +34,37 @@ class GatewayError(Exception):
     error_type: str = "internal_error"
     code: str = "internal_error"
 
-    def __init__(self, message: str, *, param: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        param: str | None = None,
+        action: str | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.param = param
+        # ``action`` is an advisory hint the client MAY act on (e.g.
+        # REDUCE_MAX_TOKENS, USE_SMALLER_MODEL) — server enforcement is
+        # independent of whether the client honours it. ``retry_after_s``
+        # is surfaced as a ``Retry-After`` header by the exception handler,
+        # not in the body. Both are None for errors that don't use them.
+        self.action = action
+        self.retry_after_s = retry_after_s
 
     def to_openai_envelope(self) -> dict[str, Any]:
-        return {
-            "error": {
-                "message": self.message,
-                "type": self.error_type,
-                "code": self.code,
-                "param": self.param,
-            }
+        error: dict[str, Any] = {
+            "message": self.message,
+            "type": self.error_type,
+            "code": self.code,
+            "param": self.param,
         }
+        # Only include ``action`` when set, so the common envelope stays
+        # exactly OpenAI-shaped; clients that don't know the field ignore it.
+        if self.action is not None:
+            error["action"] = self.action
+        return {"error": error}
 
 
 class InvalidSdkKeyError(GatewayError):

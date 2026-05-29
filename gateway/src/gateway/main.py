@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -17,6 +18,8 @@ from gateway.dify.client import DifyClient
 from gateway.errors import GatewayError, InvalidRequestError
 from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
+from gateway.middleware.rate_limit import RateLimitMiddleware
+from gateway.ratelimit import InMemoryTokenBucketLimiter, RateLimiter
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import chat as chat_router
 from gateway.routers import datasets as datasets_router
@@ -54,6 +57,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     registry: CustomerRegistry | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     """Application factory used by ``uvicorn`` and tests.
 
@@ -61,6 +65,9 @@ def create_app(
         settings: optional pre-built Settings (defaults: read env).
         registry: optional pre-built registry (tests inject; production loads
             from ``settings.registry_path``).
+        rate_limiter: optional pre-built limiter (tests inject one with a
+            controllable clock or a recording fake; production builds the
+            default in-memory token bucket).
     """
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -116,14 +123,22 @@ def create_app(
         lifespan=lifespan,
     )
 
+    rate_limiter = rate_limiter or InMemoryTokenBucketLimiter()
+
     app.state.settings = settings
     app.state.registry = registry
     app.state.app_manager = app_manager
     app.state.dify_client_factory = factory
     app.state.dify_clients = dify_clients
+    app.state.rate_limiter = rate_limiter
 
-    # Middleware: Logging is outer (request id available even on auth failure),
-    # Auth is inner (runs after logging is set up).
+    # Middleware ordering (add order is INNERMOST-first in Starlette, so the
+    # last added runs outermost):
+    #   request flow:  Logging -> Auth -> RateLimit -> route
+    # - Logging outermost: request id exists even on auth / rate-limit failure.
+    # - RateLimit inner to Auth: it keys on request.state.customer, which
+    #   AuthMiddleware sets. Added BEFORE Auth here so it ends up inner.
+    app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, settings=settings)
     app.add_middleware(AuthMiddleware, registry=registry)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
 
@@ -143,7 +158,18 @@ def create_app(
 
     @app.exception_handler(GatewayError)
     async def _gateway_error_handler(_: Request, exc: GatewayError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=exc.to_openai_envelope())
+        # Surface Retry-After when the error carries a hint (rate-limit /
+        # overload). Header is the standard signal; the body's ``action``
+        # field carries the richer hint. Round up so a 0.4s wait still
+        # tells the client "wait 1s" rather than "retry immediately".
+        headers: dict[str, str] | None = None
+        if exc.retry_after_s is not None:
+            headers = {"Retry-After": str(max(1, math.ceil(exc.retry_after_s)))}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.to_openai_envelope(),
+            headers=headers,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error_handler(
