@@ -54,7 +54,11 @@ class InMemoryTokenBucketLimiter:
         cost: float = 1.0,
     ) -> RateDecision:
         now = self._clock()
-        refill_per_s = units_per_min / 60.0
+        # Callers enforce units_per_min >= 1 (config ``ge=1`` /
+        # ``rpm_limit gt=0``), but this is a reusable component — guard the
+        # division so a future caller passing 0 degrades to "never refills"
+        # instead of crashing the request with ZeroDivisionError.
+        refill_per_s = units_per_min / 60.0 if units_per_min > 0 else 0.0
 
         bucket = self._buckets.get(key)
         if bucket is None:
@@ -79,10 +83,11 @@ class InMemoryTokenBucketLimiter:
             )
 
         # Rejected: leave the bucket untouched (no partial consume) and
-        # estimate when ``cost`` tokens will have refilled. ``refill_per_s``
-        # is > 0 because units_per_min is validated >= 1 in config/registry.
+        # estimate when ``cost`` tokens will have refilled. When
+        # ``refill_per_s`` is 0 (degenerate units_per_min<=0 config) the
+        # bucket never refills, so there's no meaningful retry time → None.
         deficit = cost - bucket.tokens
-        retry_after_s = deficit / refill_per_s
+        retry_after_s = deficit / refill_per_s if refill_per_s > 0 else None
         return RateDecision(
             allowed=False,
             retry_after_s=retry_after_s,
