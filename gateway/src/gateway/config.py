@@ -73,3 +73,37 @@ class Settings(BaseSettings):
             "production."
         ),
     )
+
+    # --- Rate limiting (PR #7 / Phase 1a) ------------------------------- #
+    # Per-tenant requests-per-minute token bucket enforced in middleware.
+    # Edge nodes share one finite vLLM; without this, a single runaway /
+    # abused customer can starve the rest. See the Edge AI Rate Limiting
+    # design doc for the full picture (TPM + cost admission land in 1b).
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for per-tenant rate limiting. When False, the "
+            "RateLimitMiddleware passes every request through untouched — "
+            "useful for local dev or a deployment that hasn't tuned limits "
+            "yet. Defaults on with a deliberately generous default_rpm so "
+            "it protects against runaways without tripping normal traffic."
+        ),
+    )
+    default_rpm: int = Field(
+        default=120,
+        ge=1,
+        description=(
+            "Default per-customer requests-per-minute, applied to customers "
+            "whose registry entry doesn't set rpm_limit. 120 = 2 req/s "
+            "sustained; generous enough that only genuine floods hit it."
+        ),
+    )
+    default_rpm_burst: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Token-bucket capacity (max instantaneous burst) for the default "
+            "RPM limit. Lets bursty-but-low-average clients through while "
+            "still capping sustained rate at default_rpm."
+        ),
+    )
