@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
 from gateway.errors import InvalidRequestError, UnknownModelError
+from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry
 from gateway.routers.ratelimit_guard import (
     admit,
@@ -198,18 +199,26 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     # reservation is a genuine upper bound, not an under-count
     # (codex 1b review-2 P2-2).
     #
-    # admit() comes last: everything above can still reject without a
-    # reservation to release; everything below (generation) settles on
-    # success AND error/disconnect.
-    configured_max = model_entry.completion_params.get("max_tokens")
+    # admit() BEFORE enforce_tpm(), then settle on a TPM rejection
+    # (codex 1b review-3 P2-1): TPM is a non-refundable bucket consume, so
+    # if the node budget is already full we must 503 WITHOUT having debited
+    # the tenant's TPM. With admit-first, a node-full request raises 503
+    # before TPM is touched; if TPM then rejects (admit succeeded), we
+    # release the reservation. Net: TPM is debited only for requests that
+    # actually proceed to generation. effective_max_tokens keeps the
+    # reservation cap consistent with the App-build cap.
     cost = estimate_request_cost(
         request,
         input_chars=_messages_chars(body.messages),
-        max_output_tokens=configured_max if isinstance(configured_max, int) else None,
+        max_output_tokens=effective_max_tokens(model_entry.completion_params),
         model_id=selected_model,
     )
-    enforce_tpm(request, customer, cost)
     grant = admit(request, customer, cost)
+    try:
+        enforce_tpm(request, customer, cost)
+    except BaseException:
+        settle(request, grant, actual_output_tokens=0)
+        raise
 
     # ---- streaming branch ----
     #

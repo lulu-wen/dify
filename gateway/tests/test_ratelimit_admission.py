@@ -457,3 +457,111 @@ class TestReviewFixes:
         _, yaml_content = fake_dify.calls["import"][-1]
         dsl = yaml.safe_load(yaml_content)
         assert dsl["model_config"]["model"]["completion_params"]["max_tokens"] == 512
+
+
+class TestReview3Fixes:
+    @pytest.mark.asyncio
+    async def test_node_full_503_does_not_debit_tpm(self, fake_dify: FakeDifyClient) -> None:
+        """Codex 1b review-3 P2-1: when the node budget is full, a chat
+        request must 503 WITHOUT consuming the tenant's (non-refundable) TPM
+        bucket. We assert the limiter was never asked to consume TPM —
+        admit() runs first and raises before enforce_tpm()."""
+        seen_tpm = {"called": False}
+
+        class _SpyLimiter:
+            def __init__(self) -> None:
+                self._inner = InMemoryTokenBucketLimiter()
+
+            def check(self, key: str, **kw: object):  # type: ignore[no-untyped-def]
+                if key.endswith(":tpm"):
+                    seen_tpm["called"] = True
+                return self._inner.check(key, **kw)  # type: ignore[arg-type]
+
+        registry = CustomerRegistry.from_entries([make_customer(model_ids=("m1",))])
+        # Budget 1 → any chat request's cost (>= input + cap) exceeds it → 503.
+        settings = Settings(
+            registry_path="unused.yaml", log_json=False,
+            node_token_budget=1, default_tpm=600, default_tpm_burst=100000,
+        )
+        app = create_app(settings=settings, registry=registry, rate_limiter=_SpyLimiter())  # type: ignore[arg-type]
+        app.state.dify_client_factory = lambda _: fake_dify
+        app.state.app_manager._client_factory = lambda _: fake_dify
+
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 503
+        assert seen_tpm["called"] is False, "TPM was consumed before admission rejected the request"
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_tpm_rejection_after_admit_releases_reservation(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Admit succeeds, TPM then rejects → the reservation must be
+        released (settle on TPM-rejection path), not leaked."""
+        # Big node budget (admit passes) + tiny TPM burst (TPM rejects: cost
+        # >> burst → unsatisfiable).
+        app = _build_app(
+            fake_dify, node_token_budget=10_000_000, default_tpm=600, default_tpm_burst=10
+        )
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 429
+        assert app.state.quota_store.in_flight == 0  # reservation released
+
+    @pytest.mark.asyncio
+    async def test_null_max_tokens_injects_default_cap(self, fake_dify: FakeDifyClient) -> None:
+        """Codex 1b review-3 P2-2: completion_params={'max_tokens': None}
+        must be treated as uncapped — the App gets the injected default cap
+        (not left unbounded), matching the reservation's fallback."""
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        customer = CustomerEntry(
+            sdk_key="bsa_test_a",
+            customer_id="test-a",
+            dify=DifyConnection(
+                base_url="http://dify.test", console_email="a@x",
+                console_password="pw", dataset_api_key="ds-x",
+            ),
+            models=[ModelEntry(id="m1", provider="prov", name="n", completion_params={"max_tokens": None})],
+        )
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(registry_path="unused.yaml", log_json=False, default_max_output_tokens=512)
+        app = create_app(settings=settings, registry=registry)
+        app.state.dify_client_factory = lambda _: fake_dify
+        app.state.app_manager._client_factory = lambda _: fake_dify
+
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+        _, yaml_content = fake_dify.calls["import"][-1]
+        dsl = yaml.safe_load(yaml_content)
+        # null max_tokens → default injected, NOT left as null/unbounded.
+        assert dsl["model_config"]["model"]["completion_params"]["max_tokens"] == 512
+
+
+def test_effective_max_tokens_normalizes_invalid_values() -> None:
+    """Unit: only a positive int counts as a usable cap."""
+    from gateway.ratelimit import effective_max_tokens
+
+    assert effective_max_tokens({"max_tokens": 2048}) == 2048
+    assert effective_max_tokens({}) is None
+    assert effective_max_tokens({"max_tokens": None}) is None
+    assert effective_max_tokens({"max_tokens": 0}) is None
+    assert effective_max_tokens({"max_tokens": -5}) is None
+    assert effective_max_tokens({"max_tokens": "1024"}) is None
+    assert effective_max_tokens({"max_tokens": True}) is None  # bool excluded

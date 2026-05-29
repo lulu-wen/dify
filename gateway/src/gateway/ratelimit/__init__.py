@@ -8,7 +8,7 @@ See the Edge AI Rate Limiting design doc.
 
 from __future__ import annotations
 
-from gateway.ratelimit.cost import estimate_cost
+from gateway.ratelimit.cost import effective_max_tokens, estimate_cost
 from gateway.ratelimit.protocols import QuotaStore, RateLimiter
 from gateway.ratelimit.quota import InMemoryQuotaStore
 from gateway.ratelimit.retry import jittered_retry_after
@@ -29,6 +29,7 @@ __all__ = [
     "RateDecision",
     "RateLimiter",
     "RequestCost",
+    "effective_max_tokens",
     "estimate_cost",
     "jittered_retry_after",
 ]

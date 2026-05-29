@@ -13,7 +13,31 @@ See the Edge AI Rate Limiting design doc, appendix B.2.
 
 from __future__ import annotations
 
+from typing import Any
+
 from gateway.ratelimit.types import RequestCost
+
+
+def effective_max_tokens(completion_params: dict[str, Any]) -> int | None:
+    """Return a model's configured output cap iff it's a usable value.
+
+    "Usable" = a **positive int**. A registry entry can carry
+    ``max_tokens: null`` / a string / 0 / a bool — none of which bound
+    generation. Returning None for those lets callers fall back to the
+    gateway default *consistently*: the App-build injects the default cap
+    AND the admission reservation uses it, so they can't disagree (codex
+    1b review-3 P2-2 — the bug was the key existing-but-invalid causing
+    one path to skip the default while the other applied it).
+
+    ``bool`` is excluded explicitly (it's an ``int`` subclass — ``True``
+    would otherwise read as a cap of 1).
+    """
+    value = completion_params.get("max_tokens")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 # Chars per token for the chars/4 heuristic. English ~4 chars/token; CJK is
 # denser (~1-2 chars/token), so chars/4 UNDER-counts CJK input tokens. That

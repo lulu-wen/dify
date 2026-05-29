@@ -39,6 +39,7 @@ import structlog
 from gateway.dify.client import ConsoleSession, DifyClient
 from gateway.dify.dsl import DSL_VERSION, build_chat_app_dsl
 from gateway.errors import DifyUpstreamError, UnknownModelError
+from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry, CustomerRegistry, ModelEntry
 
 logger = structlog.get_logger(__name__)
@@ -242,13 +243,20 @@ class AppManager:
         from gateway.mode import isolation_strategy_for
         strategy = isolation_strategy_for(customer)
         app_label = strategy.app_name(customer.customer_id, model.id)
-        # Bound generation: if the model didn't configure a max_tokens, inject
-        # the gateway default so the App can't generate unbounded output on a
-        # shared finite edge GPU — and so the admission reservation (same
-        # value) is a true upper bound. Operators set completion_params.
-        # max_tokens explicitly to allow longer outputs.
+        # Bound generation: if the model didn't configure a *valid* max_tokens
+        # (positive int), inject the gateway default so the App can't generate
+        # unbounded output on a shared finite edge GPU — and so the admission
+        # reservation (which uses the same effective_max_tokens rule) is a true
+        # upper bound. Using effective_max_tokens (not a bare key check) closes
+        # codex 1b review-3 P2-2: ``max_tokens: null`` / 0 / non-int would
+        # otherwise leave the App unbounded while the reservation assumed a
+        # bound. Operators set a positive completion_params.max_tokens to allow
+        # longer outputs.
         completion_params = dict(model.completion_params)
-        if self._default_max_output_tokens > 0 and "max_tokens" not in completion_params:
+        if (
+            self._default_max_output_tokens > 0
+            and effective_max_tokens(completion_params) is None
+        ):
             completion_params["max_tokens"] = self._default_max_output_tokens
         dsl = build_chat_app_dsl(
             name=f"auto:{app_label}",
