@@ -173,31 +173,27 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     # Fall back to ``body.model`` when not provided.
     selected_model = body.llm_model or body.model
 
-    # Validate model + obtain App key (lazy-build) FIRST — before any
-    # rate-limit metering, so an invalid model 404s without draining the
-    # customer's TPM bucket (codex 1b review-2 P2-1). get_app_key checks
-    # model membership synchronously before any network call.
-    app_key = await app_manager.get_app_key(customer, selected_model)
-    dify_client: DifyClient = dify_factory(customer)
+    # Cheap synchronous validation FIRST — model membership and body shape
+    # are local lookups. Doing these before rate limiting keeps invalid
+    # model → 404 / bad body → 400 from draining the customer's TPM bucket
+    # (codex 1b review-2 P2-1). Doing them before get_app_key avoids any
+    # network when we know we'll reject anyway.
     model_entry = customer.find_model(selected_model)
-    if model_entry is None:  # pragma: no cover - get_app_key already validated
+    if model_entry is None:
         raise UnknownModelError(f"model '{selected_model}' is not enabled for this customer")
 
     query = _last_user_message(body.messages)
     inputs: dict[str, Any] = {"system_prompt": _build_system_prompt(body.messages)}
     user = _user_id(body, customer, request_id)
 
-    # Phase 1b rate limiting, AFTER all validation (model + body) so a
-    # rejected request never consumes TPM or holds a reservation.
-    #
-    # Cost is based on the model's CONFIGURED generation cap
-    # (completion_params.max_tokens), NOT the client's max_tokens: the
-    # gateway doesn't forward per-request max_tokens to Dify — generation is
-    # bounded by the App's DSL completion_params — so the App's cap is the
-    # real upper bound on output. AppManager builds the App with the same
-    # default_max_output_tokens fallback when the model omits a cap, so this
-    # reservation is a genuine upper bound, not an under-count
-    # (codex 1b review-2 P2-2).
+    # Phase 1b rate limiting. Cost is based on the model's CONFIGURED
+    # generation cap (completion_params.max_tokens), NOT the client's
+    # max_tokens: the gateway doesn't forward per-request max_tokens to
+    # Dify — generation is bounded by the App's DSL completion_params — so
+    # the App's cap is the real upper bound on output. AppManager builds
+    # the App with the same default_max_output_tokens fallback when the
+    # model omits a cap, so this reservation is a genuine upper bound, not
+    # an under-count (codex 1b review-2 P2-2).
     #
     # admit() BEFORE enforce_tpm(), then settle on a TPM rejection
     # (codex 1b review-3 P2-1): TPM is a non-refundable bucket consume, so
@@ -207,6 +203,11 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     # release the reservation. Net: TPM is debited only for requests that
     # actually proceed to generation. effective_max_tokens keeps the
     # reservation cap consistent with the App-build cap.
+    #
+    # BOTH admission gates run BEFORE the heavy ``get_app_key`` (codex 1b
+    # review-4 P3): on a cold cache get_app_key does console_login + DSL
+    # import + api-key creation against Dify, which is wasted work — and
+    # Dify-side side-effects — for a request that's about to 503/429.
     cost = estimate_request_cost(
         request,
         input_chars=_messages_chars(body.messages),
@@ -216,6 +217,16 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
     grant = admit(request, customer, cost)
     try:
         enforce_tpm(request, customer, cost)
+    except BaseException:
+        settle(request, grant, actual_output_tokens=0)
+        raise
+
+    # Heavy now: get_app_key may lazy-build the Dify App (console login + DSL
+    # import + api-key creation). Wrap in settle-on-error so a build failure
+    # after admit+TPM succeeded doesn't leak the reservation.
+    try:
+        app_key = await app_manager.get_app_key(customer, selected_model)
+        dify_client: DifyClient = dify_factory(customer)
     except BaseException:
         settle(request, grant, actual_output_tokens=0)
         raise
@@ -254,20 +265,26 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                 ):
                     yield chunk
             finally:
-                # Release the node-budget reservation on stream end AND on
-                # client disconnect (GeneratorExit reaches this finally), so a
-                # dropped long generation doesn't hold KV budget forever.
-                # actual_output_tokens=0: the streaming path doesn't extract
-                # Dify usage; the full reservation is released regardless (the
-                # count is telemetry only — see QuotaStore.settle). settle is
-                # idempotent, so the pre-flight path above is safe too.
-                settle(request, grant, actual_output_tokens=0)
-                # Best-effort close; errors inside cleanup are swallowed because
-                # the response has already started streaming.
+                # Order matters (codex 1b review-4 P2): close the upstream
+                # FIRST, then release the node-budget reservation. If we
+                # released first, Dify/vLLM could still be holding KV cache
+                # during the (synchronous-from-our-side) close window, and
+                # another admit could exceed the real budget. Nested finally
+                # ensures settle still runs even if close raises — covers
+                # stream end AND client disconnect (GeneratorExit). settle is
+                # idempotent so the pre-flight failure path remains safe.
+                # actual_output_tokens=0: streaming doesn't extract Dify
+                # usage; the full reservation releases regardless (count is
+                # telemetry only — see QuotaStore.settle).
                 try:
-                    await stream_cm.__aexit__(None, None, None)
-                except Exception:
-                    logger.exception("chat.stream_close_failed")
+                    # Best-effort close; errors inside cleanup are swallowed
+                    # because the response has already started streaming.
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        logger.exception("chat.stream_close_failed")
+                finally:
+                    settle(request, grant, actual_output_tokens=0)
 
         return StreamingResponse(
             event_source(),

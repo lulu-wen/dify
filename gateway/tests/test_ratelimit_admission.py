@@ -565,3 +565,102 @@ def test_effective_max_tokens_normalizes_invalid_values() -> None:
     assert effective_max_tokens({"max_tokens": -5}) is None
     assert effective_max_tokens({"max_tokens": "1024"}) is None
     assert effective_max_tokens({"max_tokens": True}) is None  # bool excluded
+
+
+class TestReview4Fixes:
+    @pytest.mark.asyncio
+    async def test_streaming_settles_after_upstream_close(
+        self, fake_dify: FakeDifyClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex 1b review-4 P2: settle MUST run after the upstream Dify
+        stream is closed. If we release the reservation before __aexit__,
+        Dify/vLLM may still hold KV cache during the close window and
+        another admit could exceed the real budget. Spy on both the
+        upstream close and settle and assert order."""
+        events: list[str] = []
+
+        original_open = fake_dify.open_chat_stream
+
+        from collections.abc import AsyncIterator
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def open_with_exit_spy(**kwargs: object) -> AsyncIterator[object]:
+            async with original_open(**kwargs) as inner:
+                try:
+                    yield inner
+                finally:
+                    events.append("close")
+
+        fake_dify.open_chat_stream = open_with_exit_spy  # type: ignore[method-assign]
+
+        import gateway.routers.chat as chat_mod
+        original_settle = chat_mod.settle
+
+        def settle_spy(*args: object, **kwargs: object) -> None:
+            events.append("settle")
+            return original_settle(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(chat_mod, "settle", settle_spy)
+
+        app = _build_app(fake_dify, node_token_budget=200_000)
+        async with _client(app) as cli:
+            async with cli.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            ) as resp:
+                assert resp.status_code == 200
+                async for _ in resp.aiter_lines():
+                    pass
+        await asyncio.sleep(0)
+
+        # The upstream MUST be closed before the budget is released — else
+        # a concurrent admit could over-commit while vLLM still has KV.
+        assert events == ["close", "settle"], (
+            f"settle ran before upstream close (order: {events}) — node budget "
+            f"was released while Dify/vLLM may still have been holding KV cache"
+        )
+        assert app.state.quota_store.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_overload_503_does_not_call_get_app_key(
+        self, fake_dify: FakeDifyClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex 1b review-4 P3: when the node budget is full, admission
+        503s BEFORE the (potentially network-heavy) get_app_key lazy-build.
+        Spy on app_manager.get_app_key and assert call_count == 0 — wasted
+        Dify console_login + DSL import + api-key creation against a request
+        we're about to reject would defeat the point of fast-rejection."""
+        app = _build_app(fake_dify, node_token_budget=1)
+
+        calls = {"count": 0}
+        original = app.state.app_manager.get_app_key
+
+        async def get_app_key_spy(customer: object, model_id: str) -> str:
+            calls["count"] += 1
+            return await original(customer, model_id)  # type: ignore[no-any-return]
+
+        monkeypatch.setattr(app.state.app_manager, "get_app_key", get_app_key_spy)
+
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+
+        assert r.status_code == 503
+        assert calls["count"] == 0, (
+            "get_app_key was called for an over-budget request — admission must "
+            "run before any potentially-network-heavy lazy-build"
+        )
+        # Invalid model still 404s synchronously (find_model before admit).
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "nope", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 404
