@@ -83,11 +83,19 @@ class InMemoryTokenBucketLimiter:
             )
 
         # Rejected: leave the bucket untouched (no partial consume) and
-        # estimate when ``cost`` tokens will have refilled. When
-        # ``refill_per_s`` is 0 (degenerate units_per_min<=0 config) the
-        # bucket never refills, so there's no meaningful retry time → None.
-        deficit = cost - bucket.tokens
-        retry_after_s = deficit / refill_per_s if refill_per_s > 0 else None
+        # estimate when ``cost`` tokens will have refilled.
+        #
+        # Codex review (1a) P3 → handled here: when ``cost > burst`` the
+        # request can NEVER be satisfied — the bucket caps at ``burst``, so
+        # no amount of waiting reaches ``cost``. Return ``retry_after_s=None``
+        # (indeterminate) rather than a finite-but-false estimate. Relevant
+        # to 1b TPM where ``cost`` is a token count that can exceed burst.
+        # Also None when ``refill_per_s == 0`` (degenerate units_per_min<=0).
+        if cost > burst or refill_per_s <= 0:
+            retry_after_s = None
+        else:
+            deficit = cost - bucket.tokens
+            retry_after_s = deficit / refill_per_s
         return RateDecision(
             allowed=False,
             retry_after_s=retry_after_s,

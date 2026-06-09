@@ -19,7 +19,12 @@ from gateway.errors import GatewayError, InvalidRequestError
 from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.middleware.rate_limit import RateLimitMiddleware
-from gateway.ratelimit import InMemoryTokenBucketLimiter, RateLimiter
+from gateway.ratelimit import (
+    InMemoryQuotaStore,
+    InMemoryTokenBucketLimiter,
+    QuotaStore,
+    RateLimiter,
+)
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import chat as chat_router
 from gateway.routers import datasets as datasets_router
@@ -58,6 +63,7 @@ def create_app(
     *,
     registry: CustomerRegistry | None = None,
     rate_limiter: RateLimiter | None = None,
+    quota_store: QuotaStore | None = None,
 ) -> FastAPI:
     """Application factory used by ``uvicorn`` and tests.
 
@@ -68,6 +74,9 @@ def create_app(
         rate_limiter: optional pre-built limiter (tests inject one with a
             controllable clock or a recording fake; production builds the
             default in-memory token bucket).
+        quota_store: optional pre-built node-admission store (tests inject to
+            assert pre-charge/refund; production builds the in-memory one
+            sized to ``settings.node_token_budget``).
     """
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -82,6 +91,20 @@ def create_app(
         client_factory=factory,
         ttl_s=settings.app_cache_ttl_s,
         gc_interval_s=settings.app_cache_gc_interval_s,
+        # Bound generation on auto-built Apps so the node-budget admission
+        # reservation is a true upper bound (PR #8 1b). Only injected when
+        # rate limiting is enabled — a disabled limiter shouldn't silently
+        # cap generation length.
+        default_max_output_tokens=(
+            settings.default_max_output_tokens if settings.rate_limit_enabled else 0
+        ),
+        # Same gating for RAG retrieval cap: when rate limiting is on, cap
+        # Dify ``dataset_configs.top_k`` so the reservation's RAG allowance
+        # (top_k * chunk_tokens) bounds the retrieved context for real, not
+        # just on paper (codex 1b review-5 P2).
+        retrieval_top_k=(
+            settings.default_kb_top_k if settings.rate_limit_enabled else None
+        ),
     )
 
     @asynccontextmanager
@@ -124,6 +147,9 @@ def create_app(
     )
 
     rate_limiter = rate_limiter or InMemoryTokenBucketLimiter()
+    quota_store = quota_store or InMemoryQuotaStore(
+        node_token_budget=settings.node_token_budget
+    )
 
     app.state.settings = settings
     app.state.registry = registry
@@ -131,6 +157,7 @@ def create_app(
     app.state.dify_client_factory = factory
     app.state.dify_clients = dify_clients
     app.state.rate_limiter = rate_limiter
+    app.state.quota_store = quota_store
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):

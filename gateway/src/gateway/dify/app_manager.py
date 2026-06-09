@@ -39,6 +39,7 @@ import structlog
 from gateway.dify.client import ConsoleSession, DifyClient
 from gateway.dify.dsl import DSL_VERSION, build_chat_app_dsl
 from gateway.errors import DifyUpstreamError, UnknownModelError
+from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry, CustomerRegistry, ModelEntry
 
 logger = structlog.get_logger(__name__)
@@ -102,12 +103,27 @@ class AppManager:
         client_factory: ClientFactory,
         ttl_s: int,
         gc_interval_s: int,
+        default_max_output_tokens: int = 0,
+        retrieval_top_k: int | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._registry = registry
         self._client_factory = client_factory
         self._ttl_s = ttl_s
         self._gc_interval_s = gc_interval_s
+        # When > 0, auto-built Apps get this as ``max_tokens`` if the model's
+        # completion_params doesn't specify one — so generation is bounded
+        # and the node-budget admission reservation (which uses the same
+        # value) is a true upper bound (PR #8 / codex 1b review-2 P2-2).
+        # 0 = don't inject (preserve prior behaviour; used by tests that
+        # construct AppManager directly).
+        self._default_max_output_tokens = default_max_output_tokens
+        # When set, auto-built Apps with attached KBs cap Dify retrieval at
+        # this many chunks (``dataset_configs.top_k``) — so the admission
+        # reservation's RAG allowance (top_k * chunk_tokens) is the real
+        # upper bound, not a guess (PR #8 / codex 1b review-5 P2). None =
+        # don't inject (Dify default top_k=4 applies).
+        self._retrieval_top_k = retrieval_top_k
         self._clock = clock
 
         self._apps: dict[tuple[str, str], CachedApp] = {}
@@ -234,13 +250,29 @@ class AppManager:
         from gateway.mode import isolation_strategy_for
         strategy = isolation_strategy_for(customer)
         app_label = strategy.app_name(customer.customer_id, model.id)
+        # Bound generation: if the model didn't configure a *valid* max_tokens
+        # (positive int), inject the gateway default so the App can't generate
+        # unbounded output on a shared finite edge GPU — and so the admission
+        # reservation (which uses the same effective_max_tokens rule) is a true
+        # upper bound. Using effective_max_tokens (not a bare key check) closes
+        # codex 1b review-3 P2-2: ``max_tokens: null`` / 0 / non-int would
+        # otherwise leave the App unbounded while the reservation assumed a
+        # bound. Operators set a positive completion_params.max_tokens to allow
+        # longer outputs.
+        completion_params = dict(model.completion_params)
+        if (
+            self._default_max_output_tokens > 0
+            and effective_max_tokens(completion_params) is None
+        ):
+            completion_params["max_tokens"] = self._default_max_output_tokens
         dsl = build_chat_app_dsl(
             name=f"auto:{app_label}",
             description=f"Auto-built by AI SDK Gateway for customer={customer.customer_id} model={model.id}",
             provider=model.provider,
             model_name=model.name,
-            completion_params=model.completion_params,
+            completion_params=completion_params,
             knowledge_base_ids=customer.knowledge_bases,
+            retrieval_top_k=self._retrieval_top_k,
         )
 
         # Login (or refresh) → import → key

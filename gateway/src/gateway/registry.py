@@ -246,6 +246,18 @@ class CustomerEntry(BaseModel):
             "to disable limiting wholesale instead)."
         ),
     )
+    tpm_limit: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Per-customer tokens-per-minute override (PR #8 / Phase 1b). "
+            "None means use the gateway-wide ``default_tpm`` (which is 0 = "
+            "unlimited by default, since the node_token_budget admission "
+            "gate is the primary OOM guard). Set a positive value here to "
+            "cap a specific tenant's sustained token throughput. Must be "
+            "positive when set, same rationale as rpm_limit."
+        ),
+    )
 
     @field_validator("models")
     @classmethod

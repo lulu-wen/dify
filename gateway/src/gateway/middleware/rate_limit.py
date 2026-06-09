@@ -28,6 +28,7 @@ from gateway.config import Settings
 from gateway.errors import RateLimitError
 from gateway.middleware.auth import EXEMPT_PATHS
 from gateway.ratelimit.protocols import RateLimiter
+from gateway.ratelimit.retry import jittered_retry_after
 from gateway.ratelimit.types import ActionCode, RateDecision
 
 
@@ -48,9 +49,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     sets the bucket capacity. When ``settings.rate_limit_enabled`` is False
     the middleware is a pass-through.
 
-    ``jitter`` adds a random 0-1s to ``Retry-After`` to avoid a synchronized
-    retry storm (every rejected client retrying at the same instant re-syncs
-    the load spike). Injectable so tests can pin it to 0.
+    ``Retry-After`` gets 0-1s of jitter (via the shared
+    :func:`~gateway.ratelimit.retry.jittered_retry_after`) to avoid a
+    synchronized retry storm. ``rng`` is injectable so tests can pin it.
     """
 
     def __init__(  # type: ignore[no-untyped-def]
@@ -59,12 +60,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         limiter: RateLimiter,
         settings: Settings,
-        jitter: Callable[[], float] | None = None,
+        rng: Callable[[float, float], float] = random.uniform,
     ) -> None:
         super().__init__(app)
         self._limiter = limiter
         self._settings = settings
-        self._jitter = jitter if jitter is not None else (lambda: random.uniform(0.0, 1.0))
+        self._rng = rng
 
     async def dispatch(
         self,
@@ -94,7 +95,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
         if not decision.allowed:
-            retry_after = (decision.retry_after_s or 0.0) + self._jitter()
+            retry_after = jittered_retry_after(decision.retry_after_s, rng=self._rng)
             exc = RateLimitError(
                 f"rate limit exceeded: {rpm} requests/min for customer "
                 f"'{customer.customer_id}'",
