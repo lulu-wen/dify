@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -86,6 +87,21 @@ class FakeDifyClient:
         # Set to an exception instance to simulate a pre-flight failure
         # (e.g. Dify returns 5xx before any chunk is sent).
         self.streaming_pre_flight_error: BaseException | None = None
+        # PR #10: sleep N seconds between SSE lines. Default 0 = back-to-back
+        # yields (legacy behaviour). Used by streaming tests that need an
+        # ordering window between events.
+        self.streaming_inter_line_delay_s: float = 0.0
+        # PR #10: raise this exception from the SSE generator AFTER yielding
+        # the first N lines, simulating an upstream Dify/vLLM connection
+        # drop mid-stream. Triggers the same chat-router cancel path as a
+        # real client disconnect (both reach the streaming finally with
+        # ``cancel_sink["dify_finalized"]==False``). Default None = no
+        # synthetic error. We test the cancel path this way instead of via
+        # client-side disconnect because httpx ASGITransport buffers the
+        # full response — breaking out of ``aiter_lines`` doesn't actually
+        # propagate ``http.disconnect`` to the Starlette generator.
+        self.streaming_raise_after_n_lines: int | None = None
+        self.streaming_raise_exception: BaseException | None = None
         self.console_session = ConsoleSession(access_token="acc-1", csrf_token="csrf-1")
         self.import_app_ids = ["app-id-1", "app-id-2", "app-id-3"]
         self.api_key_tokens = ["app-key-1", "app-key-2", "app-key-3"]
@@ -132,9 +148,18 @@ class FakeDifyClient:
         self.dataset_error: BaseException | None = None
         self.file_error: BaseException | None = None
 
+        # PR #10: chat_messages_stop is fire-and-forget; tests assert it was
+        # (or wasn't) dispatched. ``chat_messages_stop_event`` lets tests
+        # await dispatch deterministically so they don't race the
+        # background asyncio.create_task. ``chat_messages_stop_delay_s`` lets
+        # tests prove settle doesn't block on the cancel POST.
+        self.chat_messages_stop_event: asyncio.Event = asyncio.Event()
+        self.chat_messages_stop_delay_s: float = 0.0
+
         self.calls: dict[str, list[Any]] = {
             "blocking": [],
             "streaming": [],
+            "stop": [],
             "login": [],
             "import": [],
             "api_key": [],
@@ -153,6 +178,15 @@ class FakeDifyClient:
         self.calls["blocking"].append(kwargs)
         return self.blocking_response
 
+    async def chat_messages_stop(self, **kwargs: Any) -> None:
+        # PR #10: best-effort cancel. Record the call (so tests can assert
+        # task_id + user were forwarded), optionally sleep (so tests can
+        # prove settle doesn't await this), then signal completion.
+        self.calls["stop"].append(kwargs)
+        if self.chat_messages_stop_delay_s > 0:
+            await asyncio.sleep(self.chat_messages_stop_delay_s)
+        self.chat_messages_stop_event.set()
+
     @asynccontextmanager
     async def open_chat_stream(self, **kwargs: Any) -> AsyncIterator[AsyncIterator[str]]:
         self.calls["streaming"].append(kwargs)
@@ -161,8 +195,16 @@ class FakeDifyClient:
             raise self.streaming_pre_flight_error
 
         async def gen() -> AsyncIterator[str]:
-            for line in self.streaming_lines:
+            for idx, line in enumerate(self.streaming_lines):
                 yield line
+                if self.streaming_inter_line_delay_s > 0:
+                    await asyncio.sleep(self.streaming_inter_line_delay_s)
+                if (
+                    self.streaming_raise_after_n_lines is not None
+                    and self.streaming_raise_exception is not None
+                    and idx + 1 >= self.streaming_raise_after_n_lines
+                ):
+                    raise self.streaming_raise_exception
 
         yield gen()
 

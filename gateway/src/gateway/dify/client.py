@@ -255,6 +255,51 @@ class DifyClient:
         finally:
             await cm.__aexit__(None, None, None)
 
+    async def chat_messages_stop(
+        self,
+        *,
+        app_key: str,
+        task_id: str,
+        user: str,
+    ) -> None:
+        """Best-effort cancel of a streaming generation (PR #10).
+
+        Dify exposes ``POST /v1/chat-messages/{task_id}/stop`` to halt an
+        in-flight generation; Dify propagates the cancel to vLLM, freeing
+        KV cache immediately rather than waiting for natural completion.
+
+        Designed for **fire-and-forget** use from the streaming finally
+        when the client disconnects: once there's no receiver, every
+        further generated token is pure waste regardless of node load.
+        Errors are SWALLOWED here (logged, not raised) so the caller can
+        ``await`` this without wrapping — the calling path is already
+        racing against shutdown / settle and re-raising would convert
+        normal upstream churn (404 if Dify already finalized the task,
+        timeout if the network is unhappy) into spurious failures.
+        """
+        try:
+            resp = await self._http.post(
+                f"/v1/chat-messages/{task_id}/stop",
+                headers=_bearer(app_key),
+                json={"user": user},
+            )
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            logger.warning(
+                "dify.chat_messages_stop.transport_error",
+                task_id=task_id,
+                error=str(e),
+            )
+            return
+        if not resp.is_success:
+            # 404 is the common case when the task already finalized
+            # between our last SSE event and our stop call — expected,
+            # log at info, don't raise.
+            logger.info(
+                "dify.chat_messages_stop.non_success",
+                task_id=task_id,
+                status_code=resp.status_code,
+            )
+
     # ------------------------------------------------------------------ #
     # Service API: Datasets (knowledge base CRUD)                        #
     # ------------------------------------------------------------------ #
