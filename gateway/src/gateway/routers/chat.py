@@ -213,6 +213,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         input_chars=_messages_chars(body.messages),
         max_output_tokens=effective_max_tokens(model_entry.completion_params),
         model_id=selected_model,
+        # RAG customers get an extra allowance for Dify-injected retrieval
+        # context — see codex 1b review-5 P2. AppManager caps Dify's actual
+        # top_k to the matching value, so the allowance is a real bound.
+        has_knowledge_bases=bool(customer.knowledge_bases),
     )
     grant = admit(request, customer, cost)
     try:

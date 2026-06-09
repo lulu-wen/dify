@@ -98,6 +98,13 @@ def create_app(
         default_max_output_tokens=(
             settings.default_max_output_tokens if settings.rate_limit_enabled else 0
         ),
+        # Same gating for RAG retrieval cap: when rate limiting is on, cap
+        # Dify ``dataset_configs.top_k`` so the reservation's RAG allowance
+        # (top_k * chunk_tokens) bounds the retrieved context for real, not
+        # just on paper (codex 1b review-5 P2).
+        retrieval_top_k=(
+            settings.default_kb_top_k if settings.rate_limit_enabled else None
+        ),
     )
 
     @asynccontextmanager

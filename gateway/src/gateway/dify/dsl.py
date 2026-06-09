@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-DSL_VERSION = "v4-output-cap"
+DSL_VERSION = "v5-rag-top-k-cap"
 """Bump when ``build_chat_app_dsl`` output changes in a way that requires
 existing cached Apps to be rebuilt. :class:`AppManager` records this on each
 :class:`CachedApp` and forces a rebuild when the constant disagrees with the
@@ -41,6 +41,7 @@ def build_chat_app_dsl(
     model_name: str,
     completion_params: dict[str, Any] | None = None,
     knowledge_base_ids: list[str] | None = None,
+    retrieval_top_k: int | None = None,
 ) -> str:
     """Render a Dify ``chat`` mode App into YAML.
 
@@ -54,6 +55,12 @@ def build_chat_app_dsl(
         completion_params: Per-request defaults (``temperature``, ``max_tokens``,
             etc.). Empty dict if omitted.
         knowledge_base_ids: Dify Dataset IDs to attach. Empty list if omitted.
+        retrieval_top_k: Max chunks Dify retrieves per chat request (set as
+            ``dataset_configs.top_k`` in multiple-retrieval mode). Only
+            emitted when KBs are attached. Caps RAG-injected context so the
+            admission reservation (which adds ``top_k * chunk_tokens``) is a
+            true upper bound, not a guess (codex 1b review-5 P2). None = use
+            Dify's default (4).
 
     Returns:
         UTF-8 YAML string suitable for ``yaml-content`` import.
@@ -98,10 +105,7 @@ def build_chat_app_dsl(
                     }
                 }
             ],
-            "dataset_configs": {
-                "retrieval_model": "multiple",
-                "datasets": {"datasets": datasets_block},
-            },
+            "dataset_configs": _build_dataset_configs(datasets_block, retrieval_top_k),
             # The following keys are not strictly required by every Dify version
             # but are emitted to keep the import deterministic across versions.
             "opening_statement": "",
@@ -115,3 +119,26 @@ def build_chat_app_dsl(
     }
 
     return yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+
+
+def _build_dataset_configs(
+    datasets_block: list[dict[str, Any]],
+    retrieval_top_k: int | None,
+) -> dict[str, Any]:
+    """Compose Dify's ``dataset_configs`` block.
+
+    Always emits ``retrieval_model: multiple`` + the dataset list (an empty
+    list when no KBs are attached). When KBs ARE attached and a
+    ``retrieval_top_k`` is supplied, emits ``top_k`` so Dify retrieves at
+    most that many chunks — bounding RAG-injected context to match what the
+    gateway's admission reservation accounts for (codex 1b review-5 P2).
+    See ``api/core/app/app_config/easy_ui_based_app/dataset/manager.py``:
+    Dify reads ``dataset_configs.top_k`` (default 4) in multiple mode.
+    """
+    cfg: dict[str, Any] = {
+        "retrieval_model": "multiple",
+        "datasets": {"datasets": datasets_block},
+    }
+    if datasets_block and retrieval_top_k is not None:
+        cfg["top_k"] = retrieval_top_k
+    return cfg

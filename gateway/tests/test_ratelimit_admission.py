@@ -664,3 +664,142 @@ class TestReview4Fixes:
                 json={"model": "nope", "messages": [{"role": "user", "content": "Hi"}]},
             )
         assert r.status_code == 404
+
+
+class TestReview5Fixes:
+    @pytest.mark.asyncio
+    async def test_rag_customer_reservation_includes_kb_allowance(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """Codex 1b review-5 P2: a customer with attached KBs has Dify inject
+        retrieval chunks into the prompt before vLLM sees it. The reservation
+        must add a RAG allowance for those chunks, else a short query over a
+        large KB can under-reserve and exceed the node budget the OOM guard
+        is meant to enforce.
+
+        With default_kb_top_k=3 and default_kb_chunk_tokens=1000, a RAG
+        customer's reservation = input + max_out + 3000 RAG. A non-RAG
+        customer's reservation = input + max_out. We pick a node_token_budget
+        that admits the non-RAG cost but rejects the RAG cost — proves the
+        allowance is actually applied.
+        """
+        # Non-RAG customer: m1, no KBs. cost = 0 input + 1024 max_out = 1024.
+        non_rag = make_customer(
+            sdk_key="bsa_norag", customer_id="norag", model_ids=("m1",)
+        )
+        # RAG customer: same model but with KBs attached → cost adds
+        # 3 * 1000 = 3000 RAG allowance → total 4024.
+        rag = make_customer(
+            sdk_key="bsa_rag", customer_id="rag", model_ids=("m1",),
+            knowledge_bases=["ds-uuid-1"],
+        )
+        registry = CustomerRegistry.from_entries([non_rag, rag])
+
+        # Budget that fits non-RAG (1024) but not RAG (4024).
+        settings = Settings(
+            registry_path="unused.yaml", log_json=False,
+            node_token_budget=2000,
+            default_kb_top_k=3,
+            default_kb_chunk_tokens=1000,
+        )
+        app = create_app(settings=settings, registry=registry)
+        app.state.dify_client_factory = lambda _: fake_dify
+        app.state.app_manager._client_factory = lambda _: fake_dify
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+
+        async with _client(app) as cli:
+            # Non-RAG customer → admitted (1024 <= 2000).
+            r1 = await cli.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer bsa_norag"},
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            # RAG customer → rejected (4024 > 2000).
+            r2 = await cli.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer bsa_rag"},
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+
+        assert r1.status_code == 200
+        assert r2.status_code == 503, (
+            "RAG customer admitted under a budget that should have rejected "
+            "them once the kb allowance is included (codex 1b review-5 P2)"
+        )
+        assert r2.json()["error"]["action"] == ActionCode.REJECTED_OVERLOAD
+
+    @pytest.mark.asyncio
+    async def test_autobuilt_app_caps_dify_retrieval_top_k(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """The reservation's RAG allowance is only a real bound if Dify
+        actually retrieves at most ``default_kb_top_k`` chunks. AppManager
+        must inject ``dataset_configs.top_k`` into the DSL when KBs are
+        attached."""
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        customer = make_customer(model_ids=("m1",), knowledge_bases=["ds-uuid-1"])
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(
+            registry_path="unused.yaml", log_json=False,
+            default_kb_top_k=2,   # custom value to assert it's plumbed through
+        )
+        app = create_app(settings=settings, registry=registry)
+        app.state.dify_client_factory = lambda _: fake_dify
+        app.state.app_manager._client_factory = lambda _: fake_dify
+
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+        _, yaml_content = fake_dify.calls["import"][-1]
+        dsl = yaml.safe_load(yaml_content)
+        cfg = dsl["model_config"]["dataset_configs"]
+        assert cfg["top_k"] == 2, f"Dify retrieval not capped — got {cfg}"
+
+    @pytest.mark.asyncio
+    async def test_no_kb_omits_top_k_in_dsl(self, fake_dify: FakeDifyClient) -> None:
+        """A customer without KBs should NOT carry a top_k in the DSL —
+        no retrieval means no cap to enforce, and emitting one would just be
+        noise. The reservation also skips the allowance for non-RAG."""
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        app = _build_app(fake_dify, default_kb_top_k=3)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 200
+        _, yaml_content = fake_dify.calls["import"][-1]
+        dsl = yaml.safe_load(yaml_content)
+        cfg = dsl["model_config"]["dataset_configs"]
+        assert "top_k" not in cfg, f"top_k emitted with no KBs — got {cfg}"
+        # Reservation also unchanged: in_flight back to 0 after blocking call.
+        assert app.state.quota_store.in_flight == 0
+
+    def test_estimate_cost_adds_rag_allowance(self) -> None:
+        """Unit: rag_allowance_tokens flows into token_cost."""
+        c_no_rag = estimate_cost(input_chars=40, max_output_tokens=100, model_id="m")
+        c_rag = estimate_cost(
+            input_chars=40, max_output_tokens=100, model_id="m",
+            rag_allowance_tokens=3000,
+        )
+        assert c_rag.token_cost == c_no_rag.token_cost + 3000
+        # Negative clamped (defensive).
+        c_neg = estimate_cost(
+            input_chars=40, max_output_tokens=100, model_id="m",
+            rag_allowance_tokens=-5,
+        )
+        assert c_neg.token_cost == c_no_rag.token_cost

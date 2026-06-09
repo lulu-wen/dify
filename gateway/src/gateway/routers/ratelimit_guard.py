@@ -33,12 +33,19 @@ def estimate_request_cost(
     input_chars: int,
     max_output_tokens: int | None,
     model_id: str,
+    has_knowledge_bases: bool = False,
 ) -> RequestCost:
     """Estimate cost, filling a config fallback when max_output is unset.
 
     A client omitting ``max_tokens`` would otherwise leave the pre-charge
     unbounded; we substitute ``settings.default_max_output_tokens`` (an
     estimation-only cap — it doesn't change what's sent to Dify/vLLM).
+
+    When ``has_knowledge_bases`` is True, add a RAG allowance of
+    ``default_kb_top_k * default_kb_chunk_tokens`` to cover the chunks Dify
+    injects into the prompt at retrieval time. AppManager caps Dify's
+    actual ``dataset_configs.top_k`` to the same value, so this allowance is
+    a real upper bound, not a guess (codex 1b review-5 P2).
     """
     settings = request.app.state.settings
     effective_max = (
@@ -46,10 +53,16 @@ def estimate_request_cost(
         if max_output_tokens is not None and max_output_tokens > 0
         else settings.default_max_output_tokens
     )
+    rag_allowance = (
+        settings.default_kb_top_k * settings.default_kb_chunk_tokens
+        if has_knowledge_bases
+        else 0
+    )
     return estimate_cost(
         input_chars=input_chars,
         max_output_tokens=effective_max,
         model_id=model_id,
+        rag_allowance_tokens=rag_allowance,
     )
 
 

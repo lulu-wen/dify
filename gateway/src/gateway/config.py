@@ -157,3 +157,28 @@ class Settings(BaseSettings):
             "Dify/vLLM for."
         ),
     )
+    default_kb_top_k: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Max number of retrieval chunks Dify injects per chat request "
+            "for customers with knowledge bases attached. Set as "
+            "``dataset_configs.top_k`` in the auto-built App DSL — so this "
+            "is the REAL upper bound on retrieved context, not an estimate. "
+            "The admission reservation uses the same value to account for "
+            "RAG-injected tokens (codex 1b review-5 P2)."
+        ),
+    )
+    default_kb_chunk_tokens: int = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Conservative upper bound on tokens per retrieval chunk. The "
+            "admission reservation adds ``default_kb_top_k * "
+            "default_kb_chunk_tokens`` when a customer has KBs attached. "
+            "Tune to your Dify ``indexing_technique`` chunk-size setting; "
+            "the default suits Dify's high-quality chunking (~500-1000 "
+            "tokens). Estimation knob only; Dify chunk size is set at "
+            "indexing time."
+        ),
+    )

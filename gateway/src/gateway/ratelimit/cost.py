@@ -57,6 +57,7 @@ def estimate_cost(
     input_chars: int,
     max_output_tokens: int,
     model_id: str,
+    rag_allowance_tokens: int = 0,
 ) -> RequestCost:
     """Estimate the token cost of one request.
 
@@ -65,9 +66,22 @@ def estimate_cost(
     input text). ``max_output_tokens`` is the worst-case generation length;
     callers pass a configured fallback when the client omits it, and 0 for
     requests that don't generate (embeddings).
+
+    ``rag_allowance_tokens`` is the worst-case RAG-injected context: Dify
+    expands the user message with retrieved chunks before calling the LLM,
+    so the actual prompt seen by vLLM = caller input + RAG chunks. Without
+    accounting for this, a short query over a large KB would under-reserve
+    and the node-budget OOM guard wouldn't actually bound KV usage. The
+    caller computes ``top_k * chunk_tokens`` and passes it iff the customer
+    has KBs attached. 0 (default) for non-RAG paths (embeddings, chat
+    without KBs). See codex 1b review-5 P2.
     """
     input_tokens = max(0, input_chars) // _CHARS_PER_TOKEN
-    token_cost = input_tokens + max(0, max_output_tokens)
+    token_cost = (
+        input_tokens
+        + max(0, max_output_tokens)
+        + max(0, rag_allowance_tokens)
+    )
     return RequestCost(
         input_tokens=input_tokens,
         max_output_tokens=max(0, max_output_tokens),

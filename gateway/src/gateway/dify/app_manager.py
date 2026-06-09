@@ -104,6 +104,7 @@ class AppManager:
         ttl_s: int,
         gc_interval_s: int,
         default_max_output_tokens: int = 0,
+        retrieval_top_k: int | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._registry = registry
@@ -117,6 +118,12 @@ class AppManager:
         # 0 = don't inject (preserve prior behaviour; used by tests that
         # construct AppManager directly).
         self._default_max_output_tokens = default_max_output_tokens
+        # When set, auto-built Apps with attached KBs cap Dify retrieval at
+        # this many chunks (``dataset_configs.top_k``) — so the admission
+        # reservation's RAG allowance (top_k * chunk_tokens) is the real
+        # upper bound, not a guess (PR #8 / codex 1b review-5 P2). None =
+        # don't inject (Dify default top_k=4 applies).
+        self._retrieval_top_k = retrieval_top_k
         self._clock = clock
 
         self._apps: dict[tuple[str, str], CachedApp] = {}
@@ -265,6 +272,7 @@ class AppManager:
             model_name=model.name,
             completion_params=completion_params,
             knowledge_base_ids=customer.knowledge_bases,
+            retrieval_top_k=self._retrieval_top_k,
         )
 
         # Login (or refresh) → import → key
