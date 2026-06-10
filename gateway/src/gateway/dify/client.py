@@ -278,10 +278,19 @@ class DifyClient:
         timeout if the network is unhappy) into spurious failures.
         """
         try:
+            # Tight timeout: this is a fire-and-forget best-effort call —
+            # ``_bg_cancel_tasks`` in the chat router holds a reference to
+            # the in-flight task until completion. Under a disconnect
+            # burst with an unhealthy Dify, a generous timeout would
+            # let the task set grow unbounded (N_disconnects x
+            # response_time). 2s is enough for a healthy Dify to ack the
+            # stop; a failed quick cancel is acceptable — Dify finalizes
+            # the abandoned task on its own. PR #10 self-review-3 #3.
             resp = await self._http.post(
                 f"/v1/chat-messages/{task_id}/stop",
                 headers=_bearer(app_key),
                 json={"user": user},
+                timeout=httpx.Timeout(2.0),
             )
         except (httpx.TimeoutException, httpx.RequestError) as e:
             logger.warning(

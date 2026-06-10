@@ -22,12 +22,26 @@ def jittered_retry_after(
     base_seconds: float | None,
     *,
     rng: Callable[[float, float], float] = random.uniform,
-) -> float:
-    """Return ``base_seconds`` plus 0-1s of jitter (min 0).
+) -> float | None:
+    """Return ``base_seconds`` plus 0-1s of jitter, or None when input is None.
 
-    ``base_seconds`` is the limiter's estimate (may be None when the wait is
-    indeterminate — treated as 0, so the caller still gets a small jittered
-    floor rather than nothing). ``rng`` is injectable so tests can pin it.
+    ``base_seconds`` is the limiter's estimate. ``None`` is the limiter's
+    signal that the request is structurally unsatisfiable (``cost > burst``,
+    or ``refill_per_s <= 0``) — no amount of waiting can satisfy it, so we
+    must NOT emit a finite ``Retry-After`` (lures standard SDKs into
+    retrying the same request forever — codex PR #10 self-review-2 P2).
+    Pass None through unchanged; callers raise an error with
+    ``retry_after_s=None`` and the exception handler omits the header.
+
+    Callers wanting a "default backoff with jitter" semantics (e.g.,
+    admission overload where retrying after a small delay is sensible)
+    must pass ``0.0`` explicitly — relying on None to mean "small jittered
+    delay" buries the unsatisfiable signal.
+
+    Negative or zero ``base_seconds`` is floored to 0 (jitter only).
+    ``rng`` is injectable so tests can pin it.
     """
-    base = base_seconds if base_seconds is not None and base_seconds > 0 else 0.0
+    if base_seconds is None:
+        return None
+    base = base_seconds if base_seconds > 0 else 0.0
     return base + rng(0.0, 1.0)

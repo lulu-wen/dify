@@ -128,8 +128,18 @@ class TestJitter:
     def test_adds_base_plus_jitter(self) -> None:
         assert jittered_retry_after(5.0, rng=lambda a, b: 0.5) == 5.5
 
-    def test_none_base_is_just_jitter(self) -> None:
-        assert jittered_retry_after(None, rng=lambda a, b: 0.7) == 0.7
+    def test_none_input_returns_none(self) -> None:
+        # PR #10 self-review-3 #1: None is the limiter's "structurally
+        # unsatisfiable" signal — must propagate unchanged so the
+        # exception handler omits Retry-After. Callers wanting a default
+        # backoff pass 0.0 explicitly.
+        assert jittered_retry_after(None, rng=lambda a, b: 0.7) is None
+
+    def test_zero_base_is_just_jitter(self) -> None:
+        # Default-backoff use case: admit() passes 0.0 to get a small
+        # jittered delay without confusing it with the "unsatisfiable"
+        # None signal.
+        assert jittered_retry_after(0.0, rng=lambda a, b: 0.7) == 0.7
 
     def test_nonpositive_base_floored(self) -> None:
         assert jittered_retry_after(-3.0, rng=lambda a, b: 0.2) == 0.2

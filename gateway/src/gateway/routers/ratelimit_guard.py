@@ -88,24 +88,16 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
         cost=float(cost.token_cost),
     )
     if not decision.allowed:
-        # ``decision.retry_after_s is None`` is the limiter's signal that
-        # waiting can NEVER make this request fit — ``cost > burst``, the
-        # bucket is structurally too small for it. Jittering None into a
-        # finite Retry-After would lure standard SDKs into retrying the
-        # same unsatisfiable request forever. Pass None through so the
-        # exception handler omits Retry-After entirely; the
-        # REDUCE_MAX_TOKENS action code is the client's only real recovery
-        # path. PR #10 self-review-2 P2.
-        retry_after_s = (
-            jittered_retry_after(decision.retry_after_s)
-            if decision.retry_after_s is not None
-            else None
-        )
+        # ``jittered_retry_after`` returns None when the limiter signals
+        # structurally unsatisfiable (``cost > burst``) so the exception
+        # handler omits the ``Retry-After`` header — REDUCE_MAX_TOKENS is
+        # the client's only recovery (PR #10 self-review-2 P2, deepened
+        # to the helper in self-review-3 #1).
         raise RateLimitError(
             f"token rate limit exceeded: {tpm} tokens/min for customer "
             f"'{customer.customer_id}' (this request ~{cost.token_cost} tokens)",
             action=ActionCode.REDUCE_MAX_TOKENS,
-            retry_after_s=retry_after_s,
+            retry_after_s=jittered_retry_after(decision.retry_after_s),
         )
 
 
@@ -123,11 +115,16 @@ def admit(request: Request, customer: CustomerEntry, cost: RequestCost) -> Admis
     quota_store = request.app.state.quota_store
     grant: AdmissionGrant = quota_store.try_admit(tenant=customer.customer_id, cost=cost)
     if not grant.admitted:
+        # Overload is recoverable in seconds (other in-flight requests
+        # complete and free the budget) — give the client a small
+        # jittered backoff. Pass 0.0 explicitly: ``jittered_retry_after``
+        # now treats None as "unsatisfiable, omit Retry-After", which is
+        # not what we want here (PR #10 self-review-3 #1).
         raise OverloadError(
             f"node at capacity: admitting ~{cost.token_cost} tokens would "
             f"exceed the node budget. Retry shortly.",
             action=grant.action,
-            retry_after_s=jittered_retry_after(None),
+            retry_after_s=jittered_retry_after(0.0),
         )
     return grant
 

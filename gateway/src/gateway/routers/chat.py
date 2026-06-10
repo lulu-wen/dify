@@ -26,13 +26,19 @@ import json
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any
 
+import httpx
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
-from gateway.errors import InvalidRequestError, UnknownModelError
+from gateway.errors import (
+    DifyTimeoutError,
+    DifyUpstreamError,
+    InvalidRequestError,
+    UnknownModelError,
+)
 from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry
 from gateway.routers.ratelimit_guard import (
@@ -304,18 +310,30 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                         cancel_sink=cancel_sink,
                     ):
                         yield chunk
-                except Exception as exc:
-                    # Upstream error mid-stream (DifyUpstreamError /
-                    # DifyTimeoutError / network drop). The response
-                    # headers were already flushed when ``open_chat_stream``
-                    # succeeded, so we can NOT propagate this to the
-                    # exception handler ("response already started" crash).
-                    # Log + emit a terminal ``[DONE]`` so the client sees a
-                    # clean stream end. The outer finally still runs the
-                    # PR #10 cancel decision against ``cancel_sink`` (which
-                    # reflects exactly how far Dify got before the drop —
-                    # task_id captured, dify_finalized still False → cancel
-                    # fires for the abandoned upstream task).
+                except (
+                    DifyUpstreamError,
+                    DifyTimeoutError,
+                    httpx.RequestError,
+                ) as exc:
+                    # Upstream error mid-stream (Dify 5xx, Dify timeout,
+                    # transport drop). The response headers were already
+                    # flushed when ``open_chat_stream`` succeeded, so we
+                    # can NOT propagate this to the exception handler
+                    # ("response already started" crash). Log + emit a
+                    # terminal ``[DONE]`` so the client sees a clean stream
+                    # end. The outer finally still runs the PR #10 cancel
+                    # decision against ``cancel_sink`` (task_id captured,
+                    # dify_finalized still False → cancel fires for the
+                    # abandoned upstream task).
+                    #
+                    # PR #10 self-review-3 #2: narrowed from
+                    # ``except Exception``. Programming errors
+                    # (TypeError/AttributeError/KeyError) from the
+                    # converter SHOULD propagate — they hit the global
+                    # exception handler (still crashes the request
+                    # because headers were flushed, but logs at ERROR
+                    # and surfaces in tests rather than being silently
+                    # downgraded to "log + clean end").
                     logger.warning(
                         "chat.stream_upstream_error",
                         request_id=request_id,
