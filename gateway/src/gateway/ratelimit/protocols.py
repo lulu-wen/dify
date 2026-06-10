@@ -69,8 +69,12 @@ class QuotaStore(Protocol):
     unknown id is a no-op), which keeps the streaming + pre-flight-failure
     paths safe.
 
-    Synchronous for the same reason as :class:`RateLimiter`: pure
-    arithmetic, atomic across coroutines on one event loop without a lock.
+    The admit/settle path is synchronous for the same reason as
+    :class:`RateLimiter`: pure arithmetic, atomic across coroutines on one
+    event loop without a lock. ``set_budget`` is async because it's
+    written by a different actor (the headroom polling task) and the
+    in-memory impl wraps the write in an ``asyncio.Lock`` to future-proof
+    multi-field extensions.
     """
 
     def try_admit(self, *, tenant: str, cost: RequestCost) -> AdmissionGrant:
@@ -84,5 +88,19 @@ class QuotaStore(Protocol):
         amount is the full pre-charged ``token_cost`` (the request is done,
         so its entire reservation frees up regardless of how much it
         actually generated).
+        """
+        ...
+
+    @property
+    def budget(self) -> int:
+        """Current effective budget. Used by the headroom polling task."""
+        ...
+
+    async def set_budget(self, new_budget: int) -> None:
+        """Update the effective budget atomically (PR #9 / Phase 2a).
+
+        Called by the background headroom task on each poll. Negative
+        values must be floored to 0. Existing in-flight reservations are
+        unaffected — only future ``try_admit`` calls see the new value.
         """
         ...

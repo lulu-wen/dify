@@ -25,7 +25,6 @@ from gateway.config import Settings
 from gateway.ratelimit.headroom import EwmaHeadroomCalculator, HeadroomConfig
 from gateway.ratelimit.quota import InMemoryQuotaStore
 from gateway.ratelimit.runtime_metrics import (
-    MockRuntimeMetrics,
     RuntimeSnapshot,
     VLLMPrometheusMetrics,
     _parse_prometheus,
@@ -33,7 +32,7 @@ from gateway.ratelimit.runtime_metrics import (
 )
 from gateway.ratelimit.types import RequestCost
 from gateway.registry import CustomerRegistry
-from tests.conftest import FakeDifyClient, make_customer
+from tests.conftest import FakeDifyClient, MockRuntimeMetrics, make_customer
 
 # --------------------------------------------------------------------------- #
 # Headroom math
@@ -112,6 +111,21 @@ class TestHeadroomConfigValidation:
                 HeadroomConfig(soft_threshold=0.8, hard_threshold=0.95, ewma_alpha=1.5)
             )
 
+    def test_settings_cross_field_validator_catches_swapped_env_vars(self) -> None:
+        """PR #9 review-1 #9: an operator that types soft=0.95, hard=0.90
+        used to get a deep ValueError from EwmaHeadroomCalculator at
+        create_app time, pointing at the calculator (not the env var).
+        Settings.model_validator now catches it at config load with
+        both env var names quoted so the failure is actionable.
+        """
+        with pytest.raises(ValueError, match="GATEWAY_HEADROOM_SOFT_THRESHOLD"):
+            Settings(
+                registry_path="unused.yaml",
+                log_json=False,
+                headroom_soft_threshold=0.95,
+                headroom_hard_threshold=0.90,
+            )
+
 
 # --------------------------------------------------------------------------- #
 # Prometheus parser
@@ -149,6 +163,31 @@ class TestPrometheusParser:
     def test_malformed_line_ignored_not_raised(self) -> None:
         parsed = _parse_prometheus("garbage_no_number\nvalid 1.5")
         assert parsed == {"valid": 1.5}
+
+    def test_negative_exponent_matches(self) -> None:
+        # PR #9 review-1 #1: Prometheus value regex had [0-9.eE+] which
+        # silently dropped 1.0e-4 (the minus after `e` wasn't in the
+        # class). Pin the fix so a future refactor doesn't regress.
+        parsed = _parse_prometheus("vllm:foo 1.0e-4\nvllm:bar -2.5e+3")
+        assert parsed["vllm:foo"] == pytest.approx(1.0e-4)
+        assert parsed["vllm:bar"] == pytest.approx(-2500.0)
+
+    def test_allowlist_skips_unwanted(self) -> None:
+        # PR #9 review-1 #4: vLLM /metrics emits hundreds of histogram-
+        # bucket lines per scrape. The allowlist must drop them BEFORE
+        # the regex runs. Use a payload where an unwanted metric uses a
+        # syntax that WOULD match if the regex ran (so we know the
+        # allowlist actually short-circuited it).
+        payload = (
+            "vllm:gpu_cache_usage_perc 0.5\n"
+            "vllm:other_metric 99.9\n"
+            "vllm:time_to_first_token_seconds_bucket{le=\"0.1\"} 12\n"
+        )
+        parsed = _parse_prometheus(payload, names=frozenset({"vllm:gpu_cache_usage_perc"}))
+        assert parsed == {"vllm:gpu_cache_usage_perc": 0.5}
+        # Sanity check the negative case: no allowlist → all valid lines parsed.
+        parsed_all = _parse_prometheus(payload)
+        assert "vllm:other_metric" in parsed_all
 
 
 class TestVLLMPrometheusMetricsTransport:
@@ -232,6 +271,50 @@ class TestQuotaStoreSetBudget:
 # --------------------------------------------------------------------------- #
 # Polling loop fail-open
 # --------------------------------------------------------------------------- #
+
+
+class TestPollLoopEagerFetch:
+    @pytest.mark.asyncio
+    async def test_first_fetch_is_eager_not_sleep_first(self) -> None:
+        """PR #9 review-1 #7: previously the loop slept poll_s BEFORE the
+        first fetch — for a 30s poll interval the gateway ran on the
+        static budget for the entire first 30s window. Now the first
+        snapshot lands immediately so headroom is authoritative from t=0.
+        We pin this by using a poll interval much longer than the test
+        sleep; if the loop still slept first, call_count would be 0.
+        """
+        store = InMemoryQuotaStore(node_token_budget=1000)
+        calc = EwmaHeadroomCalculator(
+            HeadroomConfig(soft_threshold=0.8, hard_threshold=0.95, ewma_alpha=1.0)
+        )
+        metrics = MockRuntimeMetrics(
+            initial=RuntimeSnapshot(
+                gpu_cache_usage_perc=0.875,  # midpoint → factor 0.5
+                num_requests_running=0,
+                num_requests_waiting=0,
+            )
+        )
+
+        task = asyncio.create_task(
+            run_metrics_poll_loop(
+                metrics=metrics,
+                calculator=calc,
+                quota_store=store,
+                static_budget=1000,
+                poll_interval_s=10.0,  # long: would lock budget at 1000 if sleep-first
+            )
+        )
+        # Tiny wait — far less than poll_interval_s. With eager-fetch,
+        # the first snapshot must already have applied.
+        await asyncio.sleep(0.05)
+        assert metrics.call_count == 1
+        assert store.budget == 500  # 1000 * 0.5 factor at midpoint usage
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 class TestPollLoopFailOpen:

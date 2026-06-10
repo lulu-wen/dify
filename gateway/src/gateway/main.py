@@ -120,23 +120,31 @@ def create_app(
         ),
     )
 
-    # PR #9: build the headroom calculator + metrics source up-front so
-    # lifespan can wire the polling task. Source is either operator-injected
-    # (tests pass MockRuntimeMetrics), production-built from settings, or
-    # None when the feature is disabled (lifespan skips the loop).
+    # PR #9: pick the metrics source. Explicit precedence (review-1 #10):
+    #   1. Test injection wins outright — ``runtime_metrics`` arg given.
+    #   2. Otherwise honour the production setting.
+    #   3. Otherwise the feature is off and we don't build the calculator.
+    # The old ``settings.enabled OR param is not None`` masked an
+    # ambiguous third case (settings off + param given) — kept the loop
+    # running silently against operator intent. Now param explicitly
+    # overrides settings (documented for tests) and the bare-settings
+    # path is the production-only branch.
     headroom_calc: EwmaHeadroomCalculator | None = None
     metrics_source: RuntimeMetrics | None = None
-    if settings.runtime_metrics_enabled or runtime_metrics is not None:
+    if runtime_metrics is not None:
+        metrics_source = runtime_metrics
+    elif settings.runtime_metrics_enabled:
+        metrics_source = VLLMPrometheusMetrics(
+            url=settings.runtime_metrics_url,
+            timeout_s=settings.runtime_metrics_timeout_s,
+        )
+    if metrics_source is not None:
         headroom_calc = EwmaHeadroomCalculator(
             HeadroomConfig(
                 soft_threshold=settings.headroom_soft_threshold,
                 hard_threshold=settings.headroom_hard_threshold,
                 ewma_alpha=settings.headroom_ewma_alpha,
             )
-        )
-        metrics_source = runtime_metrics or VLLMPrometheusMetrics(
-            url=settings.runtime_metrics_url,
-            timeout_s=min(settings.runtime_metrics_poll_s, 2.0),
         )
 
     @asynccontextmanager
@@ -166,35 +174,36 @@ def create_app(
                 strict=settings.strict_startup,
             )
             # PR #9: start the headroom polling task AFTER startup checks
-            # pass. The store on app.state must be an InMemoryQuotaStore
-            # (set_budget is in-memory-specific) — for Redis-backed quota
-            # stores Phase 4 will need a different polling sink.
+            # pass. set_budget is on the QuotaStore Protocol (PR #9
+            # review-1 #3) — any conforming impl participates, so this no
+            # longer isinstance-gates the store.
             if metrics_source is not None and headroom_calc is not None:
-                live_store = app_instance.state.quota_store
-                if isinstance(live_store, InMemoryQuotaStore):
-                    metrics_task = asyncio.create_task(
-                        run_metrics_poll_loop(
-                            metrics=metrics_source,
-                            calculator=headroom_calc,
-                            quota_store=live_store,
-                            static_budget=settings.node_token_budget,
-                            poll_interval_s=settings.runtime_metrics_poll_s,
-                        ),
-                        name="runtime-metrics-poll",
-                    )
-                else:
-                    logger.warning(
-                        "runtime_metrics.unsupported_store",
-                        store=type(live_store).__name__,
-                    )
+                metrics_task = asyncio.create_task(
+                    run_metrics_poll_loop(
+                        metrics=metrics_source,
+                        calculator=headroom_calc,
+                        quota_store=app_instance.state.quota_store,
+                        static_budget=settings.node_token_budget,
+                        poll_interval_s=settings.runtime_metrics_poll_s,
+                    ),
+                    name="runtime-metrics-poll",
+                )
             yield
         finally:
             if metrics_task is not None:
                 metrics_task.cancel()
                 try:
                     await metrics_task
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception:
+                    # PR #9 review-1 #6: don't bury a real bug at shutdown.
+                    # The polling loop's inner ``except Exception`` is the
+                    # designed fail-open swallow point; reaching here means
+                    # something escaped it (BaseException-ish, or a bug in
+                    # the loop's own teardown). Log so it shows up post-
+                    # mortem rather than being silently discarded.
+                    logger.exception("runtime_metrics.task_failed_at_shutdown")
             if isinstance(metrics_source, VLLMPrometheusMetrics):
                 await metrics_source.aclose()
             await app_manager.stop()

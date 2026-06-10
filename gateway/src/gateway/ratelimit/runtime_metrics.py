@@ -42,7 +42,7 @@ import httpx
 import structlog
 
 from gateway.ratelimit.headroom import EwmaHeadroomCalculator
-from gateway.ratelimit.quota import InMemoryQuotaStore
+from gateway.ratelimit.protocols import QuotaStore
 
 logger = structlog.get_logger(__name__)
 
@@ -74,26 +74,46 @@ class RuntimeMetrics(Protocol):
 # Match a Prometheus metric line:
 #   metric_name 0.42
 #   metric_name{label="x"} 0.42
+#   metric_name 1.0e-4         (PR #9 review-1 #1: scientific notation with
+#                                negative exponent must match; the previous
+#                                ``[0-9.eE+]`` class dropped the minus)
 # Leading whitespace and trailing comments are tolerated. We ignore HELP /
 # TYPE / EOF lines naturally because they don't match.
 _METRIC_LINE = re.compile(
-    r"^\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(-?[0-9.eE+]+)\s*$"
+    r"^\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+]?[0-9.eE+\-]+)\s*$"
 )
 
 
-def _parse_prometheus(text: str) -> dict[str, float]:
+def _parse_prometheus(text: str, names: frozenset[str] | None = None) -> dict[str, float]:
     """Scrape scalar metrics from a Prometheus text payload.
 
     Returns the LAST seen value per metric name. vLLM emits one line per
     label-set; for the scalar gauges we care about there's only one line,
     so "last wins" is safe. Histogram buckets share their base name with a
     ``_bucket`` suffix and are NOT collected here (parser stays cheap).
+
+    ``names`` is an optional allowlist of metric names; when given, lines
+    whose name (the prefix before ``{`` or whitespace) is not in the set
+    are skipped before the regex runs. vLLM /metrics emits hundreds of
+    histogram-bucket lines per scrape and we only consume 3 scalars, so
+    the allowlist drops ~99% of regex work (PR #9 review-1 #4).
     """
     out: dict[str, float] = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if names is not None:
+            # Cheap name prefix check before regex: split on first '{' or
+            # whitespace, compare to the allowlist. ``startswith`` over a
+            # ``frozenset`` is O(1) per name, but allows mid-string false
+            # positives (vllm:foo_bucket startswith vllm:foo); explicit
+            # name parse avoids those.
+            i = 0
+            while i < len(line) and line[i] not in " \t{":
+                i += 1
+            if line[:i] not in names:
+                continue
         m = _METRIC_LINE.match(line)
         if not m:
             continue
@@ -103,6 +123,18 @@ def _parse_prometheus(text: str) -> dict[str, float]:
         except ValueError:
             continue
     return out
+
+
+# The three scalar gauges PR #9 admission uses. Passed to ``_parse_prometheus``
+# in production so we skip the histogram-bucket lines that dominate a vLLM
+# payload (PR #9 review-1 #4).
+_VLLM_WANTED: frozenset[str] = frozenset(
+    {
+        "vllm:gpu_cache_usage_perc",
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+    }
+)
 
 
 class VLLMPrometheusMetrics:
@@ -131,7 +163,7 @@ class VLLMPrometheusMetrics:
         """
         resp = await self._http.get(self._url, timeout=httpx.Timeout(self._timeout_s))
         resp.raise_for_status()
-        parsed = _parse_prometheus(resp.text)
+        parsed = _parse_prometheus(resp.text, names=_VLLM_WANTED)
         # Default missing fields to 0 — better than rejecting the snapshot
         # if vLLM transiently omits a series during model swap.
         return RuntimeSnapshot(
@@ -145,31 +177,6 @@ class VLLMPrometheusMetrics:
             await self._http.aclose()
 
 
-class MockRuntimeMetrics:
-    """Test-only implementation. Set ``.snapshot_value`` to control output.
-
-    Use ``.fail_with`` to inject a ``RequestError`` on the next call (used
-    by fail-open integration tests). ``.call_count`` lets tests assert the
-    background loop polled the expected number of times.
-    """
-
-    def __init__(self, initial: RuntimeSnapshot | None = None) -> None:
-        self.snapshot_value: RuntimeSnapshot = initial or RuntimeSnapshot(
-            gpu_cache_usage_perc=0.0,
-            num_requests_running=0,
-            num_requests_waiting=0,
-        )
-        self.fail_with: BaseException | None = None
-        self.call_count: int = 0
-
-    async def snapshot(self) -> RuntimeSnapshot:
-        self.call_count += 1
-        if self.fail_with is not None:
-            err, self.fail_with = self.fail_with, None
-            raise err
-        return self.snapshot_value
-
-
 # ---------------------------------------------------------------------- #
 # Polling loop                                                             #
 # ---------------------------------------------------------------------- #
@@ -179,25 +186,29 @@ async def run_metrics_poll_loop(
     *,
     metrics: RuntimeMetrics,
     calculator: EwmaHeadroomCalculator,
-    quota_store: InMemoryQuotaStore,
+    quota_store: QuotaStore,
     static_budget: int,
     poll_interval_s: float,
 ) -> None:
     """Background poll loop. Cancelled by lifespan on shutdown.
 
     Each iteration:
-    1. ``await asyncio.sleep(poll_interval_s)`` — sleep BEFORE the fetch so
-       the first fetch happens one interval after startup (gives vLLM time
-       to come up; an immediate fetch against a not-yet-ready endpoint
-       would trigger fail-open on the very first poll and log noise).
-    2. ``metrics.snapshot()`` — short-timeout HTTP GET (2s in production).
-    3. ``calculator.update(snapshot.gpu_cache_usage_perc)`` — EWMA + factor.
-    4. ``quota_store.set_budget(int(static_budget * factor))`` — atomic
-       update under the store's write lock.
+    1. ``metrics.snapshot()`` — short-timeout HTTP GET.
+    2. ``calculator.update(snapshot.gpu_cache_usage_perc)`` — EWMA + factor.
+    3. ``quota_store.set_budget(int(static_budget * factor))`` — atomic.
+    4. ``await asyncio.sleep(poll_interval_s)`` — sleep AFTER the fetch so
+       the very first poll lands immediately at startup (PR #9 review-1
+       #7). With sleep-first the operator opting into headroom-driven
+       admission would still get the static budget for the full first
+       poll interval — fine at 2s, but actively harmful when an operator
+       picks a longer interval to cut vLLM scrape load. Fetch-then-sleep
+       keeps the static budget only for the eager-fetch's own duration.
 
     Fail-open: any exception inside the loop body (other than
-    ``asyncio.CancelledError`` from shutdown) is caught, logged at warning,
-    and the loop continues. The previous budget value stays in effect.
+    ``asyncio.CancelledError`` from shutdown) is caught, logged at
+    warning, and the loop continues. The previous budget value stays in
+    effect — an unhealthy vLLM at startup just means we keep the static
+    budget until /metrics comes online, never crashes the gateway.
     """
     logger.info(
         "runtime_metrics.poll_start",
@@ -206,7 +217,6 @@ async def run_metrics_poll_loop(
     )
     try:
         while True:
-            await asyncio.sleep(poll_interval_s)
             try:
                 snap = await metrics.snapshot()
                 factor = calculator.update(snap.gpu_cache_usage_perc)
@@ -230,6 +240,7 @@ async def run_metrics_poll_loop(
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
+            await asyncio.sleep(poll_interval_s)
     except asyncio.CancelledError:
         logger.info("runtime_metrics.poll_stop")
         raise

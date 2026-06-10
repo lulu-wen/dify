@@ -6,7 +6,7 @@ once at startup (see ``main.py``) and injected into the FastAPI app state.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -214,6 +214,18 @@ class Settings(BaseSettings):
             "CPU; higher values let a spike commit OOM before we react."
         ),
     )
+    runtime_metrics_timeout_s: float = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "HTTP timeout for each /metrics fetch. Decoupled from "
+            "``runtime_metrics_poll_s`` so an operator picking a "
+            "sub-second poll (high-frequency monitoring) doesn't get a "
+            "matching sub-second timeout that fails on every jitter "
+            "spike (PR #9 review-1 #8). Tune separately when the vLLM "
+            "scrape regularly exceeds the default."
+        ),
+    )
     headroom_soft_threshold: float = Field(
         default=0.80,
         ge=0.0,
@@ -249,3 +261,25 @@ class Settings(BaseSettings):
             "respond)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_headroom_thresholds(self) -> Settings:
+        """Cross-field invariant: soft must be strictly below hard.
+
+        Each Field has its own range check (lt=1.0 on soft, le=1.0 on
+        hard) but neither sees the other. Without this validator an
+        operator that swaps the two env vars would only get a ValueError
+        at ``create_app`` time deep inside ``EwmaHeadroomCalculator``,
+        pointing at the calculator rather than at the bad env var.
+        Catching it on Settings construction surfaces the failure with
+        both knob names quoted, at the right altitude (PR #9 review-1
+        #9).
+        """
+        if self.headroom_soft_threshold >= self.headroom_hard_threshold:
+            raise ValueError(
+                "GATEWAY_HEADROOM_SOFT_THRESHOLD "
+                f"({self.headroom_soft_threshold}) must be strictly less "
+                "than GATEWAY_HEADROOM_HARD_THRESHOLD "
+                f"({self.headroom_hard_threshold})"
+            )
+        return self
