@@ -88,11 +88,24 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
         cost=float(cost.token_cost),
     )
     if not decision.allowed:
+        # ``decision.retry_after_s is None`` is the limiter's signal that
+        # waiting can NEVER make this request fit — ``cost > burst``, the
+        # bucket is structurally too small for it. Jittering None into a
+        # finite Retry-After would lure standard SDKs into retrying the
+        # same unsatisfiable request forever. Pass None through so the
+        # exception handler omits Retry-After entirely; the
+        # REDUCE_MAX_TOKENS action code is the client's only real recovery
+        # path. PR #10 self-review-2 P2.
+        retry_after_s = (
+            jittered_retry_after(decision.retry_after_s)
+            if decision.retry_after_s is not None
+            else None
+        )
         raise RateLimitError(
             f"token rate limit exceeded: {tpm} tokens/min for customer "
             f"'{customer.customer_id}' (this request ~{cost.token_cost} tokens)",
             action=ActionCode.REDUCE_MAX_TOKENS,
-            retry_after_s=jittered_retry_after(decision.retry_after_s),
+            retry_after_s=retry_after_s,
         )
 
 

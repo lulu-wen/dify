@@ -262,6 +262,19 @@ class TestChatTpm:
         assert body["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
         # TPM rejected BEFORE admission → no reservation held.
         assert app.state.quota_store.in_flight == 0
+        # PR #10 self-review-2 P2: the limiter signalled "unsatisfiable"
+        # (cost > burst) by returning ``retry_after_s=None``. The 429
+        # response must NOT carry a ``Retry-After`` header — letting
+        # standard SDKs back off and retry the same request would loop
+        # forever. The REDUCE_MAX_TOKENS action above is the client's
+        # only real recovery path; no jittered finite delay should slip
+        # through.
+        assert "retry-after" not in {k.lower() for k in r.headers}, (
+            f"Retry-After leaked on cost>burst path: {dict(r.headers)}"
+        )
+        assert body["error"].get("retry_after_s") in (None, 0, 0.0), (
+            f"retry_after_s leaked: {body['error']}"
+        )
 
     @pytest.mark.asyncio
     async def test_tpm_unlimited_by_default(self, fake_dify: FakeDifyClient) -> None:

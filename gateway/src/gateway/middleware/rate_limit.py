@@ -95,7 +95,32 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
         if not decision.allowed:
-            retry_after = jittered_retry_after(decision.retry_after_s, rng=self._rng)
+            # ``decision.retry_after_s is None`` is the limiter's signal that
+            # waiting can NEVER satisfy the request — degenerate config
+            # (rpm<=0 with refill_per_s==0) or ``cost>burst``. Jittering
+            # None into a finite value would lure standard SDKs into
+            # retrying a permanently unsatisfiable request. Pass None
+            # through: omit Retry-After and downgrade the advisory action.
+            # RPM almost never hits this branch in healthy config (cost=1
+            # always fits a burst>=1), but matching TPM's behavior keeps
+            # the two limiter call sites consistent and protects against
+            # operator misconfig (PR #10 self-review-2 P2).
+            raw_retry = decision.retry_after_s
+            if raw_retry is None:
+                exc = RateLimitError(
+                    f"rate limit configured non-recoverably for customer "
+                    f"'{customer.customer_id}' (rpm={rpm}). Reduce request "
+                    "rate or contact the operator.",
+                    action=ActionCode.REDUCE_MAX_TOKENS,
+                    retry_after_s=None,
+                )
+                headers = _rate_limit_headers(decision)
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content=exc.to_openai_envelope(),
+                    headers=headers,
+                )
+            retry_after = jittered_retry_after(raw_retry, rng=self._rng)
             exc = RateLimitError(
                 f"rate limit exceeded: {rpm} requests/min for customer "
                 f"'{customer.customer_id}'",
