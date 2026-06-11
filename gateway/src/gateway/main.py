@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -24,6 +25,12 @@ from gateway.ratelimit import (
     InMemoryTokenBucketLimiter,
     QuotaStore,
     RateLimiter,
+)
+from gateway.ratelimit.headroom import EwmaHeadroomCalculator, HeadroomConfig
+from gateway.ratelimit.runtime_metrics import (
+    RuntimeMetrics,
+    VLLMPrometheusMetrics,
+    run_metrics_poll_loop,
 )
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import chat as chat_router
@@ -64,6 +71,7 @@ def create_app(
     registry: CustomerRegistry | None = None,
     rate_limiter: RateLimiter | None = None,
     quota_store: QuotaStore | None = None,
+    runtime_metrics: RuntimeMetrics | None = None,
 ) -> FastAPI:
     """Application factory used by ``uvicorn`` and tests.
 
@@ -77,6 +85,11 @@ def create_app(
         quota_store: optional pre-built node-admission store (tests inject to
             assert pre-charge/refund; production builds the in-memory one
             sized to ``settings.node_token_budget``).
+        runtime_metrics: optional pre-built metrics source (tests inject a
+            :class:`MockRuntimeMetrics`; production builds
+            :class:`VLLMPrometheusMetrics` from ``settings.runtime_metrics_url``
+            when ``settings.runtime_metrics_enabled`` is True). Off by
+            default — Phase 2a (PR #9).
     """
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
@@ -107,9 +120,37 @@ def create_app(
         ),
     )
 
+    # PR #9: pick the metrics source. Explicit precedence (review-1 #10):
+    #   1. Test injection wins outright — ``runtime_metrics`` arg given.
+    #   2. Otherwise honour the production setting.
+    #   3. Otherwise the feature is off and we don't build the calculator.
+    # The old ``settings.enabled OR param is not None`` masked an
+    # ambiguous third case (settings off + param given) — kept the loop
+    # running silently against operator intent. Now param explicitly
+    # overrides settings (documented for tests) and the bare-settings
+    # path is the production-only branch.
+    headroom_calc: EwmaHeadroomCalculator | None = None
+    metrics_source: RuntimeMetrics | None = None
+    if runtime_metrics is not None:
+        metrics_source = runtime_metrics
+    elif settings.runtime_metrics_enabled:
+        metrics_source = VLLMPrometheusMetrics(
+            url=settings.runtime_metrics_url,
+            timeout_s=settings.runtime_metrics_timeout_s,
+        )
+    if metrics_source is not None:
+        headroom_calc = EwmaHeadroomCalculator(
+            HeadroomConfig(
+                soft_threshold=settings.headroom_soft_threshold,
+                hard_threshold=settings.headroom_hard_threshold,
+                ewma_alpha=settings.headroom_ewma_alpha,
+            )
+        )
+
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
+        metrics_task: asyncio.Task[None] | None = None
         try:
             # PR #5: validate registry against real Dify deployments before
             # accepting traffic. Raises RuntimeError (and so aborts uvicorn
@@ -132,8 +173,39 @@ def create_app(
                 active_factory,
                 strict=settings.strict_startup,
             )
+            # PR #9: start the headroom polling task AFTER startup checks
+            # pass. set_budget is on the QuotaStore Protocol (PR #9
+            # review-1 #3) — any conforming impl participates, so this no
+            # longer isinstance-gates the store.
+            if metrics_source is not None and headroom_calc is not None:
+                metrics_task = asyncio.create_task(
+                    run_metrics_poll_loop(
+                        metrics=metrics_source,
+                        calculator=headroom_calc,
+                        quota_store=app_instance.state.quota_store,
+                        static_budget=settings.node_token_budget,
+                        poll_interval_s=settings.runtime_metrics_poll_s,
+                    ),
+                    name="runtime-metrics-poll",
+                )
             yield
         finally:
+            if metrics_task is not None:
+                metrics_task.cancel()
+                try:
+                    await metrics_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # PR #9 review-1 #6: don't bury a real bug at shutdown.
+                    # The polling loop's inner ``except Exception`` is the
+                    # designed fail-open swallow point; reaching here means
+                    # something escaped it (BaseException-ish, or a bug in
+                    # the loop's own teardown). Log so it shows up post-
+                    # mortem rather than being silently discarded.
+                    logger.exception("runtime_metrics.task_failed_at_shutdown")
+            if isinstance(metrics_source, VLLMPrometheusMetrics):
+                await metrics_source.aclose()
             await app_manager.stop()
             for client in dify_clients.values():
                 await client.aclose()
@@ -158,6 +230,8 @@ def create_app(
     app.state.dify_clients = dify_clients
     app.state.rate_limiter = rate_limiter
     app.state.quota_store = quota_store
+    app.state.runtime_metrics = metrics_source
+    app.state.headroom_calculator = headroom_calc
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):

@@ -6,7 +6,7 @@ once at startup (see ``main.py``) and injected into the FastAPI app state.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -182,3 +182,104 @@ class Settings(BaseSettings):
             "indexing time."
         ),
     )
+
+    # ------------------------------------------------------------------ #
+    # PR #9 (Phase 2a): live vLLM metrics + headroom-driven admission     #
+    # ------------------------------------------------------------------ #
+    runtime_metrics_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, a background asyncio task polls "
+            "``runtime_metrics_url`` and scales the effective node budget "
+            "against live ``gpu_cache_usage_perc`` (PR #9 / Phase 2a). "
+            "Off by default — opt-in until operators have run E2E to "
+            "tune thresholds for their Jetson + model combo. When off, "
+            "the static ``node_token_budget`` rules unchanged."
+        ),
+    )
+    runtime_metrics_url: str = Field(
+        default="http://localhost:8000/metrics",
+        description=(
+            "vLLM Prometheus endpoint. Default matches the dev "
+            "docker-compose vLLM port. Must serve Prometheus text format."
+        ),
+    )
+    runtime_metrics_poll_s: float = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "How often to poll vLLM /metrics. 2s balances reactivity to "
+            "edge bursts (LLM inference can fill KV in seconds) against "
+            "vLLM-side cost of serving the scrape. Lower values waste "
+            "CPU; higher values let a spike commit OOM before we react."
+        ),
+    )
+    runtime_metrics_timeout_s: float = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "HTTP timeout for each /metrics fetch. Decoupled from "
+            "``runtime_metrics_poll_s`` so an operator picking a "
+            "sub-second poll (high-frequency monitoring) doesn't get a "
+            "matching sub-second timeout that fails on every jitter "
+            "spike (PR #9 review-1 #8). Tune separately when the vLLM "
+            "scrape regularly exceeds the default."
+        ),
+    )
+    headroom_soft_threshold: float = Field(
+        default=0.80,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "GPU KV-cache fraction at which the effective budget starts "
+            "scaling DOWN. usage <= soft → full budget; soft < usage < "
+            "hard → linear ramp; usage >= hard → 0 budget. 0.80 leaves a "
+            "20-point cushion before reject-all kicks in."
+        ),
+    )
+    headroom_hard_threshold: float = Field(
+        default=0.95,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "GPU KV-cache fraction at which the effective budget is 0 "
+            "(reject all new admits). 5% gap to 1.0 reserves headroom for "
+            "in-flight generations to extend KV as context grows — "
+            "admitting at >95% pushes the next token into OOM or paged "
+            "attention, both of which spike TTFT."
+        ),
+    )
+    headroom_ewma_alpha: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "EWMA smoothing for raw cache_usage readings before scaling. "
+            "alpha=0.3 reaches ~70%% of a step change in 3-4 polls (6-8s at "
+            "2s poll). Higher = more reactive (track bursts faster, but "
+            "noisier); lower = smoother (ignores spikes but slow to "
+            "respond)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_headroom_thresholds(self) -> Settings:
+        """Cross-field invariant: soft must be strictly below hard.
+
+        Each Field has its own range check (lt=1.0 on soft, le=1.0 on
+        hard) but neither sees the other. Without this validator an
+        operator that swaps the two env vars would only get a ValueError
+        at ``create_app`` time deep inside ``EwmaHeadroomCalculator``,
+        pointing at the calculator rather than at the bad env var.
+        Catching it on Settings construction surfaces the failure with
+        both knob names quoted, at the right altitude (PR #9 review-1
+        #9).
+        """
+        if self.headroom_soft_threshold >= self.headroom_hard_threshold:
+            raise ValueError(
+                "GATEWAY_HEADROOM_SOFT_THRESHOLD "
+                f"({self.headroom_soft_threshold}) must be strictly less "
+                "than GATEWAY_HEADROOM_HARD_THRESHOLD "
+                f"({self.headroom_hard_threshold})"
+            )
+        return self
