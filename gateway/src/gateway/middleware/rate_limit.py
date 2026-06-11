@@ -95,18 +95,34 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
         if not decision.allowed:
+            # ``jittered_retry_after`` returns None when the limiter signals
+            # structurally unsatisfiable (degenerate rpm<=0 with
+            # refill_per_s==0, or cost>burst). When None, we surface
+            # REDUCE_MAX_TOKENS so SDKs don't retry forever; when finite,
+            # standard RETRY_AFTER with header (PR #10 self-review-2 P2,
+            # deepened to the helper in self-review-3 #1).
             retry_after = jittered_retry_after(decision.retry_after_s, rng=self._rng)
-            exc = RateLimitError(
-                f"rate limit exceeded: {rpm} requests/min for customer "
-                f"'{customer.customer_id}'",
-                action=ActionCode.RETRY_AFTER,
-                retry_after_s=retry_after,
-            )
-            headers = _rate_limit_headers(decision)
-            # Retry-After mirrors the exception handler's rounding (ceil,
-            # min 1) so middleware-rendered and handler-rendered 429s look
-            # identical to a client.
-            headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+            if retry_after is None:
+                exc = RateLimitError(
+                    f"rate limit configured non-recoverably for customer "
+                    f"'{customer.customer_id}' (rpm={rpm}). Reduce request "
+                    "rate or contact the operator.",
+                    action=ActionCode.REDUCE_MAX_TOKENS,
+                    retry_after_s=None,
+                )
+                headers = _rate_limit_headers(decision)
+            else:
+                exc = RateLimitError(
+                    f"rate limit exceeded: {rpm} requests/min for customer "
+                    f"'{customer.customer_id}'",
+                    action=ActionCode.RETRY_AFTER,
+                    retry_after_s=retry_after,
+                )
+                headers = _rate_limit_headers(decision)
+                # Retry-After mirrors the exception handler's rounding
+                # (ceil, min 1) so middleware-rendered and handler-rendered
+                # 429s look identical to a client.
+                headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
             return JSONResponse(
                 status_code=exc.status_code,
                 content=exc.to_openai_envelope(),

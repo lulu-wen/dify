@@ -128,8 +128,18 @@ class TestJitter:
     def test_adds_base_plus_jitter(self) -> None:
         assert jittered_retry_after(5.0, rng=lambda a, b: 0.5) == 5.5
 
-    def test_none_base_is_just_jitter(self) -> None:
-        assert jittered_retry_after(None, rng=lambda a, b: 0.7) == 0.7
+    def test_none_input_returns_none(self) -> None:
+        # PR #10 self-review-3 #1: None is the limiter's "structurally
+        # unsatisfiable" signal — must propagate unchanged so the
+        # exception handler omits Retry-After. Callers wanting a default
+        # backoff pass 0.0 explicitly.
+        assert jittered_retry_after(None, rng=lambda a, b: 0.7) is None
+
+    def test_zero_base_is_just_jitter(self) -> None:
+        # Default-backoff use case: admit() passes 0.0 to get a small
+        # jittered delay without confusing it with the "unsatisfiable"
+        # None signal.
+        assert jittered_retry_after(0.0, rng=lambda a, b: 0.7) == 0.7
 
     def test_nonpositive_base_floored(self) -> None:
         assert jittered_retry_after(-3.0, rng=lambda a, b: 0.2) == 0.2
@@ -262,6 +272,19 @@ class TestChatTpm:
         assert body["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
         # TPM rejected BEFORE admission → no reservation held.
         assert app.state.quota_store.in_flight == 0
+        # PR #10 self-review-2 P2: the limiter signalled "unsatisfiable"
+        # (cost > burst) by returning ``retry_after_s=None``. The 429
+        # response must NOT carry a ``Retry-After`` header — letting
+        # standard SDKs back off and retry the same request would loop
+        # forever. The REDUCE_MAX_TOKENS action above is the client's
+        # only real recovery path; no jittered finite delay should slip
+        # through.
+        assert "retry-after" not in {k.lower() for k in r.headers}, (
+            f"Retry-After leaked on cost>burst path: {dict(r.headers)}"
+        )
+        assert body["error"].get("retry_after_s") in (None, 0, 0.0), (
+            f"retry_after_s leaked: {body['error']}"
+        )
 
     @pytest.mark.asyncio
     async def test_tpm_unlimited_by_default(self, fake_dify: FakeDifyClient) -> None:
@@ -803,3 +826,38 @@ class TestReview5Fixes:
             rag_allowance_tokens=-5,
         )
         assert c_neg.token_cost == c_no_rag.token_cost
+
+
+class TestReview2PinAdmitRetryAfter:
+    """PR #10 review-2 #4: pin that admit() emits OverloadError with a
+    non-None retry_after_s. The admit path calls jittered_retry_after(0.0)
+    (not None) precisely BECAUSE jittered_retry_after now treats None as
+    'structurally unsatisfiable, omit Retry-After header'. If a future
+    refactor reverts the helper's None semantics, admit() would silently
+    start emitting retry_after_s=None and clients would lose their
+    Retry-After hint without any test catching it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_overload_503_carries_finite_retry_after(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        # node_token_budget=1 forces 503 on the first non-trivial request.
+        app = _build_app(fake_dify, node_token_budget=1)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 503
+        # The Retry-After header MUST be present (non-None retry_after_s).
+        # If the helper's None handling regresses to "small jittered delay",
+        # this stays True (harmless). If admit() ever starts passing None,
+        # this test fails — exactly the regression we want to catch.
+        assert "retry-after" in {k.lower() for k in r.headers}, (
+            "OverloadError must carry a finite Retry-After — admit() relies "
+            "on jittered_retry_after(0.0) for default backoff. If a refactor "
+            "passes None instead, this regression would silently drop the "
+            "header (PR #10 review-2 #4)."
+        )
