@@ -151,8 +151,10 @@ class VLLMPrometheusMetrics:
         # transport-mocked client; production passes the URL only.
         self._url = url
         self._owns_http = http is None
-        self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
-        self._timeout_s = timeout_s
+        # Cache the Timeout object — value is immutable, no reason to
+        # rebuild ~43k objects/day per node (PR #9 review-2 #2).
+        self._timeout = httpx.Timeout(timeout_s)
+        self._http = http or httpx.AsyncClient(timeout=self._timeout)
 
     async def snapshot(self) -> RuntimeSnapshot:
         """Fetch + parse the latest snapshot.
@@ -161,7 +163,7 @@ class VLLMPrometheusMetrics:
         / status problems. The polling loop catches these and triggers
         fail-open behavior (last good budget stays in effect).
         """
-        resp = await self._http.get(self._url, timeout=httpx.Timeout(self._timeout_s))
+        resp = await self._http.get(self._url, timeout=self._timeout)
         resp.raise_for_status()
         parsed = _parse_prometheus(resp.text, names=_VLLM_WANTED)
         # Default missing fields to 0 — better than rejecting the snapshot
