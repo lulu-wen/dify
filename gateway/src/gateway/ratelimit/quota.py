@@ -12,6 +12,7 @@ replace this behind the ``QuotaStore`` protocol when that matters.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from gateway.ratelimit.types import ActionCode, AdmissionGrant, RequestCost
@@ -34,6 +35,16 @@ class InMemoryQuotaStore:
         self._budget = node_token_budget
         self._in_flight = 0
         self._open: dict[str, RequestCost] = {}
+        # PR #9: budget can be retuned by the headroom polling task. The
+        # write side runs at the polling cadence (every 2s) on a background
+        # asyncio task; the read side runs on every admission attempt
+        # (hot path). Pure-asyncio single-loop semantics already guarantee
+        # atomic visibility for the single-attribute writes we do here, but
+        # we hold the lock around set_budget to future-proof against
+        # extensions that update multiple correlated fields. ``try_admit``
+        # stays wait-free (sync, no lock acquire) — the hot path must not
+        # block on a background poll's write.
+        self._budget_lock = asyncio.Lock()
 
     def try_admit(self, *, tenant: str, cost: RequestCost) -> AdmissionGrant:
         # ``tenant`` is accepted for telemetry / a future per-tenant gauge;
@@ -67,3 +78,20 @@ class InMemoryQuotaStore:
     def in_flight(self) -> int:
         """Current reserved token cost (for tests / telemetry)."""
         return self._in_flight
+
+    @property
+    def budget(self) -> int:
+        """Current effective budget (post-headroom scaling, if enabled)."""
+        return self._budget
+
+    async def set_budget(self, new_budget: int) -> None:
+        """Update the effective budget atomically (PR #9 headroom polling).
+
+        Called by the background metrics task each poll. Never lowers the
+        budget below 0. Existing in-flight requests are unaffected — only
+        future ``try_admit`` calls see the new value. If the new budget is
+        below current ``in_flight`` the gauge simply rejects new admits
+        until enough requests settle.
+        """
+        async with self._budget_lock:
+            self._budget = max(0, new_budget)

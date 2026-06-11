@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from gateway.config import Settings
 from gateway.dify.client import ConsoleSession, DifyClient
 from gateway.main import create_app
+from gateway.ratelimit.runtime_metrics import RuntimeSnapshot
 from gateway.registry import (
     CustomerEntry,
     CustomerRegistry,
@@ -19,6 +20,34 @@ from gateway.registry import (
     EmbeddingModelEntry,
     ModelEntry,
 )
+
+
+class MockRuntimeMetrics:
+    """Test double for :class:`gateway.ratelimit.runtime_metrics.RuntimeMetrics`.
+
+    PR #9 review-1 #2: moved out of ``src/gateway/ratelimit/runtime_metrics.py``
+    so production wheels don't ship test scaffolding (mirrors
+    :class:`FakeDifyClient` placement). Set ``.snapshot_value`` to control
+    output; ``.fail_with`` injects a transient exception on the next call
+    (drained after one fire); ``.call_count`` lets tests assert the poll
+    loop polled the expected number of times.
+    """
+
+    def __init__(self, initial: RuntimeSnapshot | None = None) -> None:
+        self.snapshot_value: RuntimeSnapshot = initial or RuntimeSnapshot(
+            gpu_cache_usage_perc=0.0,
+            num_requests_running=0,
+            num_requests_waiting=0,
+        )
+        self.fail_with: BaseException | None = None
+        self.call_count: int = 0
+
+    async def snapshot(self) -> RuntimeSnapshot:
+        self.call_count += 1
+        if self.fail_with is not None:
+            err, self.fail_with = self.fail_with, None
+            raise err
+        return self.snapshot_value
 
 
 def make_customer(
