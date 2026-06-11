@@ -102,6 +102,11 @@ class DifyClient:
     deterministic shutdown; alternatively call :meth:`aclose` explicitly.
     """
 
+    # Cached Timeout for chat_messages_stop fire-and-forget cancels — value
+    # is immutable, no reason to allocate per call. Pairs with PR #9's same
+    # fix on VLLMPrometheusMetrics (self-review-2 #2 sibling sweep).
+    _CANCEL_TIMEOUT: httpx.Timeout = httpx.Timeout(2.0)
+
     def __init__(
         self,
         base_url: str,
@@ -290,7 +295,7 @@ class DifyClient:
                 f"/v1/chat-messages/{task_id}/stop",
                 headers=_bearer(app_key),
                 json={"user": user},
-                timeout=httpx.Timeout(2.0),
+                timeout=self._CANCEL_TIMEOUT,
             )
         except (httpx.TimeoutException, httpx.RequestError) as e:
             logger.warning(

@@ -826,3 +826,38 @@ class TestReview5Fixes:
             rag_allowance_tokens=-5,
         )
         assert c_neg.token_cost == c_no_rag.token_cost
+
+
+class TestReview2PinAdmitRetryAfter:
+    """PR #10 review-2 #4: pin that admit() emits OverloadError with a
+    non-None retry_after_s. The admit path calls jittered_retry_after(0.0)
+    (not None) precisely BECAUSE jittered_retry_after now treats None as
+    'structurally unsatisfiable, omit Retry-After header'. If a future
+    refactor reverts the helper's None semantics, admit() would silently
+    start emitting retry_after_s=None and clients would lose their
+    Retry-After hint without any test catching it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_overload_503_carries_finite_retry_after(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        # node_token_budget=1 forces 503 on the first non-trivial request.
+        app = _build_app(fake_dify, node_token_budget=1)
+        async with _client(app) as cli:
+            r = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r.status_code == 503
+        # The Retry-After header MUST be present (non-None retry_after_s).
+        # If the helper's None handling regresses to "small jittered delay",
+        # this stays True (harmless). If admit() ever starts passing None,
+        # this test fails — exactly the regression we want to catch.
+        assert "retry-after" in {k.lower() for k in r.headers}, (
+            "OverloadError must carry a finite Retry-After — admit() relies "
+            "on jittered_retry_after(0.0) for default backoff. If a refactor "
+            "passes None instead, this regression would silently drop the "
+            "header (PR #10 review-2 #4)."
+        )

@@ -14,6 +14,7 @@ it identically at the point they construct the response/error.
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Callable
 
@@ -39,9 +40,12 @@ def jittered_retry_after(
     delay" buries the unsatisfiable signal.
 
     Negative or zero ``base_seconds`` is floored to 0 (jitter only).
-    ``rng`` is injectable so tests can pin it.
+    Non-finite ``base_seconds`` (NaN / +/-inf) is treated as None —
+    defensive guard against a buggy limiter producing garbage; emitting
+    ``Retry-After: inf`` would crash standard HTTP clients (PR #10
+    review-2 #9). ``rng`` is injectable so tests can pin it.
     """
-    if base_seconds is None:
+    if base_seconds is None or not math.isfinite(base_seconds):
         return None
     base = base_seconds if base_seconds > 0 else 0.0
     return base + rng(0.0, 1.0)

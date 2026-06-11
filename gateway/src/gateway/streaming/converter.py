@@ -99,6 +99,11 @@ async def dify_to_openai_chunks(
     last_event_metadata: dict[str, Any] | None = None
     finish_reason: str = "stop"
     conversation_id: str | None = None
+    # PR #10 review-2 #5: track first task_id capture with a local flag so
+    # the per-event `cancel_sink.get("task_id") is None` lookup short-
+    # circuits after capture instead of running on every SSE event for the
+    # stream's lifetime (10k+ events for long responses).
+    task_id_captured = cancel_sink is None
 
     # Codex review-1 P2: Dify's ``agent_thought`` payload carries the
     # **cumulative** ``thought`` text — re-emitted in full when the agent
@@ -118,10 +123,13 @@ async def dify_to_openai_chunks(
         # we see one — used by the chat router to cancel generation on
         # client disconnect (PR #10). Write-once; ``ping`` events also
         # carry task_id so we typically get this before any answer chunk.
-        if cancel_sink is not None and cancel_sink.get("task_id") is None:
+        # ``task_id_captured`` flag short-circuits this branch after the
+        # first capture (review-2 #5).
+        if not task_id_captured:
             tid = event.get("task_id")
             if isinstance(tid, str) and tid:
-                cancel_sink["task_id"] = tid
+                cancel_sink["task_id"] = tid  # type: ignore[index]
+                task_id_captured = True
 
         event_type = event.get("event")
 
