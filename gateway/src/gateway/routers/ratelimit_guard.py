@@ -100,12 +100,21 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
         # may take a minute to refill).
         retry_after = jittered_retry_after(decision.retry_after_s)
         if retry_after is None:
+            # PR #11 R2 #1 self-bug-fix: original wording said "raise
+            # default_tpm_burst or per-customer tpm_limit". Wrong on two
+            # counts: (a) CustomerEntry has no per-customer burst override
+            # — only ``tpm_limit`` which controls the refill rate, not the
+            # burst capacity — and (b) raising the rate doesn't help when
+            # cost > burst (the token bucket caps at burst regardless of
+            # how fast it refills). Only ``GATEWAY_DEFAULT_TPM_BURST``
+            # actually lifts the cap. Name the env var explicitly and
+            # quote the required value so the operator has an actionable
+            # fix without code-diving.
             message = (
-                f"token budget '{tpm} tokens/min, burst "
-                f"{settings.default_tpm_burst}' cannot satisfy a "
-                f"{cost.token_cost}-token request for customer "
+                f"token budget burst ({settings.default_tpm_burst}) too small "
+                f"for a {cost.token_cost}-token request from customer "
                 f"'{customer.customer_id}'. Operator must raise "
-                "default_tpm_burst or per-customer tpm_limit."
+                f"GATEWAY_DEFAULT_TPM_BURST to >= {cost.token_cost}."
             )
             action = ActionCode.MISCONFIGURED_RATE
         else:

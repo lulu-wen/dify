@@ -287,6 +287,18 @@ class TestChatTpm:
         assert body["error"].get("retry_after_s") in (None, 0, 0.0), (
             f"retry_after_s leaked: {body['error']}"
         )
+        # PR #11 R2-fix: the error message MUST name the actual env var
+        # that lifts the burst cap and MUST NOT advise raising tpm_limit
+        # (which only affects refill rate, not burst). Operators following
+        # the old advice would change the wrong knob and stay stuck.
+        msg = body["error"]["message"]
+        assert "GATEWAY_DEFAULT_TPM_BURST" in msg, (
+            f"error message must name the actionable env var; got: {msg!r}"
+        )
+        assert "tpm_limit" not in msg, (
+            f"error message must NOT advise tpm_limit (wrong knob for cost>burst); "
+            f"got: {msg!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_over_tpm_finite_retry_returns_reduce_max_tokens(
