@@ -6,7 +6,7 @@ once at startup (see ``main.py``) and injected into the FastAPI app state.
 
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -262,24 +262,9 @@ class Settings(BaseSettings):
         ),
     )
 
-    @model_validator(mode="after")
-    def _check_headroom_thresholds(self) -> Settings:
-        """Cross-field invariant: soft must be strictly below hard.
-
-        Each Field has its own range check (lt=1.0 on soft, le=1.0 on
-        hard) but neither sees the other. Without this validator an
-        operator that swaps the two env vars would only get a ValueError
-        at ``create_app`` time deep inside ``EwmaHeadroomCalculator``,
-        pointing at the calculator rather than at the bad env var.
-        Catching it on Settings construction surfaces the failure with
-        both knob names quoted, at the right altitude (PR #9 review-1
-        #9).
-        """
-        if self.headroom_soft_threshold >= self.headroom_hard_threshold:
-            raise ValueError(
-                "GATEWAY_HEADROOM_SOFT_THRESHOLD "
-                f"({self.headroom_soft_threshold}) must be strictly less "
-                "than GATEWAY_HEADROOM_HARD_THRESHOLD "
-                f"({self.headroom_hard_threshold})"
-            )
-        return self
+    # PR #11: cross-field validation moved to
+    # :class:`gateway.ratelimit.headroom.HeadroomConfig.__post_init__`
+    # so EVERY construction path (env load, test fixture, Phase 4 hot-
+    # reload) is covered by one source of truth. ``create_app`` constructs
+    # HeadroomConfig unconditionally at startup so config errors STILL
+    # surface during Lifespan startup, not at first request.

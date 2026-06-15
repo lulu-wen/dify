@@ -21,24 +21,17 @@ Conversation handling:
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator
 from typing import Any
 
-import httpx
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
-from gateway.errors import (
-    DifyTimeoutError,
-    DifyUpstreamError,
-    InvalidRequestError,
-    UnknownModelError,
-)
+from gateway.errors import InvalidRequestError, UnknownModelError
 from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry
 from gateway.routers.ratelimit_guard import (
@@ -57,34 +50,20 @@ from gateway.schemas import (
     Usage,
     make_metadata,
 )
-from gateway.streaming.converter import dify_to_openai_chunks
+from gateway.streaming.converter import CancelSink, dify_to_openai_chunks
+from gateway.streaming.error_safety import graceful_upstream_stream
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
 
-# PR #10: keep references to fire-and-forget cancellation tasks so the GC
-# doesn't drop them before they complete (which would emit "Task was
-# destroyed but it is pending" warnings). The set itself stays bounded —
-# each task self-removes via the done_callback.
-_bg_cancel_tasks: set[asyncio.Task[None]] = set()
-
-
-def _fire_and_forget(coro: Coroutine[Any, Any, None]) -> None:
-    """Schedule a coroutine without awaiting it (PR #10).
-
-    Used in the streaming finally to cancel an in-flight Dify generation
-    when the client has disconnected — the cancel itself MUST NOT block
-    settling the node-budget reservation, and any error inside is the
-    coroutine's own concern (``chat_messages_stop`` swallows + logs).
-    """
-    task = asyncio.create_task(coro)
-    _bg_cancel_tasks.add(task)
-    task.add_done_callback(_bg_cancel_tasks.discard)
-
-
 # ---------- helpers ----------
+#
+# PR #11: PR #10's module-level ``_bg_cancel_tasks`` set +
+# ``_fire_and_forget`` helper moved to
+# :class:`gateway.lifecycle.TaskSupervisor` on ``app.state.task_supervisor``.
+# Streaming finally below dispatches the cancel POST via that.
 
 
 def _last_user_message(messages: list[ChatMessage]) -> str:
@@ -289,82 +268,55 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
             settle(request, grant, actual_output_tokens=0)
             raise
 
-        # PR #10: side-channel to drive best-effort cancellation. ``task_id``
-        # is captured from the first SSE event. ``dify_finalized`` flips to
-        # True when the converter sees ``message_end`` or ``error`` — those
-        # mean Dify already tore down the task, so a stop call would only
-        # produce a 404. We can't infer "Dify finalized" from "async for
-        # exited normally" because GeneratorExit on the outer generator
-        # aclose's the inner generator instead of propagating, so the
-        # ``async for chunk in ...`` loop below would exit cleanly even on
-        # client disconnect — hence this explicit Dify-side flag.
-        cancel_sink: dict[str, Any] = {"task_id": None, "dify_finalized": False}
+        # PR #10: side-channel to drive best-effort cancellation. PR #11
+        # types this as a dataclass instead of a loose dict for mypy
+        # safety. ``task_id`` captured on first SSE event; ``dify_finalized``
+        # flips True on ``message_end``/``error`` — without it we can't tell
+        # "Dify done" from "client disconnect" because GeneratorExit on the
+        # outer generator aclose's the inner one cleanly.
+        cancel_sink = CancelSink()
+        task_supervisor = request.app.state.task_supervisor
 
         async def event_source() -> AsyncIterator[str]:
             try:
-                try:
-                    async for chunk in dify_to_openai_chunks(
+                # PR #11: graceful_upstream_stream wraps the converter so
+                # mid-stream upstream errors (Dify 5xx / timeout / transport
+                # drop) emit a clean ``[DONE]`` instead of crashing
+                # Starlette's "response already started" guard. Programming
+                # errors (TypeError/AttributeError etc.) still propagate —
+                # the wrapper's except clause is narrow on purpose
+                # (PR #10 self-review-3 #2).
+                async for chunk in graceful_upstream_stream(
+                    dify_to_openai_chunks(
                         dify_lines,
                         request_id=request_id,
                         model_id=selected_model,
                         cancel_sink=cancel_sink,
-                    ):
-                        yield chunk
-                except (
-                    DifyUpstreamError,
-                    DifyTimeoutError,
-                    httpx.RequestError,
-                ) as exc:
-                    # Upstream error mid-stream (Dify 5xx, Dify timeout,
-                    # transport drop). The response headers were already
-                    # flushed when ``open_chat_stream`` succeeded, so we
-                    # can NOT propagate this to the exception handler
-                    # ("response already started" crash). Log + emit a
-                    # terminal ``[DONE]`` so the client sees a clean stream
-                    # end. The outer finally still runs the PR #10 cancel
-                    # decision against ``cancel_sink`` (task_id captured,
-                    # dify_finalized still False → cancel fires for the
-                    # abandoned upstream task).
-                    #
-                    # PR #10 self-review-3 #2: narrowed from
-                    # ``except Exception``. Programming errors
-                    # (TypeError/AttributeError/KeyError) from the
-                    # converter SHOULD propagate — they hit the global
-                    # exception handler (still crashes the request
-                    # because headers were flushed, but logs at ERROR
-                    # and surfaces in tests rather than being silently
-                    # downgraded to "log + clean end").
-                    logger.warning(
-                        "chat.stream_upstream_error",
-                        request_id=request_id,
-                        error=str(exc),
-                    )
-                    yield "data: [DONE]\n\n"
+                    ),
+                    request_id=request_id,
+                ):
+                    yield chunk
             finally:
                 # Order matters (codex 1b review-4 P2): close the upstream
-                # FIRST, then release the node-budget reservation. If we
-                # released first, Dify/vLLM could still be holding KV cache
-                # during the (synchronous-from-our-side) close window, and
-                # another admit could exceed the real budget. Nested finally
-                # ensures settle still runs even if close raises — covers
-                # stream end AND client disconnect (GeneratorExit). settle is
-                # idempotent so the pre-flight failure path remains safe.
-                # actual_output_tokens=0: streaming doesn't extract Dify
-                # usage; the full reservation releases regardless (count is
-                # telemetry only — see QuotaStore.settle).
-                # PR #10: fire cancel BEFORE close+settle so the cancel POST
-                # is dispatched as soon as possible. fire-and-forget so the
-                # finally can complete without waiting for an HTTP roundtrip
-                # — settle releases node budget for the next request without
-                # being held hostage by a slow Dify stop call. Skip when
-                # Dify already finalized (message_end/error) to avoid
-                # generating 404 noise under normal load.
-                tid = cancel_sink["task_id"]
-                if tid and not cancel_sink["dify_finalized"]:
-                    _fire_and_forget(
+                # FIRST, then release the node-budget reservation. Cancel
+                # POST is fired-and-forget BEFORE close+settle so the cancel
+                # request is dispatched as soon as possible without holding
+                # settle hostage to a slow Dify stop endpoint. Skip when
+                # Dify already finalized to avoid 404 noise under normal
+                # load. PR #11: cancel dispatched via
+                # ``app.state.task_supervisor`` (was module-level set +
+                # local helper in PR #10).
+                if (
+                    cancel_sink.task_id
+                    and not cancel_sink.dify_finalized
+                ):
+                    task_supervisor.fire_and_forget(
                         dify_client.chat_messages_stop(
-                            app_key=app_key, task_id=tid, user=user
-                        )
+                            app_key=app_key,
+                            task_id=cancel_sink.task_id,
+                            user=user,
+                        ),
+                        name=f"chat_messages_stop:{cancel_sink.task_id[:8]}",
                     )
                 try:
                     # Best-effort close; errors inside cleanup are swallowed

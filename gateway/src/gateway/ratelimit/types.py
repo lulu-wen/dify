@@ -31,6 +31,13 @@ class ActionCode(StrEnum):
     USE_SMALLER_MODEL = "USE_SMALLER_MODEL"
     REJECTED_OVER_QUOTA = "REJECTED_OVER_QUOTA"
     REJECTED_OVERLOAD = "REJECTED_OVERLOAD"
+    # PR #11: operator-misconfiguration signal — limit is structurally
+    # unsatisfiable (``rpm <= 0`` with ``refill_per_s == 0``, or
+    # ``tpm_burst < min_request_token_cost``). Distinct from
+    # ``REDUCE_MAX_TOKENS`` (client problem: request too big, smaller
+    # would pass) so the SDK doesn't backoff-retry a request that can
+    # never succeed regardless of size. See PR #9 R2 #1 + PR #10 R2 #1.
+    MISCONFIGURED_RATE = "MISCONFIGURED_RATE"
 
 
 @dataclass(frozen=True)

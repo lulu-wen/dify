@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterable, AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -37,6 +38,30 @@ import structlog
 from gateway.schemas import ChatChunkChoice, ChatCompletionChunk, DeltaMessage, Reference
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class CancelSink:
+    """Side-channel state from the SSE converter to the chat router's
+    streaming ``finally`` (PR #10, typed by PR #11).
+
+    Two fields populated as the converter consumes Dify events:
+
+    - ``task_id``: first non-empty Dify ``task_id`` seen — the cancel
+      target. ``None`` if no event carried one (no upstream activity).
+    - ``dify_finalized``: True after ``message_end`` OR ``error`` event;
+      means Dify already tore the task down so a stop call would be a
+      redundant 404. The router skips the cancel POST when True.
+
+    Both attributes are mutated in-place by the converter — this is a
+    side-channel by design so the converter stays a plain async iterator
+    (existing callers that don't care about cancellation pass nothing).
+    Replaces the loose ``dict[str, Any]`` shape PR #10 originally used
+    (PR #11 R2 #7: typo-safe via mypy).
+    """
+
+    task_id: str | None = None
+    dify_finalized: bool = False
 
 
 def parse_dify_sse_line(line: str) -> dict[str, Any] | None:
@@ -65,7 +90,7 @@ async def dify_to_openai_chunks(
     *,
     request_id: str,
     model_id: str,
-    cancel_sink: dict[str, Any] | None = None,
+    cancel_sink: CancelSink | None = None,
 ) -> AsyncIterator[str]:
     """Yield OpenAI SSE strings derived from Dify SSE lines.
 
@@ -75,18 +100,18 @@ async def dify_to_openai_chunks(
         request_id: gateway-issued request id (used as ``id`` of every chunk).
         model_id: client-facing model id (echoed in every chunk).
         cancel_sink: when given, populated with two side-channel fields
-            consumed by the chat router's streaming finally (PR #10) to
-            decide whether to fire ``chat_messages_stop``:
-              * ``cancel_sink["task_id"]`` (str|None) — the first non-empty
-                Dify ``task_id`` we saw, used as the cancel target.
-              * ``cancel_sink["dify_finalized"]`` (bool) — True if Dify has
-                emitted ``message_end`` OR ``error`` (i.e. the task already
-                terminated on Dify's side, so cancelling would only produce
-                a 404). Without this signal, the router cannot tell apart
-                "natural completion" from "client disconnect" — the
-                ``async for chunk in ...`` loop exits cleanly in either
-                case because GeneratorExit on the outer generator aclose's
-                the inner generator instead of propagating.
+            consumed by the chat router's streaming finally (PR #10, typed
+            by PR #11) to decide whether to fire ``chat_messages_stop``:
+              * ``cancel_sink.task_id`` — the first non-empty Dify
+                ``task_id`` we saw, used as the cancel target.
+              * ``cancel_sink.dify_finalized`` — True if Dify has emitted
+                ``message_end`` OR ``error`` (Dify-side termination, so
+                cancelling would only produce a 404). Without this signal,
+                the router cannot tell apart "natural completion" from
+                "client disconnect" — the ``async for chunk in ...`` loop
+                exits cleanly in either case because GeneratorExit on the
+                outer generator aclose's the inner generator instead of
+                propagating.
             Side-channel rather than a tuple return so this stays a plain
             async iterator and existing callers (tests, non-cancelling
             paths) don't need to change shape.
@@ -128,7 +153,8 @@ async def dify_to_openai_chunks(
         if not task_id_captured:
             tid = event.get("task_id")
             if isinstance(tid, str) and tid:
-                cancel_sink["task_id"] = tid  # type: ignore[index]
+                assert cancel_sink is not None  # narrow for mypy
+                cancel_sink.task_id = tid
                 task_id_captured = True
 
         event_type = event.get("event")
@@ -203,7 +229,7 @@ async def dify_to_openai_chunks(
             # PR #10: Dify-side termination signal — clearing this flag
             # tells the chat router NOT to fire a redundant stop call.
             if cancel_sink is not None:
-                cancel_sink["dify_finalized"] = True
+                cancel_sink.dify_finalized = True
             # Loop continues; we emit the final chunk after exhausting the stream.
 
         elif event_type == "error":
@@ -218,7 +244,7 @@ async def dify_to_openai_chunks(
             # PR #10: Dify already reported the error and tore down the
             # task — no point in firing a stop call.
             if cancel_sink is not None:
-                cancel_sink["dify_finalized"] = True
+                cancel_sink.dify_finalized = True
             finish_reason = "content_filter"
             break
 

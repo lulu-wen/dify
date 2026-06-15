@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -17,6 +16,7 @@ from gateway.config import Settings
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
 from gateway.errors import GatewayError, InvalidRequestError
+from gateway.lifecycle import TaskSupervisor, safe_shutdown_step
 from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.middleware.rate_limit import RateLimitMiddleware
@@ -120,15 +120,22 @@ def create_app(
         ),
     )
 
+    # PR #11: HeadroomConfig is constructed UNCONDITIONALLY (even if
+    # runtime_metrics is disabled). This validates the config at startup
+    # — bad headroom thresholds in the env raise ValueError here, before
+    # the gateway starts accepting traffic. Replaces the @model_validator
+    # that previously lived on Settings (which only fired for env-loaded
+    # construction, missing test fixtures + Phase 4 hot-reload paths).
+    headroom_config = HeadroomConfig(
+        soft_threshold=settings.headroom_soft_threshold,
+        hard_threshold=settings.headroom_hard_threshold,
+        ewma_alpha=settings.headroom_ewma_alpha,
+    )
+
     # PR #9: pick the metrics source. Explicit precedence (review-1 #10):
     #   1. Test injection wins outright — ``runtime_metrics`` arg given.
     #   2. Otherwise honour the production setting.
     #   3. Otherwise the feature is off and we don't build the calculator.
-    # The old ``settings.enabled OR param is not None`` masked an
-    # ambiguous third case (settings off + param given) — kept the loop
-    # running silently against operator intent. Now param explicitly
-    # overrides settings (documented for tests) and the bare-settings
-    # path is the production-only branch.
     headroom_calc: EwmaHeadroomCalculator | None = None
     metrics_source: RuntimeMetrics | None = None
     if runtime_metrics is not None:
@@ -139,18 +146,18 @@ def create_app(
             timeout_s=settings.runtime_metrics_timeout_s,
         )
     if metrics_source is not None:
-        headroom_calc = EwmaHeadroomCalculator(
-            HeadroomConfig(
-                soft_threshold=settings.headroom_soft_threshold,
-                hard_threshold=settings.headroom_hard_threshold,
-                ewma_alpha=settings.headroom_ewma_alpha,
-            )
-        )
+        headroom_calc = EwmaHeadroomCalculator(headroom_config)
+
+    # PR #11: per-app TaskSupervisor — manages background-task lifecycle
+    # (chat router's fire-and-forget cancel POSTs + the metrics polling
+    # loop). Created here so app.state has it from the moment any request
+    # could arrive; lifespan ``shutdown`` cancels everything with a
+    # deadline + logs escapees.
+    task_supervisor = TaskSupervisor()
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
-        metrics_task: asyncio.Task[None] | None = None
         try:
             # PR #5: validate registry against real Dify deployments before
             # accepting traffic. Raises RuntimeError (and so aborts uvicorn
@@ -162,11 +169,6 @@ def create_app(
             # (see ``conftest.py::app``) replace
             # ``app.state.dify_client_factory`` AFTER ``create_app`` returns
             # so requests hit a FakeDifyClient instead of doing real HTTP.
-            # If lifespan closed over the original factory, lifespan-using
-            # tests would issue real httpx calls against the registry's
-            # ``base_url`` — slow, flaky, and worst of all not actually
-            # testing what production does (production never has a
-            # post-create_app override).
             active_factory = app_instance.state.dify_client_factory
             await run_startup_check(
                 registry,
@@ -174,11 +176,11 @@ def create_app(
                 strict=settings.strict_startup,
             )
             # PR #9: start the headroom polling task AFTER startup checks
-            # pass. set_budget is on the QuotaStore Protocol (PR #9
-            # review-1 #3) — any conforming impl participates, so this no
-            # longer isinstance-gates the store.
+            # pass. PR #11: dispatched through task_supervisor so shutdown
+            # gathers it with the chat router's cancel POSTs in one
+            # bounded await.
             if metrics_source is not None and headroom_calc is not None:
-                metrics_task = asyncio.create_task(
+                task_supervisor.spawn_long_running(
                     run_metrics_poll_loop(
                         metrics=metrics_source,
                         calculator=headroom_calc,
@@ -190,25 +192,22 @@ def create_app(
                 )
             yield
         finally:
-            if metrics_task is not None:
-                metrics_task.cancel()
-                try:
-                    await metrics_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    # PR #9 review-1 #6: don't bury a real bug at shutdown.
-                    # The polling loop's inner ``except Exception`` is the
-                    # designed fail-open swallow point; reaching here means
-                    # something escaped it (BaseException-ish, or a bug in
-                    # the loop's own teardown). Log so it shows up post-
-                    # mortem rather than being silently discarded.
-                    logger.exception("runtime_metrics.task_failed_at_shutdown")
+            # PR #11: every shutdown step goes through ``safe_shutdown_step``
+            # so a bug in any cleanup surfaces via ``logger.exception`` with
+            # the step name (instead of the previous silent
+            # ``except (CancelledError, Exception): pass`` swallow).
+            await safe_shutdown_step(
+                "task_supervisor", task_supervisor.shutdown(deadline_s=5.0)
+            )
             if isinstance(metrics_source, VLLMPrometheusMetrics):
-                await metrics_source.aclose()
-            await app_manager.stop()
-            for client in dify_clients.values():
-                await client.aclose()
+                await safe_shutdown_step(
+                    "metrics_source.aclose", metrics_source.aclose()
+                )
+            await safe_shutdown_step("app_manager.stop", app_manager.stop())
+            for url, client in dify_clients.items():
+                await safe_shutdown_step(
+                    f"dify_client.aclose:{url}", client.aclose()
+                )
             logger.info("gateway.shutdown")
 
     app = FastAPI(
@@ -232,6 +231,7 @@ def create_app(
     app.state.quota_store = quota_store
     app.state.runtime_metrics = metrics_source
     app.state.headroom_calculator = headroom_calc
+    app.state.task_supervisor = task_supervisor
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):

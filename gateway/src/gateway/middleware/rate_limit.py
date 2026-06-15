@@ -97,28 +97,32 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not decision.allowed:
             # ``jittered_retry_after`` returns None when the limiter signals
             # structurally unsatisfiable (degenerate rpm<=0 with
-            # refill_per_s==0, or cost>burst). When None, we surface
-            # REDUCE_MAX_TOKENS so SDKs don't retry forever; when finite,
-            # standard RETRY_AFTER with header (PR #10 self-review-2 P2,
-            # deepened to the helper in self-review-3 #1).
+            # refill_per_s==0, or cost>burst). PR #11 unifies the previous
+            # two-branch response builder into one path:
+            #   * Pre-compute (message, action) from the None/finite split.
+            #   * Build the RateLimitError + JSONResponse ONCE.
+            #   * Conditionally add the Retry-After header.
+            # New ActionCode ``MISCONFIGURED_RATE`` distinguishes the
+            # operator-side "this request can never pass at any size" from
+            # ``REDUCE_MAX_TOKENS`` (client-side "shrink and retry") so SDKs
+            # can stop retrying the misconfigured branch (PR #11 #5).
             retry_after = jittered_retry_after(decision.retry_after_s, rng=self._rng)
             if retry_after is None:
-                exc = RateLimitError(
+                message = (
                     f"rate limit configured non-recoverably for customer "
                     f"'{customer.customer_id}' (rpm={rpm}). Reduce request "
-                    "rate or contact the operator.",
-                    action=ActionCode.REDUCE_MAX_TOKENS,
-                    retry_after_s=None,
+                    "rate or contact the operator."
                 )
-                headers = _rate_limit_headers(decision)
+                action = ActionCode.MISCONFIGURED_RATE
             else:
-                exc = RateLimitError(
+                message = (
                     f"rate limit exceeded: {rpm} requests/min for customer "
-                    f"'{customer.customer_id}'",
-                    action=ActionCode.RETRY_AFTER,
-                    retry_after_s=retry_after,
+                    f"'{customer.customer_id}'"
                 )
-                headers = _rate_limit_headers(decision)
+                action = ActionCode.RETRY_AFTER
+            exc = RateLimitError(message, action=action, retry_after_s=retry_after)
+            headers = _rate_limit_headers(decision)
+            if retry_after is not None:
                 # Retry-After mirrors the exception handler's rounding
                 # (ceil, min 1) so middleware-rendered and handler-rendered
                 # 429s look identical to a client.
