@@ -37,6 +37,7 @@ async def graceful_upstream_stream(
     inner: AsyncIterator[str],
     *,
     request_id: str,
+    log_event: str = "chat.stream_upstream_error",
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to catch upstream errors mid-stream + emit ``[DONE]``.
 
@@ -60,13 +61,19 @@ async def graceful_upstream_stream(
     response was already flushed they'll crash Starlette's
     ``response already started`` guard — which is the correct signal
     for a real bug.
+
+    ``log_event`` is parameterised with the chat-router event key as the
+    default so PR #11's extraction-into-utility doesn't silently break
+    operator dashboards / alerts keyed on ``chat.stream_upstream_error``
+    (PR #11 R2 #2). Phase 3 routers should pass their own key, e.g.
+    ``embeddings.stream_upstream_error``.
     """
     try:
         async for chunk in inner:
             yield chunk
     except (DifyUpstreamError, DifyTimeoutError, httpx.RequestError) as exc:
         logger.warning(
-            "stream.upstream_error",
+            log_event,
             request_id=request_id,
             error=str(exc),
             error_type=type(exc).__name__,

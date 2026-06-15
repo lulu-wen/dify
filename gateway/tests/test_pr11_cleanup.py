@@ -198,6 +198,22 @@ class TestGracefulUpstreamStream:
         with pytest.raises(TypeError, match="inner generator bug"):
             await _wrap(src())
 
+    def test_default_log_event_preserves_pr10_chat_dashboard_key(self) -> None:
+        """PR #11 R2 #2 sibling-sweep observability: graceful_upstream_stream
+        was extracted from chat.py's inline pattern; the log event key
+        MUST remain ``chat.stream_upstream_error`` by default so any
+        operator dashboard / Loki query / Grafana alert keyed on the
+        PR #10 name keeps firing. Phase 3 routers pass their own key.
+        """
+        import inspect
+
+        sig = inspect.signature(graceful_upstream_stream)
+        log_event_param = sig.parameters["log_event"]
+        assert log_event_param.default == "chat.stream_upstream_error", (
+            f"log_event default changed to {log_event_param.default!r}; "
+            "production dashboards keyed on the old name will go blind"
+        )
+
 
 # --------------------------------------------------------------------------- #
 # middleware unified MISCONFIGURED_RATE
