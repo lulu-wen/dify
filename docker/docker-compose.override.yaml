@@ -4,6 +4,59 @@
 
 services:
   # ============================================================
+  # TIER 1: SDK Gateway (FastAPI)
+  # ============================================================
+
+  gateway:
+    build:
+      context: ../gateway
+      dockerfile: Dockerfile
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # registry.yaml lives on the host (NOT committed — contains real SDK
+      # keys + Dify console passwords). Copy registry.example.yaml to
+      # gateway/registry.yaml on first run, fill it in, then compose up.
+      - ../gateway/registry.yaml:/app/registry.yaml:ro
+    environment:
+      GATEWAY_REGISTRY_PATH: /app/registry.yaml
+      # Phase 1a/1b — rate limiting on
+      GATEWAY_RATE_LIMIT_ENABLED: "true"
+      GATEWAY_DEFAULT_RPM: "60"
+      GATEWAY_DEFAULT_RPM_BURST: "120"
+      GATEWAY_DEFAULT_TPM: "0"             # 0 = unlimited; per-customer via registry
+      GATEWAY_DEFAULT_TPM_BURST: "10000"
+      GATEWAY_NODE_TOKEN_BUDGET: "200000"
+      GATEWAY_DEFAULT_MAX_OUTPUT_TOKENS: "1024"
+      GATEWAY_DEFAULT_KB_TOP_K: "3"
+      GATEWAY_DEFAULT_KB_CHUNK_TOKENS: "1000"
+      # Phase 2a — opt-in; flip via .env when vLLM /metrics is live
+      GATEWAY_RUNTIME_METRICS_ENABLED: "${GATEWAY_RUNTIME_METRICS_ENABLED:-false}"
+      GATEWAY_RUNTIME_METRICS_URL: "${GATEWAY_RUNTIME_METRICS_URL:-http://vllm:8000/metrics}"
+      GATEWAY_HEADROOM_SOFT_THRESHOLD: "0.80"
+      GATEWAY_HEADROOM_HARD_THRESHOLD: "0.95"
+      GATEWAY_HEADROOM_EWMA_ALPHA: "0.3"
+      GATEWAY_LOG_JSON: "${GATEWAY_LOG_JSON:-true}"
+      GATEWAY_LOG_LEVEL: "${GATEWAY_LOG_LEVEL:-INFO}"
+    depends_on:
+      api:
+        condition: service_started
+      vllm:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health').raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      tier: edge
+      role: sdk-gateway
+      k8s-kind: Deployment
+
+  # ============================================================
   # TIER 2: RAG Stack
   # ============================================================
   
