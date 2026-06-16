@@ -108,10 +108,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # can stop retrying the misconfigured branch (PR #11 #5).
             retry_after = jittered_retry_after(decision.retry_after_s, rng=self._rng)
             if retry_after is None:
+                # PR #11 R3 sibling-sweep with enforce_tpm: the operator
+                # message must name the exact config knob to turn so the
+                # fix doesn't require code-diving. RPM=None is reachable
+                # only via per-customer ``rpm_limit=0`` in registry.yaml
+                # (Settings constrains ``default_rpm >= 1``); name that
+                # path and quote the env-var fallback so either site is
+                # actionable.
                 message = (
-                    f"rate limit configured non-recoverably for customer "
-                    f"'{customer.customer_id}' (rpm={rpm}). Reduce request "
-                    "rate or contact the operator."
+                    f"rpm limit ({rpm}) for customer '{customer.customer_id}' "
+                    "cannot be satisfied at any retry rate. Operator must "
+                    "set rpm_limit >= 1 in registry.yaml (or unset it to "
+                    f"inherit GATEWAY_DEFAULT_RPM={self._settings.default_rpm}) "
+                    "and restart the gateway."
                 )
                 action = ActionCode.MISCONFIGURED_RATE
             else:

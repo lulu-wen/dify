@@ -290,3 +290,16 @@ class TestMiddlewareUnifiedMisconfiguredRate:
         assert '"action":"MISCONFIGURED_RATE"' in body
         # No Retry-After header — backoff would be pointless
         assert "retry-after" not in {k.lower() for k in resp.headers}
+        # PR #11 R3 sibling-sweep with enforce_tpm: the message must name
+        # the exact knob — registry.yaml's rpm_limit AND the env-var
+        # fallback — so the operator can fix the misconfiguration without
+        # reading source. Without this, the SDK surfaces "non-recoverable"
+        # but the operator has no actionable advice.
+        assert "rpm_limit" in body, (
+            "MISCONFIGURED_RATE message must name registry.yaml's rpm_limit "
+            "(per-customer override) so the operator knows which knob to turn"
+        )
+        assert "GATEWAY_DEFAULT_RPM" in body, (
+            "MISCONFIGURED_RATE message must name the env-var fallback so "
+            "the operator can fix it at the gateway level when rpm_limit is unset"
+        )
