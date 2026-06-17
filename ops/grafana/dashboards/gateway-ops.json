@@ -1,0 +1,234 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Gateway Operations — admission decisions, latency, headroom, streaming lifecycle. Source: PR #12a /metrics. SRE on-call dashboard.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Request rate (per route)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" } } },
+      "options": { "legend": { "showLegend": true, "displayMode": "table", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "sum by (route) (rate(gateway_request_duration_seconds_count[1m]))",
+          "legendFormat": "{{route}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Latency p50 / p95 / p99 (chat)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_request_duration_seconds_bucket{route=\"/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket{route=\"/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_request_duration_seconds_bucket{route=\"/v1/chat/completions\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Admission outcomes (rate, stacked)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "stacking": { "mode": "normal", "group": "A" }, "fillOpacity": 30 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (action) (rate(gateway_admission_total[1m]))",
+          "legendFormat": "{{action}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Node budget usage",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "expr": "gateway_admission_in_flight_token_cost",
+          "legendFormat": "in-flight",
+          "refId": "A"
+        },
+        {
+          "expr": "gateway_admission_node_budget",
+          "legendFormat": "budget (after headroom scaling)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Headroom factor (EWMA-smoothed)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.05 },
+              { "color": "yellow", "value": 0.20 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "gateway_admission_headroom_factor",
+          "legendFormat": "headroom",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "vLLM cache pressure (raw)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [
+        {
+          "expr": "gateway_runtime_metrics_gpu_cache_usage",
+          "legendFormat": "raw cache_usage",
+          "refId": "A"
+        },
+        {
+          "expr": "gateway_runtime_metrics_num_running",
+          "legendFormat": "num_running",
+          "refId": "B"
+        },
+        {
+          "expr": "gateway_runtime_metrics_num_waiting",
+          "legendFormat": "num_waiting",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Stream disconnect (by reason)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "stacking": { "mode": "normal", "group": "A" }, "fillOpacity": 30 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gateway_stream_disconnect_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Dify cancel result (PR #10 verification)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "stacking": { "mode": "normal", "group": "A" }, "fillOpacity": 30 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(gateway_dify_cancel_total[1m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Internal state (gauges)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "expr": "gateway_background_tasks_pending",
+          "legendFormat": "background tasks pending",
+          "refId": "A"
+        },
+        {
+          "expr": "gateway_app_cache_size",
+          "legendFormat": "app cache size",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(gateway_runtime_metrics_poll_total{result=\"error\"}[5m]))",
+          "legendFormat": "poll error rate (5m)",
+          "refId": "C"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["gateway", "ops"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Gateway Operations",
+  "uid": "gateway-ops",
+  "version": 1,
+  "weekStart": ""
+}

@@ -1,0 +1,64 @@
+# Promtail config for docker log scraping (PR #12b).
+#
+# Scrapes all docker container stdout/stderr via the docker service
+# discovery, ships to Loki with labels for {container,service,stream}.
+# This gives Grafana the ability to grep all Gateway / Dify / vLLM logs
+# in one place without SSH'ing into a Jetson.
+#
+# Why Promtail and not the Loki docker plugin: the plugin requires
+# editing daemon.json per host and reboots; Promtail runs as a sibling
+# container and works on any docker host with /var/run/docker.sock
+# mounted.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/positions.yaml  # remembers where each file left off
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # ----------------------------------------------------------------
+  # Docker container logs (all containers on this host)
+  # ----------------------------------------------------------------
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: label
+            values:
+              - "logging=promtail"   # opt-in: only containers with this label
+    relabel_configs:
+      # Container name → label
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      # Compose service name → label (set by docker compose automatically
+      # via "com.docker.compose.service")
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+      # Log stream (stdout vs stderr) → label
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+      # Image (helps debug "which version was this")
+      - source_labels: ['__meta_docker_container_label_org_opencontainers_image_version']
+        target_label: 'image_version'
+    pipeline_stages:
+      # Gateway emits structlog JSON; parse so individual fields become
+      # queryable in LogQL (level, request_id, etc.).
+      - match:
+          selector: '{service="gateway"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  event: event
+                  request_id: request_id
+            - labels:
+                level:
+                event:

@@ -1,0 +1,83 @@
+# Loki single-binary config (PR #12b).
+#
+# Storage backend: local filesystem. Suitable for single-Jetson PoC.
+# When we go multi-base-station (Phase 4) this swaps to S3-compatible
+# object storage with a shared schema/index — Loki supports that via
+# a config change, no app rewrites.
+#
+# Retention: 7 days. Logs are higher-cost-per-byte than metrics; 7d
+# covers "last week" debugging without exploding disk on edge.
+
+auth_enabled: false              # single-tenant, ops network only
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn                # Loki itself is chatty; suppress info
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1          # single-instance
+  ring:
+    kvstore:
+      store: inmemory
+
+ingester:
+  chunk_idle_period: 5m          # flush idle chunks after 5 min
+  chunk_block_size: 262144
+  chunk_target_size: 1572864
+  max_chunk_age: 1h
+  wal:
+    enabled: true
+    dir: /loki/wal
+
+limits_config:
+  retention_period: 168h         # 7 days
+  ingestion_rate_mb: 10          # per-tenant rate cap
+  ingestion_burst_size_mb: 20
+  max_query_series: 10000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: false  # OpenSSF + index simplicity
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13                # latest stable as of mid-2025
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+  filesystem:
+    directory: /loki/chunks
+
+compactor:
+  working_directory: /loki/compactor
+  delete_request_store: filesystem
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules
+  alertmanager_url: ""          # PR #12c future
+  ring:
+    kvstore:
+      store: inmemory
+
+analytics:
+  reporting_enabled: false       # don't phone home from edge

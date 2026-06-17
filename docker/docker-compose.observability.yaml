@@ -1,0 +1,125 @@
+# Observability stack — Prometheus + Grafana + Loki + Promtail (PR #12b).
+#
+# Designed as an OVERLAY compose file: bring up alongside the main stack
+# with:
+#     docker compose \
+#       -f docker-compose.yaml \
+#       -f docker-compose.override.yaml \
+#       -f docker-compose.observability.yaml \
+#       up -d
+#
+# Or define COMPOSE_FILE in your shell profile / .env so the long flag set
+# is implicit.
+#
+# Resource budget on Jetson Thor (128 GB unified memory):
+#   - prometheus    ~ 200 MB RAM at 1k series
+#   - grafana       ~ 100 MB RAM
+#   - loki          ~ 150 MB RAM at moderate ingest
+#   - promtail      ~  50 MB RAM
+#   - total         ~ 500 MB — well within budget on edge.
+#
+# Hardware metrics (CPU/GPU temp/power) are NOT included here — that's
+# the other team's stack. Cross-stack federation is possible later if
+# operations want a single Grafana for everything.
+
+services:
+  # ----------------------------------------------------------------
+  # Prometheus — metric scrape + TSDB
+  # ----------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"   # localhost-only by default; ops VPN/SSH to reach
+    volumes:
+      - ../ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      # No remote write configured — federation comes Phase 4 when we have
+      # multi-base-station deployments. Single-station stays self-contained.
+    labels:
+      tier: ops
+      role: metrics-tsdb
+      k8s-kind: StatefulSet     # Phase 4 hint
+
+  # ----------------------------------------------------------------
+  # Grafana — visualisation
+  # ----------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"   # localhost-only; ops VPN/SSH to reach
+    environment:
+      # Grafana admin password MUST be set explicitly — refuse to come up
+      # with the default "admin/admin" credential. Ops adds GRAFANA_PASSWORD
+      # to docker/.env before first launch.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD env var is required}
+      # Disable sign-up; this is an ops dashboard, not a SaaS.
+      GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Quiet down analytics phone-home
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ../ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../ops/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+    labels:
+      tier: ops
+      role: dashboard-ui
+      logging: promtail         # Promtail picks up Grafana's own logs too
+
+  # ----------------------------------------------------------------
+  # Loki — log aggregation
+  # ----------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ../ops/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    command:
+      - "-config.file=/etc/loki/loki-config.yml"
+    labels:
+      tier: ops
+      role: log-aggregator
+
+  # ----------------------------------------------------------------
+  # Promtail — ship docker stdout/stderr → Loki
+  # ----------------------------------------------------------------
+  # Containers opt in by labelling themselves with `logging=promtail`.
+  # Edit docker-compose.override.yaml entries to add that label for
+  # services whose logs should land in Loki (gateway already labelled).
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - ../ops/promtail/promtail-config.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - "-config.file=/etc/promtail/promtail.yml"
+    depends_on:
+      - loki
+    labels:
+      tier: ops
+      role: log-shipper
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:

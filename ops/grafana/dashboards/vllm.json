@@ -1,0 +1,143 @@
+{
+  "annotations": { "list": [] },
+  "description": "vLLM internal state — KV cache pressure, concurrent requests, throughput. Source: vLLM /metrics scraped every 5s. SRE deep-dive when Gateway dashboard shows trouble.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "GPU KV cache usage",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.80 },
+              { "color": "red", "value": 0.95 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      },
+      "targets": [
+        {
+          "expr": "vllm:gpu_cache_usage_perc",
+          "legendFormat": "raw cache_usage",
+          "refId": "A"
+        },
+        {
+          "expr": "gateway_admission_headroom_factor",
+          "legendFormat": "(Gateway smoothed headroom, inverse)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Concurrent requests",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "stacking": { "mode": "normal", "group": "A" }, "fillOpacity": 30 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "vllm:num_requests_running",
+          "legendFormat": "running",
+          "refId": "A"
+        },
+        {
+          "expr": "vllm:num_requests_waiting",
+          "legendFormat": "waiting (saturation signal)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Throughput — tokens / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "expr": "sum(rate(vllm:prompt_tokens_total[1m]))",
+          "legendFormat": "prompt tokens/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(vllm:generation_tokens_total[1m]))",
+          "legendFormat": "generation tokens/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Time to first token (p50 / p95 / p99)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Polling health (Gateway → vLLM /metrics)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_runtime_metrics_poll_total{result=\"success\"}[5m]))",
+          "legendFormat": "successful polls / s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(gateway_runtime_metrics_poll_total{result=\"error\"}[5m]))",
+          "legendFormat": "errored polls / s (should be 0)",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["vllm", "ops"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "vLLM Internals",
+  "uid": "vllm-internals",
+  "version": 1,
+  "weekStart": ""
+}

@@ -1,0 +1,34 @@
+# Grafana datasource provisioning (PR #12b).
+#
+# Auto-loaded by Grafana on container start (mounted into
+# /etc/grafana/provisioning/datasources/). Datasources marked
+# editable: false so operators can't accidentally repoint them via
+# the UI to a stale target.
+
+apiVersion: 1
+
+datasources:
+  # ----------------------------------------------------------------
+  # Prometheus — metrics queries
+  # ----------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST           # POST supports longer queries
+      timeInterval: 15s          # matches scrape_interval
+
+  # ----------------------------------------------------------------
+  # Loki — log queries (Gateway + Dify + vLLM docker stdout)
+  # ----------------------------------------------------------------
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+    editable: false
+    jsonData:
+      maxLines: 1000             # cap per query result for browser perf

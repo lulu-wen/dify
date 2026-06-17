@@ -1,0 +1,65 @@
+# Prometheus scrape config for Gateway observability stack (PR #12b).
+#
+# Scrapes:
+#   - Gateway /metrics (PR #12a) — instrumentation hooks
+#   - vLLM /metrics — built-in continuous batching + KV cache gauges
+#
+# Hardware metrics (CPU/GPU temp/power) are intentionally NOT scraped here —
+# that's the other team's responsibility via jtop-exporter on a separate
+# Prometheus. Our stack stays scoped to application metrics so the dashboards
+# we build can be owned end-to-end without cross-team coordination.
+#
+# Retention: 30 days in the local TSDB (set on the prometheus container via
+# --storage.tsdb.retention.time=30d). Enough for capacity planning + monthly
+# billing reports; pre-aggregate via recording rules if we ever push longer.
+
+global:
+  scrape_interval: 15s         # default cadence
+  evaluation_interval: 15s     # alerting rule eval (we have none in PR #12b)
+  external_labels:
+    cluster: edge-jetson
+    # When we go multi-base-station (Phase 4) this becomes the
+    # per-base-station identifier so federation can dedup.
+
+scrape_configs:
+  # ----------------------------------------------------------------
+  # Gateway — our application metrics (PR #12a)
+  # ----------------------------------------------------------------
+  - job_name: gateway
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - gateway:8080
+        labels:
+          service: gateway
+          tier: edge
+
+  # ----------------------------------------------------------------
+  # vLLM — built-in Prometheus exposition (vllm:* namespace)
+  # ----------------------------------------------------------------
+  # vLLM cache pressure changes fast (per-request granularity) — scrape
+  # tighter than gateway so dashboards reflect bursts. Still avoid 1s
+  # (excessive load + cardinality).
+  - job_name: vllm
+    scrape_interval: 5s
+    scrape_timeout: 3s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - vllm:8000
+        labels:
+          service: vllm
+          tier: llm
+
+  # ----------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ----------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+        labels:
+          service: prometheus
+          tier: ops

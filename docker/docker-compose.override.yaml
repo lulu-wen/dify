@@ -55,6 +55,7 @@ services:
       tier: edge
       role: sdk-gateway
       k8s-kind: Deployment
+      logging: promtail        # PR #12b: opt-in for Promtail → Loki shipping
 
   # ============================================================
   # TIER 2: RAG Stack
@@ -152,4 +153,5 @@ services:
     labels:
       tier: llm
       role: llm-inference
+      logging: promtail        # PR #12b: opt-in for Promtail → Loki shipping
 

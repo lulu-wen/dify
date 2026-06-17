@@ -1,0 +1,20 @@
+# Grafana dashboard provider (PR #12b).
+#
+# Tells Grafana to scan /etc/grafana/dashboards/ on startup AND every 30s
+# for changes so operators can hot-add JSON dashboards via the host mount
+# without restarting Grafana.
+
+apiVersion: 1
+
+providers:
+  - name: gateway-dashboards
+    orgId: 1
+    folder: Gateway
+    type: file
+    disableDeletion: true        # protect from accidental UI delete
+    editable: true               # allow ad-hoc tweaks in UI for ops
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
