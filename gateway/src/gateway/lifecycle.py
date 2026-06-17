@@ -26,6 +26,8 @@ from typing import Any
 
 import structlog
 
+from gateway.observability.metrics import GATEWAY_BACKGROUND_TASKS_PENDING
+
 logger = structlog.get_logger(__name__)
 
 
@@ -67,7 +69,11 @@ class TaskSupervisor:
         """Schedule + track + auto-discard. Replaces the per-router pattern."""
         task = asyncio.create_task(coro, name=name)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        GATEWAY_BACKGROUND_TASKS_PENDING.set(len(self._tasks))
+        # PR #12a: include the gauge update in the done_callback chain so the
+        # tracked count drops at the same moment as the set discard. Using a
+        # lambda over both is fine — they're cheap and unconditional.
+        task.add_done_callback(self._on_task_done)
 
     def spawn_long_running(
         self,
@@ -80,8 +86,14 @@ class TaskSupervisor:
         completion the task self-discards from the supervisor's set."""
         task = asyncio.create_task(coro, name=name)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        GATEWAY_BACKGROUND_TASKS_PENDING.set(len(self._tasks))
+        task.add_done_callback(self._on_task_done)
         return task
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Done callback: discard + republish the gauge atomically."""
+        self._tasks.discard(task)
+        GATEWAY_BACKGROUND_TASKS_PENDING.set(len(self._tasks))
 
     async def shutdown(self, *, deadline_s: float = 5.0) -> None:
         """Cancel all tracked tasks + await with deadline.

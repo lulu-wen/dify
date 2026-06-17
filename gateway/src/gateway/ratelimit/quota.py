@@ -15,6 +15,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+from gateway.observability.metrics import (
+    GATEWAY_ADMISSION_IN_FLIGHT_TOKEN_COST,
+    GATEWAY_ADMISSION_NODE_BUDGET,
+)
 from gateway.ratelimit.types import ActionCode, AdmissionGrant, RequestCost
 
 
@@ -35,6 +39,11 @@ class InMemoryQuotaStore:
         self._budget = node_token_budget
         self._in_flight = 0
         self._open: dict[str, RequestCost] = {}
+        # PR #12a: seed gauges so scrapers see initial state even before the
+        # first admit/poll. Without this the budget gauge is 0 until the
+        # first ``set_budget`` (~2s after startup with headroom enabled).
+        GATEWAY_ADMISSION_NODE_BUDGET.set(self._budget)
+        GATEWAY_ADMISSION_IN_FLIGHT_TOKEN_COST.set(0)
         # PR #9: budget can be retuned by the headroom polling task. The
         # write side runs at the polling cadence (every 2s) on a background
         # asyncio task; the read side runs on every admission attempt
@@ -58,6 +67,7 @@ class InMemoryQuotaStore:
         charge_id = uuid.uuid4().hex
         self._open[charge_id] = cost
         self._in_flight += cost.token_cost
+        GATEWAY_ADMISSION_IN_FLIGHT_TOKEN_COST.set(self._in_flight)
         return AdmissionGrant(admitted=True, charge_id=charge_id, action=None)
 
     def settle(self, charge_id: str, *, actual_output_tokens: int) -> None:
@@ -73,6 +83,7 @@ class InMemoryQuotaStore:
         self._in_flight -= cost.token_cost
         if self._in_flight < 0:
             self._in_flight = 0
+        GATEWAY_ADMISSION_IN_FLIGHT_TOKEN_COST.set(self._in_flight)
 
     @property
     def in_flight(self) -> int:
@@ -95,3 +106,4 @@ class InMemoryQuotaStore:
         """
         async with self._budget_lock:
             self._budget = max(0, new_budget)
+            GATEWAY_ADMISSION_NODE_BUDGET.set(self._budget)

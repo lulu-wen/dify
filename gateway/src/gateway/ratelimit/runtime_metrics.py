@@ -41,6 +41,13 @@ from typing import Protocol
 import httpx
 import structlog
 
+from gateway.observability.metrics import (
+    GATEWAY_ADMISSION_HEADROOM_FACTOR,
+    GATEWAY_RUNTIME_METRICS_GPU_CACHE_USAGE,
+    GATEWAY_RUNTIME_METRICS_NUM_RUNNING,
+    GATEWAY_RUNTIME_METRICS_NUM_WAITING,
+    GATEWAY_RUNTIME_METRICS_POLL_TOTAL,
+)
 from gateway.ratelimit.headroom import EwmaHeadroomCalculator
 from gateway.ratelimit.protocols import QuotaStore
 
@@ -224,6 +231,15 @@ async def run_metrics_poll_loop(
                 factor = calculator.update(snap.gpu_cache_usage_perc)
                 new_budget = int(static_budget * factor)
                 await quota_store.set_budget(new_budget)
+                # PR #12a: publish vLLM-derived gauges + smoothed headroom.
+                # These are read-only views on the polling task's state, so
+                # they live exactly here (the one place that knows the
+                # latest snapshot AND factor together).
+                GATEWAY_RUNTIME_METRICS_GPU_CACHE_USAGE.set(snap.gpu_cache_usage_perc)
+                GATEWAY_RUNTIME_METRICS_NUM_RUNNING.set(snap.num_requests_running)
+                GATEWAY_RUNTIME_METRICS_NUM_WAITING.set(snap.num_requests_waiting)
+                GATEWAY_ADMISSION_HEADROOM_FACTOR.set(factor)
+                GATEWAY_RUNTIME_METRICS_POLL_TOTAL.labels(result="success").inc()
                 logger.debug(
                     "runtime_metrics.tick",
                     gpu_cache_usage=snap.gpu_cache_usage_perc,
@@ -237,6 +253,9 @@ async def run_metrics_poll_loop(
             except Exception as exc:
                 # Fail-open: leave the last good budget in place. An edge
                 # node MUST stay available even when metrics are flapping.
+                # PR #12a: still bump the poll_total error counter so the
+                # ops dashboard surfaces "monitoring itself is broken".
+                GATEWAY_RUNTIME_METRICS_POLL_TOTAL.labels(result="error").inc()
                 logger.warning(
                     "runtime_metrics.poll_failed",
                     error=str(exc),

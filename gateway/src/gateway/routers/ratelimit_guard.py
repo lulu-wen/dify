@@ -14,9 +14,15 @@ these helpers can ``raise`` normally.
 
 from __future__ import annotations
 
+import time
+
 from fastapi import Request
 
 from gateway.errors import OverloadError, RateLimitError
+from gateway.observability.metrics import (
+    GATEWAY_ADMISSION_TOTAL,
+    GATEWAY_SETTLE_SECONDS,
+)
 from gateway.ratelimit import (
     ActionCode,
     AdmissionGrant,
@@ -123,6 +129,12 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
                 f"'{customer.customer_id}' (this request ~{cost.token_cost} tokens)"
             )
             action = ActionCode.REDUCE_MAX_TOKENS
+        # PR #12a: emit admission_total before raising. Labels keep
+        # cardinality low (action enum x small route set), no customer_id.
+        GATEWAY_ADMISSION_TOTAL.labels(
+            action=action.value,
+            route=request.url.path,
+        ).inc()
         raise RateLimitError(message, action=action, retry_after_s=retry_after)
 
 
@@ -145,12 +157,23 @@ def admit(request: Request, customer: CustomerEntry, cost: RequestCost) -> Admis
         # jittered backoff. Pass 0.0 explicitly: ``jittered_retry_after``
         # now treats None as "unsatisfiable, omit Retry-After", which is
         # not what we want here (PR #10 self-review-3 #1).
+        # PR #12a: emit admission_total on reject path.
+        GATEWAY_ADMISSION_TOTAL.labels(
+            action=(grant.action.value if grant.action is not None else "rejected_overload"),
+            route=request.url.path,
+        ).inc()
         raise OverloadError(
             f"node at capacity: admitting ~{cost.token_cost} tokens would "
             f"exceed the node budget. Retry shortly.",
             action=grant.action,
             retry_after_s=jittered_retry_after(0.0),
         )
+    # PR #12a: emit admission_total on accept path. Symmetric with reject
+    # so dashboards can show accepted vs rejected counts side by side.
+    GATEWAY_ADMISSION_TOTAL.labels(
+        action="accepted",
+        route=request.url.path,
+    ).inc()
     return grant
 
 
@@ -158,6 +181,15 @@ def settle(request: Request, grant: AdmissionGrant, *, actual_output_tokens: int
     """Release a reservation. Safe to call with a no-charge grant or twice."""
     if grant.charge_id is None:
         return
-    request.app.state.quota_store.settle(
-        grant.charge_id, actual_output_tokens=actual_output_tokens
-    )
+    # PR #12a: time the settle path. Histogram surfaces if the in-memory
+    # refund ever blows up (PoC should be ~microseconds; if a future
+    # Redis-backed store goes slow this catches it).
+    start = time.monotonic()
+    try:
+        request.app.state.quota_store.settle(
+            grant.charge_id, actual_output_tokens=actual_output_tokens
+        )
+        GATEWAY_SETTLE_SECONDS.labels(result="ok").observe(time.monotonic() - start)
+    except Exception:
+        GATEWAY_SETTLE_SECONDS.labels(result="error").observe(time.monotonic() - start)
+        raise

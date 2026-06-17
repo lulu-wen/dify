@@ -39,6 +39,7 @@ import structlog
 from gateway.dify.client import ConsoleSession, DifyClient
 from gateway.dify.dsl import DSL_VERSION, build_chat_app_dsl
 from gateway.errors import DifyUpstreamError, UnknownModelError
+from gateway.observability.metrics import GATEWAY_APP_CACHE_SIZE
 from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry, CustomerRegistry, ModelEntry
 
@@ -175,6 +176,7 @@ class AppManager:
 
             cached = await self._build_app(customer, model)
             self._apps[cache_key] = cached
+            self._publish_cache_size()
             return cached.app_key
 
     async def _evict_stale(
@@ -187,6 +189,7 @@ class AppManager:
         customer = self._registry.find_by_customer_id(stale.customer_id)
         if customer is None:
             self._apps.pop(key, None)
+            self._publish_cache_size()
             return
         try:
             client = self._client_factory(customer)
@@ -215,6 +218,7 @@ class AppManager:
                 current_dsl_version=DSL_VERSION,
             )
             self._apps.pop(key, None)
+            self._publish_cache_size()
 
     async def start(self) -> None:
         """Launch the background GC task. Call after asyncio loop is running."""
@@ -235,6 +239,14 @@ class AppManager:
     def cached_apps(self) -> dict[tuple[str, str], CachedApp]:
         """Return a *copy* of the cache (for diagnostics / metrics)."""
         return dict(self._apps)
+
+    def _publish_cache_size(self) -> None:
+        """PR #12a: keep ``gateway_app_cache_size`` in sync with the dict.
+
+        Called after every mutation path (build add, stale evict, GC evict).
+        Cheap — single ``Gauge.set`` after a ``len()``.
+        """
+        GATEWAY_APP_CACHE_SIZE.set(len(self._apps))
 
     # ------------------------------------------------------------------ #
     # Internals                                                          #
@@ -428,4 +440,5 @@ class AppManager:
                 dify_deleted=deleted,
             )
             self._apps.pop(key, None)
+            self._publish_cache_size()
 

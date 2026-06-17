@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from gateway.dify.app_manager import AppManager
 from gateway.dify.client import DifyClient
 from gateway.errors import InvalidRequestError, UnknownModelError
+from gateway.observability.metrics import GATEWAY_STREAM_DISCONNECT_TOTAL
 from gateway.ratelimit import effective_max_tokens
 from gateway.registry import CustomerEntry
 from gateway.routers.ratelimit_guard import (
@@ -297,6 +298,21 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                 ):
                     yield chunk
             finally:
+                # PR #12a: record how the stream ended for ops visibility.
+                # ``normal`` = Dify said message_end; ``early_termination``
+                # = task started but we're closing before Dify finalized
+                # (client disconnect OR upstream error caught by
+                # ``graceful_upstream_stream``); ``no_first_event`` = the
+                # stream closed before Dify even returned a task_id (e.g.
+                # initial Dify call 5xx).
+                if cancel_sink.dify_finalized:
+                    _disconnect_reason = "normal"
+                elif cancel_sink.task_id:
+                    _disconnect_reason = "early_termination"
+                else:
+                    _disconnect_reason = "no_first_event"
+                GATEWAY_STREAM_DISCONNECT_TOTAL.labels(reason=_disconnect_reason).inc()
+
                 # Order matters (codex 1b review-4 P2): close the upstream
                 # FIRST, then release the node-budget reservation. Cancel
                 # POST is fired-and-forget BEFORE close+settle so the cancel

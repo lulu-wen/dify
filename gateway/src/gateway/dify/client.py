@@ -37,12 +37,19 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from time import monotonic as _monotonic
 from typing import Any, cast
 
 import httpx
 import structlog
 
 from gateway.errors import DifyTimeoutError, DifyUpstreamError, UpstreamClientError
+from gateway.observability.metrics import (
+    GATEWAY_DIFY_CALL_DURATION_SECONDS,
+    GATEWAY_DIFY_CALL_TOTAL,
+    GATEWAY_DIFY_CANCEL_DURATION_SECONDS,
+    GATEWAY_DIFY_CANCEL_TOTAL,
+)
 
 # Dify Service API 4xx statuses that describe a *client* mistake on the
 # dataset / document path. Surface these as ``UpstreamClientError`` so the
@@ -166,6 +173,10 @@ class DifyClient:
         if conversation_id:
             body["conversation_id"] = conversation_id
 
+        # PR #12a: timed Dify call for ops latency tracking. ``chat_messages``
+        # is the dominant blocking call; isolating it as a separate label
+        # lets Grafana split "blocking chat" from "datasets CRUD" cleanly.
+        _start = _monotonic()
         try:
             resp = await self._http.post(
                 "/v1/chat-messages",
@@ -173,10 +184,29 @@ class DifyClient:
                 json=body,
             )
         except httpx.TimeoutException as e:
+            GATEWAY_DIFY_CALL_DURATION_SECONDS.labels(endpoint="chat_messages").observe(
+                _monotonic() - _start
+            )
+            GATEWAY_DIFY_CALL_TOTAL.labels(
+                endpoint="chat_messages", status="timeout"
+            ).inc()
             raise DifyTimeoutError("Dify chat-messages timed out") from e
         except httpx.RequestError as e:
+            GATEWAY_DIFY_CALL_DURATION_SECONDS.labels(endpoint="chat_messages").observe(
+                _monotonic() - _start
+            )
+            GATEWAY_DIFY_CALL_TOTAL.labels(
+                endpoint="chat_messages", status="error"
+            ).inc()
             raise DifyUpstreamError(f"Dify request failed: {e}") from e
 
+        GATEWAY_DIFY_CALL_DURATION_SECONDS.labels(endpoint="chat_messages").observe(
+            _monotonic() - _start
+        )
+        GATEWAY_DIFY_CALL_TOTAL.labels(
+            endpoint="chat_messages",
+            status=f"{resp.status_code // 100}xx",
+        ).inc()
         _raise_for_dify_status(resp)
         return cast(dict[str, Any], resp.json())
 
@@ -282,6 +312,10 @@ class DifyClient:
         normal upstream churn (404 if Dify already finalized the task,
         timeout if the network is unhappy) into spurious failures.
         """
+        # PR #12a: time the cancel call as a histogram. Demonstrates that
+        # fire-and-forget really is bounded (CANCEL_TIMEOUT=2s upper bound)
+        # and surfaces if the cancel path is unexpectedly slow.
+        _start = _monotonic()
         try:
             # Tight timeout: this is a fire-and-forget best-effort call —
             # ``_bg_cancel_tasks`` in the chat router holds a reference to
@@ -297,22 +331,37 @@ class DifyClient:
                 json={"user": user},
                 timeout=self._CANCEL_TIMEOUT,
             )
-        except (httpx.TimeoutException, httpx.RequestError) as e:
+        except httpx.TimeoutException as e:
+            GATEWAY_DIFY_CANCEL_DURATION_SECONDS.observe(_monotonic() - _start)
+            GATEWAY_DIFY_CANCEL_TOTAL.labels(result="timeout").inc()
             logger.warning(
                 "dify.chat_messages_stop.transport_error",
                 task_id=task_id,
                 error=str(e),
             )
             return
+        except httpx.RequestError as e:
+            GATEWAY_DIFY_CANCEL_DURATION_SECONDS.observe(_monotonic() - _start)
+            GATEWAY_DIFY_CANCEL_TOTAL.labels(result="error").inc()
+            logger.warning(
+                "dify.chat_messages_stop.transport_error",
+                task_id=task_id,
+                error=str(e),
+            )
+            return
+        GATEWAY_DIFY_CANCEL_DURATION_SECONDS.observe(_monotonic() - _start)
         if not resp.is_success:
             # 404 is the common case when the task already finalized
             # between our last SSE event and our stop call — expected,
             # log at info, don't raise.
+            GATEWAY_DIFY_CANCEL_TOTAL.labels(result="non_success").inc()
             logger.info(
                 "dify.chat_messages_stop.non_success",
                 task_id=task_id,
                 status_code=resp.status_code,
             )
+        else:
+            GATEWAY_DIFY_CANCEL_TOTAL.labels(result="success").inc()
 
     # ------------------------------------------------------------------ #
     # Service API: Datasets (knowledge base CRUD)                        #

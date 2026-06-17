@@ -20,6 +20,8 @@ from gateway.lifecycle import TaskSupervisor, safe_shutdown_step
 from gateway.middleware.auth import AuthMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.middleware.rate_limit import RateLimitMiddleware
+from gateway.observability import PrometheusMiddleware
+from gateway.observability import router as metrics_endpoint_router
 from gateway.ratelimit import (
     InMemoryQuotaStore,
     InMemoryTokenBucketLimiter,
@@ -235,12 +237,16 @@ def create_app(
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):
-    #   request flow:  Logging -> Auth -> RateLimit -> route
+    #   request flow:  Logging -> Prometheus -> Auth -> RateLimit -> route
     # - Logging outermost: request id exists even on auth / rate-limit failure.
+    # - PR #12a Prometheus second outermost: records request_duration with
+    #   full request lifetime (auth + rate-limit + route + serialisation).
+    #   Excludes /metrics + /health itself; see middleware.py.
     # - RateLimit inner to Auth: it keys on request.state.customer, which
     #   AuthMiddleware sets. Added BEFORE Auth here so it ends up inner.
     app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, settings=settings)
     app.add_middleware(AuthMiddleware, registry=registry)
+    app.add_middleware(PrometheusMiddleware)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
 
     app.include_router(chat_router.router)
@@ -248,6 +254,12 @@ def create_app(
     app.include_router(models_router.router)
     app.include_router(datasets_router.router)
     app.include_router(files_router.router)
+    # PR #12a: Prometheus exposition endpoint at /metrics. Pull-based by
+    # design; scrapers (Prometheus, Grafana Agent) hit it on a schedule.
+    # No auth — ops network isolation is the boundary (compose binds port
+    # 8080 to internal network only; reverse proxies MUST NOT route
+    # /metrics to the internet without an IP allowlist).
+    app.include_router(metrics_endpoint_router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
