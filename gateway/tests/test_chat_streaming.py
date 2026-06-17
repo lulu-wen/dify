@@ -367,7 +367,7 @@ class TestPR10ConverterCancelSink:
 
     @pytest.mark.asyncio
     async def test_first_event_captures_task_id(self) -> None:
-        from gateway.streaming.converter import dify_to_openai_chunks
+        from gateway.streaming.converter import CancelSink, dify_to_openai_chunks
 
         async def lines() -> list:  # type: ignore[type-arg]
             for raw in [
@@ -377,17 +377,17 @@ class TestPR10ConverterCancelSink:
             ]:
                 yield raw
 
-        sink: dict = {"task_id": None, "dify_finalized": False}
+        sink = CancelSink()
         async for _ in dify_to_openai_chunks(
             lines(), request_id="r-1", model_id="m1", cancel_sink=sink
         ):
             pass
-        assert sink["task_id"] == "t-1"
-        assert sink["dify_finalized"] is True
+        assert sink.task_id == "t-1"
+        assert sink.dify_finalized is True
 
     @pytest.mark.asyncio
     async def test_error_event_marks_finalized(self) -> None:
-        from gateway.streaming.converter import dify_to_openai_chunks
+        from gateway.streaming.converter import CancelSink, dify_to_openai_chunks
 
         async def lines() -> list:  # type: ignore[type-arg]
             for raw in [
@@ -396,25 +396,25 @@ class TestPR10ConverterCancelSink:
             ]:
                 yield raw
 
-        sink: dict = {"task_id": None, "dify_finalized": False}
+        sink = CancelSink()
         async for _ in dify_to_openai_chunks(
             lines(), request_id="r", model_id="m", cancel_sink=sink
         ):
             pass
-        assert sink["dify_finalized"] is True
+        assert sink.dify_finalized is True
 
     @pytest.mark.asyncio
     async def test_pings_only_no_task_id(self) -> None:
-        from gateway.streaming.converter import dify_to_openai_chunks
+        from gateway.streaming.converter import CancelSink, dify_to_openai_chunks
 
         async def lines() -> list:  # type: ignore[type-arg]
             for raw in ['data: {"event":"ping"}']:
                 yield raw
 
-        sink: dict = {"task_id": None, "dify_finalized": False}
+        sink = CancelSink()
         async for _ in dify_to_openai_chunks(
             lines(), request_id="r", model_id="m", cancel_sink=sink
         ):
             pass
-        assert sink["task_id"] is None
-        assert sink["dify_finalized"] is False
+        assert sink.task_id is None
+        assert sink.dify_finalized is False

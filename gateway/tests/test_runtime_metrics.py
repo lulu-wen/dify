@@ -111,20 +111,52 @@ class TestHeadroomConfigValidation:
                 HeadroomConfig(soft_threshold=0.8, hard_threshold=0.95, ewma_alpha=1.5)
             )
 
-    def test_settings_cross_field_validator_catches_swapped_env_vars(self) -> None:
-        """PR #9 review-1 #9: an operator that types soft=0.95, hard=0.90
-        used to get a deep ValueError from EwmaHeadroomCalculator at
-        create_app time, pointing at the calculator (not the env var).
-        Settings.model_validator now catches it at config load with
-        both env var names quoted so the failure is actionable.
+    def test_headroom_config_post_init_catches_swapped_thresholds(self) -> None:
+        """PR #11 #6: cross-field validation moved from Settings.@model_validator
+        to HeadroomConfig.__post_init__. Now EVERY construction path
+        (env-loaded Settings, test fixture, Phase 4 hot-reload) is covered
+        by one source of truth — the dataclass itself. The error fires at
+        the construction site rather than relying on Pydantic to catch it.
         """
-        with pytest.raises(ValueError, match="GATEWAY_HEADROOM_SOFT_THRESHOLD"):
-            Settings(
-                registry_path="unused.yaml",
-                log_json=False,
-                headroom_soft_threshold=0.95,
-                headroom_hard_threshold=0.90,
+        with pytest.raises(ValueError, match="soft < hard"):
+            HeadroomConfig(soft_threshold=0.95, hard_threshold=0.90, ewma_alpha=0.3)
+
+    def test_create_app_validates_headroom_at_startup_even_if_disabled(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """PR #11 R2 #2: HeadroomConfig is constructed unconditionally at
+        ``create_app`` time, so a misconfigured env raises before the
+        gateway accepts traffic — even when ``runtime_metrics_enabled`` is
+        False (the default). The previous Settings.@model_validator did
+        catch this path too, but the calculator-internal validation
+        DIDN'T fire unless metrics were enabled. PR #11 unifies on
+        HeadroomConfig.__post_init__ + unconditional construction.
+        """
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+
+        registry = CustomerRegistry.from_entries([make_customer()])
+        with pytest.raises(ValueError, match="soft < hard"):
+            create_app(
+                settings=Settings(
+                    registry_path="unused.yaml",
+                    log_json=False,
+                    runtime_metrics_enabled=False,   # feature off — still validates
+                    headroom_soft_threshold=0.95,
+                    headroom_hard_threshold=0.90,
+                ),
+                registry=registry,
             )
+
+    def test_headroom_config_is_frozen(self) -> None:
+        """PR #11 R2 #1: ``frozen=True`` preserved. Runtime cannot mutate
+        a HeadroomConfig instance after construction — guards against the
+        EWMA / scaling math going off-spec between polls."""
+        from dataclasses import FrozenInstanceError
+
+        cfg = HeadroomConfig(soft_threshold=0.8, hard_threshold=0.95, ewma_alpha=0.3)
+        with pytest.raises(FrozenInstanceError):
+            cfg.soft_threshold = 0.5  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- #

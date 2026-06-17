@@ -256,9 +256,14 @@ class TestChatAdmission:
 
 class TestChatTpm:
     @pytest.mark.asyncio
-    async def test_over_tpm_returns_429_reduce_max_tokens(self, fake_dify: FakeDifyClient) -> None:
+    async def test_over_tpm_cost_gt_burst_returns_misconfigured_rate(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
         # tpm enabled, burst tiny (10) — a request costing ~1024 (default
-        # max_output fallback) exceeds burst → unsatisfiable → 429.
+        # max_output fallback) exceeds burst → structurally unsatisfiable
+        # → 429 MISCONFIGURED_RATE (PR #11 R2 #1 sibling-sweep: middleware
+        # already used this code; enforce_tpm now matches so SDKs stop
+        # the halve-and-retry loop on this branch).
         app = _build_app(fake_dify, default_tpm=600, default_tpm_burst=10, node_token_budget=10_000_000)
         async with _client(app) as cli:
             r = await cli.post(
@@ -269,22 +274,73 @@ class TestChatTpm:
         assert r.status_code == 429
         body = r.json()
         assert body["error"]["type"] == "rate_limit_error"
-        assert body["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+        assert body["error"]["action"] == ActionCode.MISCONFIGURED_RATE
         # TPM rejected BEFORE admission → no reservation held.
         assert app.state.quota_store.in_flight == 0
-        # PR #10 self-review-2 P2: the limiter signalled "unsatisfiable"
-        # (cost > burst) by returning ``retry_after_s=None``. The 429
-        # response must NOT carry a ``Retry-After`` header — letting
-        # standard SDKs back off and retry the same request would loop
-        # forever. The REDUCE_MAX_TOKENS action above is the client's
-        # only real recovery path; no jittered finite delay should slip
-        # through.
+        # The limiter signalled "unsatisfiable" (cost > burst) by returning
+        # ``retry_after_s=None``. The 429 response must NOT carry a
+        # ``Retry-After`` header — SDKs see MISCONFIGURED_RATE + no
+        # backoff hint and surface the operator-misconfig to the user.
         assert "retry-after" not in {k.lower() for k in r.headers}, (
             f"Retry-After leaked on cost>burst path: {dict(r.headers)}"
         )
         assert body["error"].get("retry_after_s") in (None, 0, 0.0), (
             f"retry_after_s leaked: {body['error']}"
         )
+        # PR #11 R2-fix: the error message MUST name the actual env var
+        # that lifts the burst cap and MUST NOT advise raising tpm_limit
+        # (which only affects refill rate, not burst). Operators following
+        # the old advice would change the wrong knob and stay stuck.
+        msg = body["error"]["message"]
+        assert "GATEWAY_DEFAULT_TPM_BURST" in msg, (
+            f"error message must name the actionable env var; got: {msg!r}"
+        )
+        assert "tpm_limit" not in msg, (
+            f"error message must NOT advise tpm_limit (wrong knob for cost>burst); "
+            f"got: {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_over_tpm_finite_retry_returns_reduce_max_tokens(
+        self, fake_dify: FakeDifyClient
+    ) -> None:
+        """PR #11 R2 #1 sibling-sweep correctness: the REDUCE_MAX_TOKENS
+        branch survives for the genuine rate-exhaustion case (cost <=
+        burst but bucket temporarily empty). Burn through the burst with
+        a tight success, then send a second small request that's
+        rejected with a FINITE retry estimate — the SDK can back off.
+        """
+        fake_dify.blocking_response = {
+            "id": "m", "answer": "ok", "conversation_id": "c",
+            "metadata": {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+        # burst high enough for first request (default_max_output=1024
+        # → cost ~1024 fits in burst=2000), tpm low so refill is slow.
+        app = _build_app(
+            fake_dify,
+            default_tpm=60, default_tpm_burst=2000,
+            node_token_budget=10_000_000,
+        )
+        async with _client(app) as cli:
+            # First request burns ~1024 tokens of burst.
+            r1 = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            assert r1.status_code == 200
+            # Second request: burst is now ~976; another ~1024 cost
+            # doesn't fit but cost <= burst (1024 < 2000) → finite retry.
+            r2 = await cli.post(
+                "/v1/chat/completions",
+                headers=_AUTH,
+                json={"model": "m1", "messages": [{"role": "user", "content": "Hi"}]},
+            )
+        assert r2.status_code == 429
+        body = r2.json()
+        assert body["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+        # Finite retry case: Retry-After header IS present.
+        assert "retry-after" in {k.lower() for k in r2.headers}
 
     @pytest.mark.asyncio
     async def test_tpm_unlimited_by_default(self, fake_dify: FakeDifyClient) -> None:
@@ -371,7 +427,8 @@ class TestEmbeddingsTpm:
                 json={"model": "emb1", "input": long_input},
             )
         assert r.status_code == 429
-        assert r.json()["error"]["action"] == ActionCode.REDUCE_MAX_TOKENS
+        # cost > burst → MISCONFIGURED_RATE (PR #11 R2 #1 sibling-sweep)
+        assert r.json()["error"]["action"] == ActionCode.MISCONFIGURED_RATE
 
     @pytest.mark.asyncio
     async def test_embeddings_unlimited_by_default(self, fake_dify: FakeDifyClient, monkeypatch: pytest.MonkeyPatch) -> None:

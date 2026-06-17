@@ -88,17 +88,42 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
         cost=float(cost.token_cost),
     )
     if not decision.allowed:
-        # ``jittered_retry_after`` returns None when the limiter signals
-        # structurally unsatisfiable (``cost > burst``) so the exception
-        # handler omits the ``Retry-After`` header — REDUCE_MAX_TOKENS is
-        # the client's only recovery (PR #10 self-review-2 P2, deepened
-        # to the helper in self-review-3 #1).
-        raise RateLimitError(
-            f"token rate limit exceeded: {tpm} tokens/min for customer "
-            f"'{customer.customer_id}' (this request ~{cost.token_cost} tokens)",
-            action=ActionCode.REDUCE_MAX_TOKENS,
-            retry_after_s=jittered_retry_after(decision.retry_after_s),
-        )
+        # PR #11 R2 #1: sibling-sweep with middleware's MISCONFIGURED_RATE
+        # path. ``jittered_retry_after`` returns None when the limiter
+        # signals structurally unsatisfiable (``cost > burst`` — the
+        # token bucket caps at burst, so no amount of waiting fits the
+        # request). When that happens here, the request is doomed even
+        # at zero tokens spent — REDUCE_MAX_TOKENS would lure the SDK
+        # into a halve-and-retry loop. Emit MISCONFIGURED_RATE so the
+        # SDK stops retrying. Finite retry → standard REDUCE_MAX_TOKENS
+        # (the client CAN shrink and try again, even though the answer
+        # may take a minute to refill).
+        retry_after = jittered_retry_after(decision.retry_after_s)
+        if retry_after is None:
+            # PR #11 R2 #1 self-bug-fix: original wording said "raise
+            # default_tpm_burst or per-customer tpm_limit". Wrong on two
+            # counts: (a) CustomerEntry has no per-customer burst override
+            # — only ``tpm_limit`` which controls the refill rate, not the
+            # burst capacity — and (b) raising the rate doesn't help when
+            # cost > burst (the token bucket caps at burst regardless of
+            # how fast it refills). Only ``GATEWAY_DEFAULT_TPM_BURST``
+            # actually lifts the cap. Name the env var explicitly and
+            # quote the required value so the operator has an actionable
+            # fix without code-diving.
+            message = (
+                f"token budget burst ({settings.default_tpm_burst}) too small "
+                f"for a {cost.token_cost}-token request from customer "
+                f"'{customer.customer_id}'. Operator must raise "
+                f"GATEWAY_DEFAULT_TPM_BURST to >= {cost.token_cost}."
+            )
+            action = ActionCode.MISCONFIGURED_RATE
+        else:
+            message = (
+                f"token rate limit exceeded: {tpm} tokens/min for customer "
+                f"'{customer.customer_id}' (this request ~{cost.token_cost} tokens)"
+            )
+            action = ActionCode.REDUCE_MAX_TOKENS
+        raise RateLimitError(message, action=action, retry_after_s=retry_after)
 
 
 def admit(request: Request, customer: CustomerEntry, cost: RequestCost) -> AdmissionGrant:

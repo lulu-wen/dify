@@ -35,11 +35,30 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class HeadroomConfig:
-    """Thresholds + EWMA smoothing. Sourced from :class:`Settings` at startup."""
+    """Thresholds + EWMA smoothing. Sourced from :class:`Settings` at startup.
+
+    ``frozen=True`` is intentional — no runtime mutation. PR #11 moved
+    cross-field validation (``0 <= soft < hard <= 1`` and ``alpha`` range)
+    into ``__post_init__`` so EVERY construction path is covered (not
+    just env-loaded ``Settings``). ``__post_init__`` raises ValueError;
+    it doesn't ASSIGN any attribute, so it works on a frozen dataclass.
+    """
 
     soft_threshold: float  # default 0.80 — start降階
     hard_threshold: float  # default 0.95 — full reject
     ewma_alpha: float  # default 0.3 — smoothing factor (higher = more reactive)
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.soft_threshold < self.hard_threshold <= 1.0:
+            raise ValueError(
+                "headroom thresholds must satisfy "
+                "0.0 <= soft < hard <= 1.0; "
+                f"got soft={self.soft_threshold}, hard={self.hard_threshold}"
+            )
+        if not 0.0 < self.ewma_alpha <= 1.0:
+            raise ValueError(
+                f"ewma_alpha must be in (0.0, 1.0]; got {self.ewma_alpha}"
+            )
 
 
 class EwmaHeadroomCalculator:
@@ -52,16 +71,7 @@ class EwmaHeadroomCalculator:
     """
 
     def __init__(self, config: HeadroomConfig) -> None:
-        if not 0.0 <= config.soft_threshold < config.hard_threshold <= 1.0:
-            raise ValueError(
-                "headroom thresholds must satisfy "
-                "0.0 <= soft < hard <= 1.0; "
-                f"got soft={config.soft_threshold}, hard={config.hard_threshold}"
-            )
-        if not 0.0 < config.ewma_alpha <= 1.0:
-            raise ValueError(
-                f"ewma_alpha must be in (0.0, 1.0]; got {config.ewma_alpha}"
-            )
+        # Validation lives in HeadroomConfig.__post_init__ (PR #11).
         self._config = config
         # ``None`` until the first observation — first poll seeds the EWMA
         # directly (no smoothing into a 0.0 default; that would let a busy
