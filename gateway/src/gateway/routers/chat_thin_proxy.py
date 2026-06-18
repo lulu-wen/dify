@@ -120,8 +120,13 @@ async def chat_completions_thin_proxy(
     )
     grant = admit(request, customer, cost)
     try:
+        # R2 fix: narrow to ``Exception`` so CancelledError / KeyboardInterrupt
+        # propagate without us re-settling and delaying shutdown. ``settle``
+        # is documented idempotent so the original double-call pattern was
+        # already safe; the R2 narrowing is about exception semantics, not
+        # the leak risk.
         enforce_tpm(request, customer, cost)
-    except BaseException:
+    except Exception:
         settle(request, grant, actual_output_tokens=0)
         raise
 
@@ -130,30 +135,30 @@ async def chat_completions_thin_proxy(
     # parser with nulls. ``model`` is rewritten to the resolved id so
     # ``extra_body.llm_model`` (gateway-only escape hatch) doesn't leak.
     #
-    # R1 fix: also strip ``conversation_id`` (Dify-path-only state) and
-    # the legacy/new alias pair (``safety_identifier``,
-    # ``max_completion_tokens``). vLLM/LiteLLM in strict-schema mode
-    # would 422 on the unknown fields, lenient mode silently ignores
-    # but still logs them upstream — either way the gateway-internal
-    # vocabulary must not leak. After normalisation the forwarded body
-    # is a clean OpenAI chat-completions shape vLLM accepts verbatim.
+    # R2 fix: when a client sends BOTH ``max_tokens`` and
+    # ``max_completion_tokens`` (or both ``user`` and ``safety_identifier``)
+    # the previous R1 collapse logic let the legacy field win silently —
+    # ``setdefault`` is a no-op when the legacy key already exists, and the
+    # ``"user" not in forward_body`` guard fired False whenever the client
+    # set ``user`` too. The fix uses the schema-level ``effective_*``
+    # properties as the source of truth and unconditionally overwrites
+    # ``max_tokens`` / ``user`` with them after stripping both aliases.
     forward_body = body.model_dump(exclude_none=True, by_alias=True)
     forward_body["model"] = selected_model
     for gateway_only in (
-        "llm_model",          # gateway-only escape hatch
-        "conversation_id",    # Dify-path stateful turn id
-        "safety_identifier",  # OpenAI deprecation alias for ``user``
+        "llm_model",            # gateway-only escape hatch
+        "conversation_id",      # Dify-path stateful turn id
+        "safety_identifier",    # OpenAI deprecation alias for ``user``
+        "max_completion_tokens",  # OpenAI 2025 alias for ``max_tokens``
     ):
         forward_body.pop(gateway_only, None)
-    # Normalise OpenAI 2025 token-limit alias: ``max_completion_tokens`` is
-    # the new field, ``max_tokens`` is the legacy one. vLLM honours
-    # ``max_tokens``, so collapse to that and drop the alias.
-    if "max_completion_tokens" in forward_body:
-        forward_body.setdefault("max_tokens", forward_body["max_completion_tokens"])
-        forward_body.pop("max_completion_tokens", None)
-    # Likewise for end-user identity: collapse safety_identifier (popped
-    # above) into ``user`` if it was set and ``user`` wasn't.
-    if "user" not in forward_body and body.effective_user is not None:
+    # Normalise OpenAI 2025 aliases by writing the schema-resolved value
+    # back so vLLM/LiteLLM (which honour the legacy names) see exactly
+    # what the schema's precedence rules say the request meant — not a
+    # half-collapsed view that depends on which alias the client also sent.
+    if body.effective_max_tokens is not None:
+        forward_body["max_tokens"] = body.effective_max_tokens
+    if body.effective_user is not None:
         forward_body["user"] = body.effective_user
 
     if body.stream:
@@ -211,6 +216,9 @@ async def _blocking(
             resp = await client.post(
                 f"{endpoint}/v1/chat/completions",
                 json=forward_body,
+                # R2 fix: propagate the gateway's request_id so vLLM/LiteLLM
+                # logs can be correlated with gateway logs by SRE.
+                headers={"X-Request-ID": request_id},
             )
     except httpx.TimeoutException as e:
         settle(request, grant, actual_output_tokens=0)
@@ -258,8 +266,23 @@ async def _blocking(
     # Pull completion tokens out of the upstream's ``usage`` so settle
     # can refund the over-reservation. vLLM/LiteLLM both emit this in
     # OpenAI's standard shape.
+    #
+    # R2 fix: guard ``int(...)`` against non-numeric usage values. A
+    # misbehaving upstream / proxy could return
+    # ``{"usage":{"completion_tokens":"NaN"}}`` and the bare ``int(...)``
+    # would raise ValueError AFTER ``resp.json()`` succeeded but BEFORE
+    # ``settle`` ran, leaking the grant until process restart.
     usage = payload.get("usage") or {}
-    actual_completion = int(usage.get("completion_tokens") or 0)
+    raw = usage.get("completion_tokens") or 0
+    try:
+        actual_completion = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "thin_proxy.chat.upstream_non_numeric_completion_tokens",
+            request_id=request_id,
+            raw=str(raw)[:64],
+        )
+        actual_completion = 0
     settle(request, grant, actual_output_tokens=actual_completion)
     return JSONResponse(content=payload)
 
@@ -297,108 +320,170 @@ async def _stream(
     # rather than overwrite so a client that explicitly set
     # ``include_usage=False`` still gets it (gateway accounting > client
     # convenience).
-    stream_opts = dict(forward_body.get("stream_options") or {})
-    stream_opts["include_usage"] = True
-    forward_body["stream_options"] = stream_opts
+    #
+    # R2 fix: guard against ``stream_options`` arriving as a non-dict
+    # (the schema is ``extra="allow"`` so a string like
+    # ``"stream_options": "include_usage"`` would survive validation and
+    # crash ``dict(str)`` with ValueError AFTER admit/enforce_tpm
+    # committed the grant).
+    existing_opts = forward_body.get("stream_options")
+    if not isinstance(existing_opts, dict):
+        existing_opts = {}
+    forward_body["stream_options"] = {**existing_opts, "include_usage": True}
 
     timeout = httpx.Timeout(
         settings.ems_request_timeout_s, read=settings.ems_request_timeout_s
     )
 
+    # R2 fix: pre-flight the upstream POST BEFORE returning StreamingResponse
+    # so a vLLM 5xx / connect-refused surfaces as a synchronous GatewayError
+    # (clean HTTP 502/504 envelope), matching the Dify-path chat router.
+    # The prior structure returned 200 text/event-stream with the error
+    # baked into the SSE body — SDK retry helpers that branch on
+    # resp.status_code never retried; choices-only parsers silently saw an
+    # empty completion. With pre-flight, the StreamingResponse only runs
+    # when we already know the upstream is healthy; mid-stream errors
+    # (after headers are flushed) still surface as inline SSE error
+    # envelopes since there's no way to retroactively change the status.
+    #
+    # ``client`` and ``stream_cm`` are not closed here on the success path —
+    # ownership transfers to ``event_source`` whose finally closes both.
+    client = httpx.AsyncClient(timeout=timeout)
+    stream_cm = client.stream(
+        "POST",
+        f"{endpoint}/v1/chat/completions",
+        json=forward_body,
+        headers={
+            "Accept": "text/event-stream",
+            "X-Request-ID": request_id,
+        },
+    )
+    try:
+        try:
+            resp = await stream_cm.__aenter__()
+        except httpx.TimeoutException as e:
+            await client.aclose()
+            settle(request, grant, actual_output_tokens=0)
+            raise LLMTimeoutError("LLM upstream timed out") from e
+        except httpx.RequestError as e:
+            await client.aclose()
+            settle(request, grant, actual_output_tokens=0)
+            raise LLMUpstreamError(f"LLM upstream failed: {e}") from e
+
+        if not resp.is_success:
+            # R2 fix: bound the error-body read so a misbehaving upstream
+            # returning a multi-MB HTML 502 page can't OOM the gateway.
+            # We only need ~500 chars for the envelope preview anyway.
+            body_buf = bytearray()
+            try:
+                async for chunk in resp.aiter_bytes():
+                    body_buf.extend(chunk)
+                    if len(body_buf) >= 2048:
+                        break
+            except httpx.HTTPError:
+                pass
+            preview = bytes(body_buf).decode(errors="replace")[:500]
+            status = resp.status_code
+            await stream_cm.__aexit__(None, None, None)
+            await client.aclose()
+            settle(request, grant, actual_output_tokens=0)
+            logger.warning(
+                "thin_proxy.chat.stream_upstream_non_2xx",
+                request_id=request_id,
+                status=status,
+                body=preview,
+            )
+            if 400 <= status < 500:
+                raise UpstreamClientError(
+                    f"LLM upstream rejected request (HTTP {status}): {preview}",
+                    upstream_status=status,
+                )
+            raise LLMUpstreamError(
+                f"LLM upstream returned HTTP {status}: {preview}"
+            )
+    except BaseException:
+        # Pre-flight cleanup belt-and-braces — the typed except branches
+        # above already close client + settle, but if a different exception
+        # type (e.g. CancelledError during shutdown) lands here we still
+        # need to release the connection. settle() is idempotent.
+        raise
+
     async def event_source() -> AsyncIterator[bytes]:
         completion_tokens = 0  # best-effort count from the final usage chunk
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    f"{endpoint}/v1/chat/completions",
-                    json=forward_body,
-                    headers={"Accept": "text/event-stream"},
-                ) as resp:
-                    if not resp.is_success:
-                        # Surface as a clean SSE error event then [DONE].
-                        body_bytes = await resp.aread()
-                        envelope = {
-                            "error": {
-                                "message": body_bytes.decode(errors="replace")[:500],
-                                "type": "upstream_error",
-                                "code": "llm_upstream_error",
-                                "upstream_status": resp.status_code,
-                            }
-                        }
-                        yield f"data: {json.dumps(envelope)}\n\n".encode()
-                        yield b"data: [DONE]\n\n"
-                        return
-
-                    # Forward chunks 1:1. Inspect (cheaply) for the usage
-                    # block in the terminal chunk so settle can refund.
-                    # R1: parse only when the chunk is the terminal one
-                    # (empty choices + usage block), avoiding false-
-                    # positive json.loads on content text that contains
-                    # the literal word "usage".
-                    async for raw in resp.aiter_lines():
-                        if not raw:
-                            yield b"\n"
-                            continue
-                        line = raw if raw.endswith("\n") else raw + "\n"
-                        yield line.encode()
-                        if not raw.startswith("data: "):
-                            continue
-                        tail = raw[len("data: "):].strip()
-                        if not tail or tail == "[DONE]":
-                            continue
-                        # Cheap pre-filter: only parse when 'usage' is
-                        # actually present. Avoids decoding every chunk.
-                        if "usage" not in tail:
-                            continue
-                        try:
-                            obj = json.loads(tail)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                        if not isinstance(obj, dict):
-                            continue
-                        # Terminal usage chunk: choices is empty AND
-                        # usage is present. include_usage spec from
-                        # OpenAI. Content chunks with the word "usage"
-                        # in them have non-empty choices.
-                        if obj.get("choices"):
-                            continue
-                        u = obj.get("usage") or {}
+            # Forward chunks 1:1. Inspect (cheaply) for the usage block
+            # in the terminal chunk so settle can refund.
+            try:
+                async for raw in resp.aiter_lines():
+                    if not raw:
+                        yield b"\n"
+                        continue
+                    line = raw if raw.endswith("\n") else raw + "\n"
+                    yield line.encode()
+                    if not raw.startswith("data: "):
+                        continue
+                    tail = raw[len("data: "):].strip()
+                    if not tail or tail == "[DONE]":
+                        continue
+                    if "usage" not in tail:
+                        continue
+                    try:
+                        obj = json.loads(tail)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    # Terminal usage chunk: choices is empty AND usage is present.
+                    if obj.get("choices"):
+                        continue
+                    u = obj.get("usage") or {}
+                    # R2 fix: guard int() so a non-numeric completion_tokens
+                    # doesn't crash the generator mid-stream (which would
+                    # leave the client without a [DONE] sentinel).
+                    try:
                         ct = int(u.get("completion_tokens") or 0)
-                        if ct:
-                            completion_tokens = ct
-                    yield b"\n"
-        except httpx.TimeoutException as e:
-            logger.warning(
-                "thin_proxy.chat.stream_timeout",
-                request_id=request_id,
-                error=str(e),
-            )
-            envelope = {
-                "error": {
-                    "message": "LLM upstream timed out",
-                    "type": "upstream_error",
-                    "code": "llm_timeout",
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "thin_proxy.chat.stream_non_numeric_completion_tokens",
+                            request_id=request_id,
+                        )
+                        ct = 0
+                    if ct:
+                        completion_tokens = ct
+                yield b"\n"
+            except httpx.TimeoutException as e:
+                logger.warning(
+                    "thin_proxy.chat.stream_timeout",
+                    request_id=request_id,
+                    error=str(e),
+                )
+                envelope = {
+                    "error": {
+                        "message": "LLM upstream timed out",
+                        "type": "upstream_error",
+                        "code": "llm_timeout",
+                    }
                 }
-            }
-            yield f"data: {json.dumps(envelope)}\n\n".encode()
-            yield b"data: [DONE]\n\n"
-        except httpx.RequestError as e:
-            logger.warning(
-                "thin_proxy.chat.stream_transport_error",
-                request_id=request_id,
-                error=str(e),
-            )
-            envelope = {
-                "error": {
-                    "message": "LLM upstream transport error",
-                    "type": "upstream_error",
-                    "code": "llm_upstream_error",
+                yield f"data: {json.dumps(envelope)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+            except httpx.RequestError as e:
+                logger.warning(
+                    "thin_proxy.chat.stream_transport_error",
+                    request_id=request_id,
+                    error=str(e),
+                )
+                envelope = {
+                    "error": {
+                        "message": "LLM upstream transport error",
+                        "type": "upstream_error",
+                        "code": "llm_upstream_error",
+                    }
                 }
-            }
-            yield f"data: {json.dumps(envelope)}\n\n".encode()
-            yield b"data: [DONE]\n\n"
+                yield f"data: {json.dumps(envelope)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
         finally:
+            await stream_cm.__aexit__(None, None, None)
+            await client.aclose()
             settle(request, grant, actual_output_tokens=completion_tokens)
 
     return StreamingResponse(

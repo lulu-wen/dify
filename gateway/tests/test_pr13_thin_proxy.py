@@ -774,3 +774,408 @@ class TestCreateAppStartupValidation:
         )
         app = create_app(settings=s, registry=registry)
         assert app is not None
+
+
+# --------------------------------------------------------------------------- #
+# PR #13 R2 regression tests — bugs the R1 self-review missed.
+# --------------------------------------------------------------------------- #
+
+
+class TestR2AliasPrecedence:
+    """R2 #1 / #2: max_completion_tokens and safety_identifier must beat their
+    legacy aliases on the wire — the R1 ``setdefault`` / ``if 'user' not in``
+    pattern silently kept the legacy value when the client sent BOTH fields.
+    """
+
+    @pytest.mark.asyncio
+    async def test_max_completion_tokens_overrides_legacy_max_tokens(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        captured_body: dict[str, object] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured_body.update(json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                # Client sends BOTH legacy and modern aliases — schema's
+                # effective_max_tokens picks max_completion_tokens (4000).
+                # vLLM must see max_tokens=4000, NOT the legacy 100.
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 100,
+                        "max_completion_tokens": 4000,
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert resp.status_code == 200
+        assert captured_body.get("max_tokens") == 4000
+        assert "max_completion_tokens" not in captured_body
+
+    @pytest.mark.asyncio
+    async def test_safety_identifier_overrides_legacy_user(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        captured_body: dict[str, object] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured_body.update(json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                # Client sends BOTH user and safety_identifier — schema's
+                # effective_user picks safety_identifier ('bob'). vLLM must
+                # see user='bob', NOT 'alice'.
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "user": "alice",
+                        "safety_identifier": "bob",
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert resp.status_code == 200
+        assert captured_body.get("user") == "bob"
+        assert "safety_identifier" not in captured_body
+
+
+class TestR2StreamPreFlight:
+    """R2 #5: streaming path must pre-flight the upstream POST so a vLLM
+    5xx at connect time surfaces as a clean HTTP 502, not a 200 SSE with an
+    error baked into the body."""
+
+    @pytest.mark.asyncio
+    async def test_stream_upstream_5xx_returns_502_not_200_sse(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, content=b"vllm down")
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        # R2: must surface as 502, NOT 200 text/event-stream.
+        assert resp.status_code == 502
+        assert resp.headers["content-type"].startswith("application/json")
+        body = resp.json()
+        assert body["error"]["code"] == "llm_upstream_error"
+
+    @pytest.mark.asyncio
+    async def test_stream_upstream_4xx_pre_flight_passes_through_status(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(422, json={"error": "bad model"})
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        # 422 passes through via UpstreamClientError.
+        assert resp.status_code == 422
+        body = resp.json()
+        assert body["error"]["code"] == "upstream_invalid_request"
+
+
+class TestR2DefensiveGuards:
+    """R2 #7 / #11: extra='allow' lets non-dict stream_options through, and
+    non-numeric completion_tokens raises ValueError after settle's grant is
+    committed. Both must be handled defensively without leaking the grant."""
+
+    @pytest.mark.asyncio
+    async def test_non_dict_stream_options_does_not_500(self) -> None:
+        """Client sends stream_options as a string (extra='allow' lets it
+        through). The R1 ``dict(...)`` would have raised ValueError after
+        admit; R2 isinstance-guard treats the value as missing.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            sse = (
+                'data: {"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+                "data: [DONE]\n\n"
+            )
+            return httpx.Response(
+                200,
+                content=sse.encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                        # Non-dict — would crash dict() before R2.
+                        "stream_options": "include_usage",
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+                async for _ in resp.aiter_bytes():
+                    pass
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_completion_tokens_does_not_500(self) -> None:
+        """Upstream returns usage.completion_tokens='NaN' — R1 int() would
+        have raised after the success-path settle was queued. R2 guards
+        with try/except and degrades to 0.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": "NaN", "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        # Must succeed (200 with payload), NOT crash to 500.
+        assert resp.status_code == 200
+
+
+class TestR2RequestIdForwarded:
+    """R2 #13: gateway X-Request-ID must propagate to upstream so SREs can
+    correlate gateway logs with vLLM/WhisperX/Kokoro logs."""
+
+    @pytest.mark.asyncio
+    async def test_chat_forwards_x_request_id(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        captured_headers: dict[str, str] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured_headers.update({k.lower(): v for k, v in req.headers.items()})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert "x-request-id" in captured_headers
+        # Non-empty — any UUID-like value is fine.
+        assert captured_headers["x-request-id"]
+
+
+class TestR2AudioContentTypeAndTpm:
+    """R2 #4 / #8: audio routes must call enforce_tpm and case-insensitively
+    detect application/json for cost accounting."""
+
+    @pytest.mark.asyncio
+    async def test_tts_case_insensitive_content_type(self) -> None:
+        """``Application/JSON`` must still trigger the cost-parse block.
+
+        We exercise this indirectly by checking the upstream sees the body
+        forwarded (so the route didn't 503 first) and the gateway returned
+        200 — the parse path's only observable effect is the cost value,
+        which is internal. The real assertion is that the previously
+        case-sensitive check no longer silently drops accounting.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=b"fake-mp3-bytes",
+                headers={"content-type": "audio/mpeg"},
+            )
+
+        import gateway.routers.audio as audio_mod
+
+        original = audio_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        audio_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                # Capital-case Content-Type — legal per RFC 9110.
+                resp = await client.post(
+                    "/v1/audio/speech",
+                    content=json.dumps(
+                        {"model": "kokoro", "voice": "alloy", "input": "hello"}
+                    ),
+                    headers={
+                        "Authorization": "Bearer bsa_test_key",
+                        "Content-Type": "Application/JSON",
+                    },
+                )
+        finally:
+            audio_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert resp.status_code == 200

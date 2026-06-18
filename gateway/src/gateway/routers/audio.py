@@ -32,7 +32,12 @@ from gateway.errors import (
     TTSUpstreamError,
     UpstreamClientError,
 )
-from gateway.routers.ratelimit_guard import admit, estimate_request_cost, settle
+from gateway.routers.ratelimit_guard import (
+    admit,
+    enforce_tpm,
+    estimate_request_cost,
+    settle,
+)
 from gateway.translators.whisperx import (
     build_whisperx_request,
     translate_whisperx_response,
@@ -121,6 +126,15 @@ async def audio_transcriptions(
         has_knowledge_bases=False,
     )
     grant = admit(request, customer, cost)
+    # R2 fix: gate audio behind the same TPM meter chat uses so a customer
+    # at TPM cap on chat can't dodge it by switching to /v1/audio/*. The
+    # RateLimitMiddleware only enforces RPM (cost=1.0); enforce_tpm is the
+    # only per-route TPM site, and audio.py previously omitted it.
+    try:
+        enforce_tpm(request, customer, cost)
+    except Exception:
+        settle(request, grant, actual_output_tokens=0)
+        raise
 
     try:
         timeout = httpx.Timeout(settings.ems_request_timeout_s, read=settings.ems_request_timeout_s)
@@ -130,6 +144,9 @@ async def audio_transcriptions(
                     f"{endpoint}/transcribe",
                     files=files,
                     data=whisperx_req.to_form(),
+                    # R2 fix: propagate request_id so WhisperX logs can be
+                    # correlated with gateway logs.
+                    headers={"X-Request-ID": request_id},
                 )
         except httpx.TimeoutException as e:
             raise ASRTimeoutError("ASR upstream timed out") from e
@@ -204,12 +221,22 @@ async def audio_speech(request: Request) -> Response:
     # despite the shared GPU pressure. Best-effort parse of ``input``
     # from the JSON body — if parse fails (binary body, malformed JSON)
     # fall back to a fixed cost so we still admit.
+    #
+    # R2 fix: lowercase the Content-Type before matching. Per RFC 9110
+    # media types are case-insensitive, so a client posting
+    # ``Content-Type: Application/JSON`` previously skipped this block
+    # and the cost meter — defeating the R1 admission-for-audio fix.
     input_chars = 0
-    if upstream_ct.startswith("application/json"):
+    if upstream_ct.lower().startswith("application/json"):
         try:
             payload = json.loads(body_bytes)
             if isinstance(payload, dict):
-                input_chars = len(str(payload.get("input") or ""))
+                raw_input = payload.get("input")
+                # Only meter string inputs — OpenAI TTS contract requires
+                # ``input: str``. A non-string would str-coerce to its
+                # repr and pollute the metric with Python syntax.
+                if isinstance(raw_input, str):
+                    input_chars = len(raw_input)
         except (json.JSONDecodeError, TypeError):
             pass
     cost = estimate_request_cost(
@@ -220,6 +247,12 @@ async def audio_speech(request: Request) -> Response:
         has_knowledge_bases=False,
     )
     grant = admit(request, customer, cost)
+    # R2 fix: gate TTS behind the same TPM meter chat uses (see ASR comment).
+    try:
+        enforce_tpm(request, customer, cost)
+    except Exception:
+        settle(request, grant, actual_output_tokens=0)
+        raise
 
     logger.info(
         "audio.speech.forward",
@@ -236,7 +269,12 @@ async def audio_speech(request: Request) -> Response:
                 resp = await client.post(
                     f"{endpoint}/v1/audio/speech",
                     content=body_bytes,
-                    headers={"Content-Type": upstream_ct},
+                    # R2 fix: propagate request_id for cross-system trace
+                    # correlation with Kokoro logs.
+                    headers={
+                        "Content-Type": upstream_ct,
+                        "X-Request-ID": request_id,
+                    },
                 )
         except httpx.TimeoutException as e:
             raise TTSTimeoutError("TTS upstream timed out") from e
