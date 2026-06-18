@@ -979,55 +979,37 @@ class TestR2DefensiveGuards:
     committed. Both must be handled defensively without leaking the grant."""
 
     @pytest.mark.asyncio
-    async def test_non_dict_stream_options_does_not_500(self) -> None:
-        """Client sends stream_options as a string (extra='allow' lets it
-        through). The R1 ``dict(...)`` would have raised ValueError after
-        admit; R2 isinstance-guard treats the value as missing.
+    async def test_non_dict_stream_options_rejected_at_validation(self) -> None:
+        """Client sends stream_options as a string.
+
+        R2 round-1 isinstance-guarded ``dict(...)`` so the call wouldn't
+        crash. R2 round-2 declared ``stream_options: dict[str, Any]`` on
+        the schema so Pydantic rejects the string at validation time —
+        the cleanest place to fail. The router-side defence is now
+        defence-in-depth: if a future code path widens the schema again,
+        it still won't crash.
         """
         from httpx import ASGITransport, AsyncClient
 
-        def _handler(_req: httpx.Request) -> httpx.Response:
-            sse = (
-                'data: {"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
-                "data: [DONE]\n\n"
+        app, _ = _build_thin_proxy_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "stream_options": "include_usage",  # not a dict
+                },
+                headers={"Authorization": "Bearer bsa_test_key"},
             )
-            return httpx.Response(
-                200,
-                content=sse.encode(),
-                headers={"content-type": "text/event-stream"},
-            )
 
-        import gateway.routers.chat_thin_proxy as chat_mod
-
-        original = chat_mod.httpx.AsyncClient
-
-        def _patched(*args, **kwargs):
-            kwargs["transport"] = httpx.MockTransport(_handler)
-            return original(*args, **kwargs)
-
-        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
-        try:
-            app, _ = _build_thin_proxy_app()
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://gateway"
-            ) as client:
-                resp = await client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "m1",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "stream": True,
-                        # Non-dict — would crash dict() before R2.
-                        "stream_options": "include_usage",
-                    },
-                    headers={"Authorization": "Bearer bsa_test_key"},
-                )
-                async for _ in resp.aiter_bytes():
-                    pass
-        finally:
-            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
-
-        assert resp.status_code == 200
+        # 400/422 with the OpenAI envelope — schema rejects at the edge.
+        assert resp.status_code in (400, 422)
+        body = resp.json()
+        assert body["error"]["type"] == "invalid_request_error"
 
     @pytest.mark.asyncio
     async def test_non_numeric_completion_tokens_does_not_500(self) -> None:
@@ -1179,3 +1161,372 @@ class TestR2AudioContentTypeAndTpm:
             audio_mod.httpx.AsyncClient = original  # type: ignore[misc]
 
         assert resp.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# PR #13 R2 round-2 tests — architectural fixes (entitlement, upstream auth,
+# max-body middleware, schema tightening + cost-by-n).
+# --------------------------------------------------------------------------- #
+
+
+class TestR2AudioEntitlement:
+    """R2 #3: audio_enabled=False must reject /v1/audio/* with 403."""
+
+    @pytest.mark.asyncio
+    async def test_audio_transcriptions_blocked_without_entitlement(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        # Build a customer with audio_enabled explicitly False.
+        no_audio = make_customer(
+            sdk_key="bsa_no_audio", customer_id="no-audio-co",
+            audio_enabled=False,
+        )
+        registry = CustomerRegistry.from_entries([no_audio])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            rate_limit_enabled=False,
+            thin_proxy_mode=True,
+            llm_endpoint="http://test/llm",
+            asr_endpoint="http://test/asr",
+            tts_endpoint="http://test/tts",
+            strict_startup=False,
+        )
+        app = create_app(settings=settings, registry=registry)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("a.wav", b"x", "audio/wav")},
+                data={"model": "whisper-1"},
+                headers={"Authorization": "Bearer bsa_no_audio"},
+            )
+
+        assert resp.status_code == 403
+        body = resp.json()
+        assert body["error"]["code"] == "not_entitled"
+
+    @pytest.mark.asyncio
+    async def test_audio_speech_blocked_without_entitlement(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        no_audio = make_customer(
+            sdk_key="bsa_no_audio", customer_id="no-audio-co",
+            audio_enabled=False,
+        )
+        registry = CustomerRegistry.from_entries([no_audio])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            rate_limit_enabled=False,
+            thin_proxy_mode=True,
+            llm_endpoint="http://test/llm",
+            asr_endpoint="http://test/asr",
+            tts_endpoint="http://test/tts",
+            strict_startup=False,
+        )
+        app = create_app(settings=settings, registry=registry)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/audio/speech",
+                json={"model": "kokoro", "voice": "alloy", "input": "hi"},
+                headers={"Authorization": "Bearer bsa_no_audio"},
+            )
+
+        assert resp.status_code == 403
+        body = resp.json()
+        assert body["error"]["code"] == "not_entitled"
+
+
+class TestR2UpstreamBearer:
+    """R2 #6: when settings.llm_api_key is set, the chat router must send
+    Authorization: Bearer <key> on the upstream POST. When empty, no
+    Authorization header is sent."""
+
+    @pytest.mark.asyncio
+    async def test_chat_forwards_bearer_when_key_set(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        captured: dict[str, str] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured.update({k.lower(): v for k, v in req.headers.items()})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            customer = make_customer(sdk_key="bsa_t", customer_id="co")
+            registry = CustomerRegistry.from_entries([customer])
+            settings = Settings(
+                registry_path="unused.yaml",
+                log_json=False,
+                rate_limit_enabled=False,
+                thin_proxy_mode=True,
+                llm_endpoint="http://test/llm",
+                llm_api_key="sk-upstream-secret",
+                strict_startup=False,
+            )
+            app = create_app(settings=settings, registry=registry)
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": "Bearer bsa_t"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert captured.get("authorization") == "Bearer sk-upstream-secret"
+
+    @pytest.mark.asyncio
+    async def test_chat_omits_bearer_when_key_empty(self) -> None:
+        """Default (empty key) → no Authorization header sent upstream.
+
+        Tailscale-isolated deployments where no upstream auth exists must
+        not send the literal ``Bearer `` (empty) which would confuse some
+        proxies.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        captured: dict[str, str] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured.update({k.lower(): v for k, v in req.headers.items()})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()  # default llm_api_key=""
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert "authorization" not in captured
+
+
+class TestR2BodySizeLimit:
+    """R2 #9: BodySizeLimitMiddleware rejects oversized requests with 413
+    before any downstream code allocates."""
+
+    @pytest.mark.asyncio
+    async def test_oversize_body_rejected_413(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        customer = make_customer(sdk_key="bsa_t", customer_id="co")
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            rate_limit_enabled=False,
+            thin_proxy_mode=True,
+            llm_endpoint="http://test/llm",
+            asr_endpoint="http://test/asr",
+            tts_endpoint="http://test/tts",
+            max_body_bytes=100,  # tiny cap for the test
+            strict_startup=False,
+        )
+        app = create_app(settings=settings, registry=registry)
+        big_body = b"x" * 5000  # well over the 100-byte cap
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/audio/speech",
+                content=big_body,
+                headers={
+                    "Authorization": "Bearer bsa_t",
+                    "Content-Type": "application/json",
+                },
+            )
+
+        assert resp.status_code == 413
+        body = resp.json()
+        assert body["error"]["code"] == "payload_too_large"
+
+    @pytest.mark.asyncio
+    async def test_max_body_bytes_zero_disables_cap(self) -> None:
+        """``max_body_bytes=0`` disables the cap so tests can post big bodies."""
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        customer = make_customer(sdk_key="bsa_t", customer_id="co")
+        registry = CustomerRegistry.from_entries([customer])
+        settings = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            rate_limit_enabled=False,
+            thin_proxy_mode=True,
+            llm_endpoint="http://test/llm",
+            asr_endpoint="http://test/asr",
+            tts_endpoint="http://test/tts",
+            max_body_bytes=0,  # disabled
+            strict_startup=False,
+        )
+
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"fake", headers={"content-type": "audio/mpeg"}
+            )
+
+        import gateway.routers.audio as audio_mod
+
+        original = audio_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        audio_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app = create_app(settings=settings, registry=registry)
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                # 50 KB body — well over the default cap, but middleware
+                # is disabled.
+                resp = await client.post(
+                    "/v1/audio/speech",
+                    content=json.dumps({"model": "kokoro", "voice": "x", "input": "y" * 50_000}),
+                    headers={
+                        "Authorization": "Bearer bsa_t",
+                        "Content-Type": "application/json",
+                    },
+                )
+        finally:
+            audio_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        # Should pass through to the upstream (not 413).
+        assert resp.status_code == 200
+
+
+class TestR2CostScalesByN:
+    """R2 #14: cost estimator must scale max_output_tokens by ``n`` so a
+    client sending n>1 doesn't get the same admission budget as n=1.
+
+    We exercise this indirectly by checking that the forwarded body
+    carries n verbatim AND that admission still goes through (the
+    accounting is internal). The math contract: n=5 with max_tokens=100
+    reserves 500 tokens, not 100.
+    """
+
+    @pytest.mark.asyncio
+    async def test_n_field_forwarded(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        captured_body: dict[str, object] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            captured_body.update(json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+        import gateway.routers.chat_thin_proxy as chat_mod
+
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_thin_proxy_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                resp = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 100,
+                        "n": 5,
+                    },
+                    headers={"Authorization": "Bearer bsa_test_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert resp.status_code == 200
+        assert captured_body.get("n") == 5
+        # max_tokens stays 100 on the wire (per-completion). Internal
+        # admission reserved n * max_tokens = 500.
+        assert captured_body.get("max_tokens") == 100

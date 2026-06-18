@@ -83,6 +83,21 @@ class UnknownModelError(GatewayError):
     code = "model_not_found"
 
 
+class NotEntitledError(GatewayError):
+    """Authenticated customer lacks entitlement for the requested feature. → 403.
+
+    Distinct from :class:`InvalidSdkKeyError` (401, "your key is bad") and
+    :class:`UnknownModelError` (404, "this model isn't on your list"). 403
+    semantics: "we know who you are, your key is valid, but this feature
+    isn't on your plan". First consumer is the audio routes (PR #13 R2 #3)
+    — customers without ``audio_enabled`` hit this on /v1/audio/*.
+    """
+
+    status_code = 403
+    error_type = "invalid_request_error"
+    code = "not_entitled"
+
+
 class UnknownDatasetError(GatewayError):
     """Client referenced a dataset they don't own (or that doesn't exist). → 404.
 

@@ -66,6 +66,22 @@ def _messages_chars(messages: list[ChatMessage]) -> int:
     return sum(len(m.content) for m in messages if m.content)
 
 
+def _upstream_headers(api_key: str, request_id: str) -> dict[str, str]:
+    """Build the standard upstream-call headers: bearer (when set) + request id.
+
+    PR #13 R2 #6: operators can set ``GATEWAY_LLM_API_KEY`` /
+    ``GATEWAY_ASR_API_KEY`` / ``GATEWAY_TTS_API_KEY`` when the EMS
+    endpoint is hardened with LITELLM_MASTER_KEY-style bearer auth. An
+    empty string means "no auth" (Tailscale-isolated default) and
+    suppresses the Authorization header entirely so we don't send the
+    literal ``Bearer `` to upstream.
+    """
+    headers: dict[str, str] = {"X-Request-ID": request_id}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions_thin_proxy(
     request: Request, body: ChatCompletionRequest
@@ -111,10 +127,18 @@ async def chat_completions_thin_proxy(
     # got the ``default_max_output_tokens`` fallback — wildly
     # under-budgeting then forwarding a field name vLLM ignores → KV
     # cache OOM the admission gate exists to prevent.
+    # R2 fix #14: scale the per-completion cap by ``n`` so a client
+    # sending ``n=5`` reserves 5x the output budget. The previous code
+    # only saw ``max_output_tokens`` → admission gate's OOM guarantee
+    # was silently n-times off whenever the client asked for multiple
+    # choices.
+    per_completion = body.effective_max_tokens
+    n = body.n or 1
+    scaled_max_output = per_completion * n if per_completion is not None else None
     cost = estimate_request_cost(
         request,
         input_chars=_messages_chars(body.messages),
-        max_output_tokens=body.effective_max_tokens,
+        max_output_tokens=scaled_max_output,
         model_id=selected_model,
         has_knowledge_bases=False,  # thin-proxy has no RAG
     )
@@ -216,9 +240,9 @@ async def _blocking(
             resp = await client.post(
                 f"{endpoint}/v1/chat/completions",
                 json=forward_body,
-                # R2 fix: propagate the gateway's request_id so vLLM/LiteLLM
-                # logs can be correlated with gateway logs by SRE.
-                headers={"X-Request-ID": request_id},
+                # R2 fix: propagate request_id for log correlation and
+                # forward the configured upstream bearer (R2 #6) when set.
+                headers=_upstream_headers(settings.llm_api_key, request_id),
             )
     except httpx.TimeoutException as e:
         settle(request, grant, actual_output_tokens=0)
@@ -355,7 +379,7 @@ async def _stream(
         json=forward_body,
         headers={
             "Accept": "text/event-stream",
-            "X-Request-ID": request_id,
+            **_upstream_headers(settings.llm_api_key, request_id),
         },
     )
     try:

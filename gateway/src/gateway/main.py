@@ -18,6 +18,7 @@ from gateway.dify.client import DifyClient
 from gateway.errors import GatewayError, InvalidRequestError
 from gateway.lifecycle import TaskSupervisor, safe_shutdown_step
 from gateway.middleware.auth import AuthMiddleware
+from gateway.middleware.body_size import BodySizeLimitMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.middleware.rate_limit import RateLimitMiddleware
 from gateway.ratelimit import (
@@ -264,12 +265,15 @@ def create_app(
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):
-    #   request flow:  Logging -> Auth -> RateLimit -> route
+    #   request flow:  Logging -> BodySize -> Auth -> RateLimit -> route
     # - Logging outermost: request id exists even on auth / rate-limit failure.
+    # - BodySize before Auth: a multi-GB body shouldn't even get to the auth
+    #   parser (PR #13 R2 #9). Added AFTER Auth here so it ends up outer.
     # - RateLimit inner to Auth: it keys on request.state.customer, which
     #   AuthMiddleware sets. Added BEFORE Auth here so it ends up inner.
     app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, settings=settings)
     app.add_middleware(AuthMiddleware, registry=registry)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
 
     # PR #13: thin-proxy mode swaps the Dify-based chat router for one

@@ -258,6 +258,19 @@ class CustomerEntry(BaseModel):
             "positive when set, same rationale as rpm_limit."
         ),
     )
+    audio_enabled: bool = Field(
+        default=False,
+        description=(
+            "Audio entitlement gate (PR #13 R2 #3). When False, the audio "
+            "routes (``/v1/audio/transcriptions`` and ``/v1/audio/speech``) "
+            "reject this customer with 403 even though their SDK key is "
+            "valid. Default False so chat-only tenants don't silently get "
+            "GPU-hungry ASR/TTS access just because thin-proxy mode is on; "
+            "flip per tenant in registry.yaml when their plan includes audio. "
+            "Has no effect on Dify-mode deployments (audio routes are not "
+            "mounted there)."
+        ),
+    )
 
     @field_validator("models")
     @classmethod

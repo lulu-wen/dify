@@ -57,7 +57,12 @@ def make_customer(
     model_ids: tuple[str, ...] = ("m1",),
     embedding_model_ids: tuple[str, ...] = ("emb1",),
     knowledge_bases: list[str] | None = None,
+    audio_enabled: bool = True,
 ) -> CustomerEntry:
+    # ``audio_enabled`` defaults True in the test fixture so the existing
+    # audio-router tests don't all need to opt in explicitly. Tests that
+    # exercise the entitlement-gate (PR #13 R2 #3) build a False-flagged
+    # customer.
     return CustomerEntry(
         sdk_key=sdk_key,
         customer_id=customer_id,
@@ -88,6 +93,7 @@ def make_customer(
             for eid in embedding_model_ids
         ],
         knowledge_bases=knowledge_bases or [],
+        audio_enabled=audio_enabled,
     )
 
 

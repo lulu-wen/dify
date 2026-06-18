@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, Response
 from gateway.errors import (
     ASRTimeoutError,
     ASRUpstreamError,
+    NotEntitledError,
     ServiceUnavailableError,
     TTSTimeoutError,
     TTSUpstreamError,
@@ -46,6 +47,19 @@ from gateway.translators.whisperx import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+def _upstream_headers(api_key: str, request_id: str) -> dict[str, str]:
+    """Build standard upstream headers: bearer (when set) + request id.
+
+    Duplicated from chat_thin_proxy.py rather than imported to keep
+    router modules independent — a future shared upstream-utils module
+    can absorb both call sites (R2 reuse finding).
+    """
+    headers: dict[str, str] = {"X-Request-ID": request_id}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 # --------------------------------------------------------------------------- #
@@ -74,6 +88,13 @@ async def audio_transcriptions(
     settings = request.app.state.settings
     request_id = request.state.request_id
     customer = request.state.customer
+    # R2 fix #3: per-customer entitlement gate. Chat-only tenants don't
+    # silently get GPU-hungry transcription access just because the
+    # gateway is in thin-proxy mode.
+    if not customer.audio_enabled:
+        raise NotEntitledError(
+            "customer is not entitled to /v1/audio/transcriptions"
+        )
     endpoint = settings.asr_endpoint.rstrip("/")
     if not endpoint:
         raise ServiceUnavailableError(
@@ -144,9 +165,8 @@ async def audio_transcriptions(
                     f"{endpoint}/transcribe",
                     files=files,
                     data=whisperx_req.to_form(),
-                    # R2 fix: propagate request_id so WhisperX logs can be
-                    # correlated with gateway logs.
-                    headers={"X-Request-ID": request_id},
+                    # R2 fix: propagate request_id + upstream bearer (R2 #6).
+                    headers=_upstream_headers(settings.asr_api_key, request_id),
                 )
         except httpx.TimeoutException as e:
             raise ASRTimeoutError("ASR upstream timed out") from e
@@ -206,6 +226,11 @@ async def audio_speech(request: Request) -> Response:
     settings = request.app.state.settings
     request_id = request.state.request_id
     customer = request.state.customer
+    # R2 fix #3: per-customer entitlement gate (mirrors transcriptions).
+    if not customer.audio_enabled:
+        raise NotEntitledError(
+            "customer is not entitled to /v1/audio/speech"
+        )
     endpoint = settings.tts_endpoint.rstrip("/")
     if not endpoint:
         raise ServiceUnavailableError(
@@ -269,11 +294,11 @@ async def audio_speech(request: Request) -> Response:
                 resp = await client.post(
                     f"{endpoint}/v1/audio/speech",
                     content=body_bytes,
-                    # R2 fix: propagate request_id for cross-system trace
-                    # correlation with Kokoro logs.
+                    # R2 fix: request_id + upstream bearer (R2 #6) on top
+                    # of the inbound Content-Type passthrough.
                     headers={
                         "Content-Type": upstream_ct,
-                        "X-Request-ID": request_id,
+                        **_upstream_headers(settings.tts_api_key, request_id),
                     },
                 )
         except httpx.TimeoutException as e:

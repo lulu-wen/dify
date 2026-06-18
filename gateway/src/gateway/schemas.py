@@ -65,6 +65,32 @@ class ChatCompletionRequest(BaseModel):
         description="OpenAI 2025+ replacement for ``user``; preferred when both are provided",
     )
 
+    # PR #13 R2 #14: declare the common OpenAI fields the cost estimator
+    # cares about so we can read them on the typed schema instead of
+    # poking forward_body. Critically ``n`` multiplies output tokens —
+    # without declaring it, the cost estimator only saw max_output_tokens
+    # and a client sending n=10 made the admission gate's OOM guarantee
+    # silently 10x off. Other declared fields (top_p, stop, response_format,
+    # tools, tool_choice, seed, presence_penalty, frequency_penalty,
+    # logit_bias, logprobs, top_logprobs, parallel_tool_calls) don't
+    # affect cost but get type-checked validation at the gateway edge
+    # instead of being deferred to vLLM. ``extra="allow"`` is preserved
+    # so unknown future OpenAI fields still pass through.
+    n: int | None = Field(default=None, ge=1, le=128)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    stop: str | list[str] | None = Field(default=None)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    logit_bias: dict[str, float] | None = Field(default=None)
+    logprobs: bool | None = Field(default=None)
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    response_format: dict[str, Any] | None = Field(default=None)
+    seed: int | None = Field(default=None)
+    tools: list[dict[str, Any]] | None = Field(default=None)
+    tool_choice: str | dict[str, Any] | None = Field(default=None)
+    parallel_tool_calls: bool | None = Field(default=None)
+    stream_options: dict[str, Any] | None = Field(default=None)
+
     # Gateway extensions (kept under ``extra_body`` for client SDK compatibility).
     # The OpenAI Python SDK flattens ``extra_body={"foo":...}`` into top-level
     # JSON fields, so these appear at the request root despite being passed via

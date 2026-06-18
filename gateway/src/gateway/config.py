@@ -326,3 +326,34 @@ class Settings(BaseSettings):
             "take tens of seconds for long audio."
         ),
     )
+    # PR #13 R2 #6: optional upstream bearer keys. EMS deployments hardened
+    # with LITELLM_MASTER_KEY (a standard prod recommendation) would 401
+    # every request without this. Default empty = no Authorization header
+    # sent, which suits the Tailscale-CGNAT-isolated PoC setup but isn't
+    # safe to assume in general production.
+    llm_api_key: str = Field(
+        default="",
+        description=(
+            "Bearer token for the EMS LLM endpoint. When set, the chat "
+            "thin-proxy router sends ``Authorization: Bearer <key>``. "
+            "Leave empty for Tailscale-isolated deployments."
+        ),
+    )
+    asr_api_key: str = Field(
+        default="",
+        description="Bearer token for the EMS ASR endpoint. See ``llm_api_key``.",
+    )
+    tts_api_key: str = Field(
+        default="",
+        description="Bearer token for the EMS TTS endpoint. See ``llm_api_key``.",
+    )
+    max_body_bytes: int = Field(
+        default=25 * 1024 * 1024,  # 25 MB
+        ge=0,
+        description=(
+            "Request body size cap enforced by BodySizeLimitMiddleware "
+            "(PR #13 R2 #9). Set to 0 to disable the cap (tests only). "
+            "Default 25 MB suits chat / embeddings / short ASR clips; "
+            "raise when on-prem deployments need long-form audio uploads."
+        ),
+    )
