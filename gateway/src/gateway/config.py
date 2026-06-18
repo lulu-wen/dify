@@ -268,3 +268,61 @@ class Settings(BaseSettings):
     # reload) is covered by one source of truth. ``create_app`` constructs
     # HeadroomConfig unconditionally at startup so config errors STILL
     # surface during Lifespan startup, not at first request.
+
+    # ------------------------------------------------------------------ #
+    # PR #13 (Phase A1): thin-proxy mode for EMS-managed AI services      #
+    # ------------------------------------------------------------------ #
+    # When EMS provides LLM/ASR/TTS as separate equipment (Dify is just
+    # one option among many), the gateway becomes a pure routing layer:
+    # auth + rate-limit + schema-translate + forward. Dify orchestration
+    # becomes opt-in per customer. See Notion ``EMS Integration``.
+
+    thin_proxy_mode: bool = Field(
+        default=False,
+        description=(
+            "When True, the gateway becomes a thin proxy: chat completions "
+            "forward directly to ``llm_endpoint`` (bypassing Dify, no "
+            "App lazy-build), the new /v1/audio/* routes activate, and "
+            "startup health check skips Dify reachability since there "
+            "may be no Dify at all. Customers in registry.yaml can still "
+            "carry ``dify`` config for the existing path (per-request "
+            "override TBD); when ``dify`` is omitted the customer is "
+            "thin-proxy-only and chat goes direct to LLM."
+        ),
+    )
+    llm_endpoint: str = Field(
+        default="",
+        description=(
+            "EMS-provided LLM endpoint base URL. Reached as "
+            "``{llm_endpoint}/v1/chat/completions`` (OpenAI-compatible). "
+            "Must be set when thin_proxy_mode=true and any customer "
+            "lacks a ``dify`` config. Example: ``http://100.88.9.9/llm``."
+        ),
+    )
+    asr_endpoint: str = Field(
+        default="",
+        description=(
+            "EMS-provided ASR endpoint base URL (WhisperX). Reached as "
+            "``{asr_endpoint}/transcribe`` (multipart). The gateway's "
+            "/v1/audio/transcriptions translates the OpenAI Whisper "
+            "schema to WhisperX's native form. Example: "
+            "``http://100.88.9.9/asr``."
+        ),
+    )
+    tts_endpoint: str = Field(
+        default="",
+        description=(
+            "EMS-provided TTS endpoint base URL (Kokoro). Already OpenAI-"
+            "compatible; the gateway's /v1/audio/speech is pure "
+            "passthrough. Example: ``http://100.88.9.9/tts``."
+        ),
+    )
+    ems_request_timeout_s: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "HTTP timeout for thin-proxy forwarding to EMS endpoints. "
+            "Generous default because WhisperX batch transcription can "
+            "take tens of seconds for long audio."
+        ),
+    )

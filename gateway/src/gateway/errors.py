@@ -184,3 +184,64 @@ class ServiceUnavailableError(GatewayError):
     status_code = 503
     error_type = "service_unavailable"
     code = "service_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# PR #13 R1: per-service upstream errors for thin-proxy mode.
+#
+# Original Dify*Error codes implied 'Customer's Dify deployment failed' —
+# but in thin-proxy mode the upstream is vLLM (LLM), WhisperX (ASR), or
+# Kokoro (TTS), none of which involve Dify. Reusing Dify*Error there
+# misleads operator dashboards and runbooks keyed on the ``code`` field.
+# Each non-Dify upstream now has its own typed class with a distinct
+# ``code`` ("llm_upstream_error", etc.) so the OpenAI envelope sent to
+# clients carries the truth.
+# --------------------------------------------------------------------------- #
+
+
+class LLMUpstreamError(GatewayError):
+    """EMS-managed LLM endpoint (vLLM/LiteLLM) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "llm_upstream_error"
+
+
+class LLMTimeoutError(GatewayError):
+    """EMS-managed LLM endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "llm_timeout"
+
+
+class ASRUpstreamError(GatewayError):
+    """EMS-managed ASR endpoint (WhisperX) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "asr_upstream_error"
+
+
+class ASRTimeoutError(GatewayError):
+    """EMS-managed ASR endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "asr_timeout"
+
+
+class TTSUpstreamError(GatewayError):
+    """EMS-managed TTS endpoint (Kokoro) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "tts_upstream_error"
+
+
+class TTSTimeoutError(GatewayError):
+    """EMS-managed TTS endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "tts_timeout"

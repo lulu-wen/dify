@@ -33,7 +33,9 @@ from gateway.ratelimit.runtime_metrics import (
     run_metrics_poll_loop,
 )
 from gateway.registry import CustomerEntry, CustomerRegistry
+from gateway.routers import audio as audio_router
 from gateway.routers import chat as chat_router
+from gateway.routers import chat_thin_proxy as chat_thin_proxy_router
 from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
 from gateway.routers import files as files_router
@@ -93,6 +95,18 @@ def create_app(
     """
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
+
+    # PR #13 R1 #8: thin-proxy mode REQUIRES a non-empty llm_endpoint —
+    # without it, every /v1/chat/completions request would hit
+    # ServiceUnavailableError. Fail at startup so operators see the
+    # misconfiguration immediately, not on first traffic. ASR/TTS
+    # endpoints stay optional (a deployment with no audio hardware is
+    # legitimate; the audio routes 503 cleanly when called).
+    if settings.thin_proxy_mode and not settings.llm_endpoint.strip():
+        raise RuntimeError(
+            "thin_proxy_mode=true requires GATEWAY_LLM_ENDPOINT to be set "
+            "(empty value would 503 every chat request)."
+        )
 
     registry = registry or CustomerRegistry.from_yaml(settings.registry_path)
     logger.info("gateway.bootstrap", customers=len(registry))
@@ -159,22 +173,37 @@ def create_app(
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
         try:
-            # PR #5: validate registry against real Dify deployments before
-            # accepting traffic. Raises RuntimeError (and so aborts uvicorn
-            # startup with non-zero exit) when settings.strict_startup is
-            # True; otherwise logs warnings and continues.
-            #
-            # Codex review-3 P2: read the factory from app.state at call
-            # time, NOT from the closure captured during create_app. Tests
-            # (see ``conftest.py::app``) replace
-            # ``app.state.dify_client_factory`` AFTER ``create_app`` returns
-            # so requests hit a FakeDifyClient instead of doing real HTTP.
-            active_factory = app_instance.state.dify_client_factory
-            await run_startup_check(
-                registry,
-                active_factory,
-                strict=settings.strict_startup,
-            )
+            # PR #13: thin-proxy mode bypasses Dify entirely — the
+            # startup check would fail (or worse, succeed against
+            # stale Dify) since the chat/audio routes never call
+            # AppManager / DifyClient. Skip the L2/L3/L4 round-trip;
+            # the registry's pydantic validation (L1) has already run.
+            if settings.thin_proxy_mode:
+                logger.info(
+                    "gateway.startup.thin_proxy_mode",
+                    llm_endpoint=settings.llm_endpoint,
+                    asr_endpoint=settings.asr_endpoint,
+                    tts_endpoint=settings.tts_endpoint,
+                )
+            else:
+                # PR #5: validate registry against real Dify deployments
+                # before accepting traffic. Raises RuntimeError (and so
+                # aborts uvicorn startup with non-zero exit) when
+                # settings.strict_startup is True; otherwise logs warnings
+                # and continues.
+                #
+                # Codex review-3 P2: read the factory from app.state at
+                # call time, NOT from the closure captured during
+                # create_app. Tests (see ``conftest.py::app``) replace
+                # ``app.state.dify_client_factory`` AFTER ``create_app``
+                # returns so requests hit a FakeDifyClient instead of
+                # doing real HTTP.
+                active_factory = app_instance.state.dify_client_factory
+                await run_startup_check(
+                    registry,
+                    active_factory,
+                    strict=settings.strict_startup,
+                )
             # PR #9: start the headroom polling task AFTER startup checks
             # pass. PR #11: dispatched through task_supervisor so shutdown
             # gathers it with the chat router's cancel POSTs in one
@@ -243,7 +272,17 @@ def create_app(
     app.add_middleware(AuthMiddleware, registry=registry)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
 
-    app.include_router(chat_router.router)
+    # PR #13: thin-proxy mode swaps the Dify-based chat router for one
+    # that forwards directly to the EMS LLM endpoint, and mounts the
+    # new audio router (ASR + TTS). The Dify-flavoured datasets / files
+    # routes stay mounted unconditionally — clients calling them when
+    # no Dify is wired up will get a clean 502 from the path, not a
+    # confusing 404.
+    if settings.thin_proxy_mode:
+        app.include_router(chat_thin_proxy_router.router)
+        app.include_router(audio_router.router)
+    else:
+        app.include_router(chat_router.router)
     app.include_router(embeddings_router.router)
     app.include_router(models_router.router)
     app.include_router(datasets_router.router)
