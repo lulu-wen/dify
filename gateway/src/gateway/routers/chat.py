@@ -225,11 +225,25 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         # top_k to the matching value, so the allowance is a real bound.
         has_knowledge_bases=bool(customer.knowledge_bases),
     )
-    grant = admit(request, customer, cost)
+    # PR #12a R1 finding #3: admit() / enforce_tpm() / get_app_key() /
+    # stream_cm.__aenter__() are preflight steps for a streaming chat — if
+    # any of them raise, event_source() never runs, so the old code never
+    # emitted GATEWAY_STREAM_DISCONNECT_TOTAL for the most common upstream-
+    # down scenarios. Each of the four sites below now emits
+    # ``reason="preflight_failed"`` for streaming requests before
+    # re-raising.
+    try:
+        grant = admit(request, customer, cost)
+    except BaseException:
+        if body.stream:
+            GATEWAY_STREAM_DISCONNECT_TOTAL.labels(reason="preflight_failed").inc()
+        raise
     try:
         enforce_tpm(request, customer, cost)
     except BaseException:
         settle(request, grant, actual_output_tokens=0)
+        if body.stream:
+            GATEWAY_STREAM_DISCONNECT_TOTAL.labels(reason="preflight_failed").inc()
         raise
 
     # Heavy now: get_app_key may lazy-build the Dify App (console login + DSL
@@ -240,6 +254,8 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
         dify_client: DifyClient = dify_factory(customer)
     except BaseException:
         settle(request, grant, actual_output_tokens=0)
+        if body.stream:
+            GATEWAY_STREAM_DISCONNECT_TOTAL.labels(reason="preflight_failed").inc()
         raise
 
     # ---- streaming branch ----
@@ -267,6 +283,9 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
             dify_lines = await stream_cm.__aenter__()
         except BaseException:
             settle(request, grant, actual_output_tokens=0)
+            # PR #12a R1: stream open failed → record so the disconnect
+            # dashboard sees the most common Dify-down failure mode.
+            GATEWAY_STREAM_DISCONNECT_TOTAL.labels(reason="preflight_failed").inc()
             raise
 
         # PR #10: side-channel to drive best-effort cancellation. PR #11
@@ -299,14 +318,26 @@ async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any
                     yield chunk
             finally:
                 # PR #12a: record how the stream ended for ops visibility.
-                # ``normal`` = Dify said message_end; ``early_termination``
-                # = task started but we're closing before Dify finalized
-                # (client disconnect OR upstream error caught by
-                # ``graceful_upstream_stream``); ``no_first_event`` = the
-                # stream closed before Dify even returned a task_id (e.g.
-                # initial Dify call 5xx).
+                # PR #12a R1 finding #6 fix: Dify's ``error`` event used to
+                # land under ``normal`` because the converter flipped
+                # ``dify_finalized=True`` for both ``message_end`` and
+                # ``error``. The new ``finalized_with_error`` flag (set
+                # only on ``error``) lets us split them — so dashboards
+                # for upstream-error rate actually see those events.
+                #
+                #   ``normal`` — Dify said message_end (clean completion)
+                #   ``upstream_error`` — Dify emitted ``error`` event
+                #     OR ``graceful_upstream_stream`` caught a mid-stream
+                #     DifyUpstreamError / DifyTimeoutError / httpx.RequestError
+                #   ``early_termination`` — task started but we're closing
+                #     before Dify finalized (client disconnect)
+                #   ``no_first_event`` — stream closed before Dify even
+                #     returned a task_id (e.g. SSE drop with zero events)
                 if cancel_sink.dify_finalized:
-                    _disconnect_reason = "normal"
+                    if cancel_sink.finalized_with_error:
+                        _disconnect_reason = "upstream_error"
+                    else:
+                        _disconnect_reason = "normal"
                 elif cancel_sink.task_id:
                     _disconnect_reason = "early_termination"
                 else:

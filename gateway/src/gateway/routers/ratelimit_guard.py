@@ -19,6 +19,7 @@ import time
 from fastapi import Request
 
 from gateway.errors import OverloadError, RateLimitError
+from gateway.observability.labels import normalise_route
 from gateway.observability.metrics import (
     GATEWAY_ADMISSION_TOTAL,
     GATEWAY_SETTLE_SECONDS,
@@ -130,10 +131,12 @@ def enforce_tpm(request: Request, customer: CustomerEntry, cost: RequestCost) ->
             )
             action = ActionCode.REDUCE_MAX_TOKENS
         # PR #12a: emit admission_total before raising. Labels keep
-        # cardinality low (action enum x small route set), no customer_id.
+        # cardinality low — ``action`` enum times normalised ``route``
+        # (path params collapsed to ``:id`` so /v1/datasets/{id}/...
+        # doesn't explode per dataset). R1 fix: pass through normalise_route.
         GATEWAY_ADMISSION_TOTAL.labels(
             action=action.value,
-            route=request.url.path,
+            route=normalise_route(request.url.path),
         ).inc()
         raise RateLimitError(message, action=action, retry_after_s=retry_after)
 
@@ -157,10 +160,16 @@ def admit(request: Request, customer: CustomerEntry, cost: RequestCost) -> Admis
         # jittered backoff. Pass 0.0 explicitly: ``jittered_retry_after``
         # now treats None as "unsatisfiable, omit Retry-After", which is
         # not what we want here (PR #10 self-review-3 #1).
-        # PR #12a: emit admission_total on reject path.
+        # PR #12a: emit admission_total on reject path. R1 fix: use
+        # normalised route + always fall back to ActionCode.REJECTED_OVERLOAD
+        # so the label vocabulary stays inside the enum (the hand-typed
+        # "rejected_overload" diverged from ActionCode.REJECTED_OVERLOAD.value).
+        action_label = (
+            grant.action.value if grant.action is not None else ActionCode.REJECTED_OVERLOAD.value
+        )
         GATEWAY_ADMISSION_TOTAL.labels(
-            action=(grant.action.value if grant.action is not None else "rejected_overload"),
-            route=request.url.path,
+            action=action_label,
+            route=normalise_route(request.url.path),
         ).inc()
         raise OverloadError(
             f"node at capacity: admitting ~{cost.token_cost} tokens would "
@@ -170,9 +179,10 @@ def admit(request: Request, customer: CustomerEntry, cost: RequestCost) -> Admis
         )
     # PR #12a: emit admission_total on accept path. Symmetric with reject
     # so dashboards can show accepted vs rejected counts side by side.
+    # R1 fix: use normalised route (was raw path → cardinality bomb).
     GATEWAY_ADMISSION_TOTAL.labels(
         action="accepted",
-        route=request.url.path,
+        route=normalise_route(request.url.path),
     ).inc()
     return grant
 

@@ -43,17 +43,23 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class CancelSink:
     """Side-channel state from the SSE converter to the chat router's
-    streaming ``finally`` (PR #10, typed by PR #11).
+    streaming ``finally`` (PR #10, typed by PR #11, refined PR #12a R1).
 
-    Two fields populated as the converter consumes Dify events:
+    Fields populated as the converter consumes Dify events:
 
     - ``task_id``: first non-empty Dify ``task_id`` seen — the cancel
       target. ``None`` if no event carried one (no upstream activity).
     - ``dify_finalized``: True after ``message_end`` OR ``error`` event;
       means Dify already tore the task down so a stop call would be a
       redundant 404. The router skips the cancel POST when True.
+    - ``finalized_with_error``: True only when Dify emitted an ``error``
+      event (NOT on normal ``message_end``). Lets the chat router's
+      ``GATEWAY_STREAM_DISCONNECT_TOTAL`` instrumentation distinguish
+      genuine upstream errors from natural completion — both used to
+      land under ``reason="normal"`` because ``dify_finalized`` flipped
+      True in both cases (PR #12a R1 finding #6).
 
-    Both attributes are mutated in-place by the converter — this is a
+    All attributes are mutated in-place by the converter — this is a
     side-channel by design so the converter stays a plain async iterator
     (existing callers that don't care about cancellation pass nothing).
     Replaces the loose ``dict[str, Any]`` shape PR #10 originally used
@@ -62,6 +68,7 @@ class CancelSink:
 
     task_id: str | None = None
     dify_finalized: bool = False
+    finalized_with_error: bool = False
 
 
 def parse_dify_sse_line(line: str) -> dict[str, Any] | None:
@@ -243,8 +250,13 @@ async def dify_to_openai_chunks(
             )
             # PR #10: Dify already reported the error and tore down the
             # task — no point in firing a stop call.
+            # PR #12a R1: also flag ``finalized_with_error`` so the chat
+            # router's stream_disconnect metric distinguishes upstream
+            # errors from natural completion (both used to land under
+            # ``reason="normal"``).
             if cancel_sink is not None:
                 cancel_sink.dify_finalized = True
+                cancel_sink.finalized_with_error = True
             finish_reason = "content_filter"
             break
 
