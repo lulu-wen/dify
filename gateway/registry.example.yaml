@@ -51,6 +51,12 @@ customers:
         dimensions: 1024
     # Optional: knowledge bases (Dataset IDs) to attach to every auto-built App.
     knowledge_bases: []
+    # PR #13 R2 #3: audio entitlement gate. When ``thin_proxy_mode=true``,
+    # /v1/audio/transcriptions (WhisperX) and /v1/audio/speech (Kokoro) are
+    # only accessible to customers with this flag set to true. Default false
+    # so chat-only tenants don't silently get GPU-hungry ASR/TTS access.
+    # Has no effect on Dify-mode deployments (audio routes are not mounted).
+    audio_enabled: true
 
   - sdk_key: "bsa_dev_example_def456"
     customer_id: "customer-b"
