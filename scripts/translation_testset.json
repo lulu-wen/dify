@@ -1,0 +1,219 @@
+{
+  "_meta": {
+    "version": "0.1.0",
+    "description": "Translation benchmark test set covering general / base-station / legal domains across multi-source -> {zh-TW, en}.",
+    "language_pairs": ["en->zh-TW", "ja->zh-TW", "es->zh-TW", "fr->zh-TW", "zh-TW->en", "ja->en"],
+    "categories": {
+      "general": "Everyday speech and conversational content. Baseline quality.",
+      "base_station": "5G/RAN domain terminology — PRACH, OFDM, handover, beamforming etc. Stress-tests technical translation.",
+      "legal": "Legal / contractual / regulatory terminology. Cross-system mapping is famously hard (common law vs civil law concepts don't translate 1:1)."
+    },
+    "credits": {
+      "general": "Curated from FLORES-200 style sentences (CC-BY-SA 4.0 compatible structure).",
+      "base_station": "Hand-curated by project team — base station SDK use case.",
+      "legal": "Hand-curated — legal translation reference standard."
+    },
+    "expansion_notes": [
+      "Add more entries by appending to `cases`. Each entry must have a unique `id`.",
+      "Categories can be extended (e.g. 'medical', 'finance') without script changes — benchmark groups by category automatically.",
+      "When adding a new language pair, ensure COMET supports both source and target (wmt22-comet-da covers all common langs).",
+      "Reference translations should be high quality — they are the ground truth COMET scores against."
+    ]
+  },
+  "cases": [
+    {
+      "id": "general-en-zh-001",
+      "src_lang": "en",
+      "src_text": "It's a nice day today, would you like to go for a walk?",
+      "ref_lang": "zh-TW",
+      "ref_text": "今天天氣不錯，要不要去散步？",
+      "category": "general"
+    },
+    {
+      "id": "general-en-zh-002",
+      "src_lang": "en",
+      "src_text": "I'll have the same coffee I had yesterday, but with oat milk this time.",
+      "ref_lang": "zh-TW",
+      "ref_text": "我要跟昨天一樣的咖啡，但這次換成燕麥奶。",
+      "category": "general"
+    },
+    {
+      "id": "general-ja-zh-001",
+      "src_lang": "ja",
+      "src_text": "電車が遅れているので、会議には少し遅れて到着します。",
+      "ref_lang": "zh-TW",
+      "ref_text": "電車誤點了，所以我會晚一點到會議現場。",
+      "category": "general"
+    },
+    {
+      "id": "general-es-zh-001",
+      "src_lang": "es",
+      "src_text": "El servicio al cliente está cerrado los domingos, vuelva el lunes.",
+      "ref_lang": "zh-TW",
+      "ref_text": "客服週日休息，請星期一再來。",
+      "category": "general"
+    },
+    {
+      "id": "general-fr-en-001",
+      "src_lang": "fr",
+      "src_text": "Je vous remercie de votre patience, votre commande sera expédiée demain.",
+      "ref_lang": "en",
+      "ref_text": "Thank you for your patience, your order will be shipped tomorrow.",
+      "category": "general"
+    },
+    {
+      "id": "general-zh-en-001",
+      "src_lang": "zh-TW",
+      "src_text": "這家餐廳的服務態度真的需要改進，等了一個小時菜還沒上。",
+      "ref_lang": "en",
+      "ref_text": "This restaurant's service really needs to improve — we waited an hour and the food still hasn't arrived.",
+      "category": "general"
+    },
+    {
+      "id": "general-ja-en-001",
+      "src_lang": "ja",
+      "src_text": "彼の言うことは半分は嘘で、もう半分は誇張だと思ったほうがいい。",
+      "ref_lang": "en",
+      "ref_text": "You should assume that half of what he says is a lie and the other half is exaggeration.",
+      "category": "general"
+    },
+
+    {
+      "id": "base-en-zh-001",
+      "src_lang": "en",
+      "src_text": "The PRACH signal from the base station is being interfered with by adjacent cells.",
+      "ref_lang": "zh-TW",
+      "ref_text": "基地台的 PRACH 訊號受到相鄰細胞的干擾。",
+      "category": "base_station"
+    },
+    {
+      "id": "base-en-zh-002",
+      "src_lang": "en",
+      "src_text": "We changed the OFDM subcarrier spacing to 30 kHz to support higher throughput in this band.",
+      "ref_lang": "zh-TW",
+      "ref_text": "我們把 OFDM 子載波間隔調成 30 kHz，以便在這個頻段支援更高的吞吐量。",
+      "category": "base_station"
+    },
+    {
+      "id": "base-en-zh-003",
+      "src_lang": "en",
+      "src_text": "Handover failures from gNodeB-A to gNodeB-B increased after the beamforming weights were updated.",
+      "ref_lang": "zh-TW",
+      "ref_text": "在波束成形權重更新後，從 gNodeB-A 切換到 gNodeB-B 的切換失敗次數增加了。",
+      "category": "base_station"
+    },
+    {
+      "id": "base-ja-zh-001",
+      "src_lang": "ja",
+      "src_text": "セル間干渉が大きいので、隣接セルのSSB送信タイミングを再同期してください。",
+      "ref_lang": "zh-TW",
+      "ref_text": "細胞間干擾過大，請重新同步鄰近細胞的 SSB 發送時序。",
+      "category": "base_station"
+    },
+    {
+      "id": "base-en-zh-004",
+      "src_lang": "en",
+      "src_text": "Run a RACH preamble sweep on band n78 to confirm whether the issue is RF or baseband.",
+      "ref_lang": "zh-TW",
+      "ref_text": "在 n78 頻段執行 RACH preamble 掃描，確認問題是來自 RF 還是基頻。",
+      "category": "base_station"
+    },
+    {
+      "id": "base-zh-en-001",
+      "src_lang": "zh-TW",
+      "src_text": "上行 BLER 超過 10% 之後，UE 會觸發 SRS 重新組態。",
+      "ref_lang": "en",
+      "ref_text": "Once uplink BLER exceeds 10%, the UE triggers an SRS reconfiguration.",
+      "category": "base_station"
+    },
+    {
+      "id": "base-zh-en-002",
+      "src_lang": "zh-TW",
+      "src_text": "請檢查 CU-DU 之間的 F1AP 介面是否有 SCTP 連線中斷的紀錄。",
+      "ref_lang": "en",
+      "ref_text": "Please check whether the F1AP interface between CU and DU has any SCTP connection-drop records.",
+      "category": "base_station"
+    },
+    {
+      "id": "base-en-zh-005",
+      "src_lang": "en",
+      "src_text": "Network slicing requires the DU to maintain separate QoS flows per S-NSSAI.",
+      "ref_lang": "zh-TW",
+      "ref_text": "網路切片要求 DU 為每個 S-NSSAI 維護獨立的 QoS 流。",
+      "category": "base_station"
+    },
+
+    {
+      "id": "legal-en-zh-001",
+      "src_lang": "en",
+      "src_text": "The defendant shall indemnify and hold harmless the plaintiff against any third-party claims arising from breach of this Agreement.",
+      "ref_lang": "zh-TW",
+      "ref_text": "被告應就因違反本協議所引發之任何第三人請求，補償原告並使其免受損害。",
+      "category": "legal"
+    },
+    {
+      "id": "legal-en-zh-002",
+      "src_lang": "en",
+      "src_text": "This clause shall survive the termination of the Agreement and remain enforceable for a period of five (5) years thereafter.",
+      "ref_lang": "zh-TW",
+      "ref_text": "本條款於本協議終止後仍應繼續有效，並於其後五（5）年內持續具有強制執行力。",
+      "category": "legal"
+    },
+    {
+      "id": "legal-en-zh-003",
+      "src_lang": "en",
+      "src_text": "Force majeure events include, but are not limited to, acts of God, war, terrorism, and government-imposed restrictions.",
+      "ref_lang": "zh-TW",
+      "ref_text": "不可抗力事件包含但不限於天災、戰爭、恐怖行動及政府實施之限制措施。",
+      "category": "legal"
+    },
+    {
+      "id": "legal-zh-en-001",
+      "src_lang": "zh-TW",
+      "src_text": "本契約之解釋與適用，悉依中華民國法律為準據法，並以台灣台北地方法院為第一審管轄法院。",
+      "ref_lang": "en",
+      "ref_text": "The interpretation and application of this contract shall be governed by the laws of the Republic of China, and the Taiwan Taipei District Court shall be the court of first instance.",
+      "category": "legal"
+    },
+    {
+      "id": "legal-zh-en-002",
+      "src_lang": "zh-TW",
+      "src_text": "甲方未經乙方書面同意，不得將本契約之權利義務轉讓予第三人。",
+      "ref_lang": "en",
+      "ref_text": "Party A shall not assign the rights and obligations under this contract to any third party without Party B's written consent.",
+      "category": "legal"
+    },
+    {
+      "id": "legal-ja-zh-001",
+      "src_lang": "ja",
+      "src_text": "前項の規定に違反した場合、相手方は何らの催告を要せず、本契約を解除することができる。",
+      "ref_lang": "zh-TW",
+      "ref_text": "違反前項規定者，相對人無須任何催告即得解除本契約。",
+      "category": "legal"
+    },
+    {
+      "id": "legal-fr-en-001",
+      "src_lang": "fr",
+      "src_text": "Le présent contrat est régi par le droit français et tout litige relève de la compétence exclusive du Tribunal de commerce de Paris.",
+      "ref_lang": "en",
+      "ref_text": "This contract is governed by French law and any dispute shall fall under the exclusive jurisdiction of the Paris Commercial Court.",
+      "category": "legal"
+    },
+    {
+      "id": "legal-en-zh-004",
+      "src_lang": "en",
+      "src_text": "Processing of personal data shall comply with Article 6 of the GDPR, requiring a lawful basis for each processing activity.",
+      "ref_lang": "zh-TW",
+      "ref_text": "個人資料之處理應符合 GDPR 第 6 條規定，每項處理活動皆需具備合法依據。",
+      "category": "legal"
+    },
+    {
+      "id": "legal-en-zh-005",
+      "src_lang": "en",
+      "src_text": "Any patent infringement claim shall be resolved through binding arbitration administered by the WIPO Arbitration and Mediation Center.",
+      "ref_lang": "zh-TW",
+      "ref_text": "任何專利侵權主張應透過由 WIPO 仲裁與調解中心管理之具拘束力仲裁程序解決。",
+      "category": "legal"
+    }
+  ]
+}
