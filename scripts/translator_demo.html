@@ -157,11 +157,16 @@
  *
  * For now this hits the EMS Traefik directly for E2E validation.
  */
-const GATEWAY   = "http://100.88.9.9";
-const ASR_URL   = GATEWAY + "/asr";
-const LLM_URL   = GATEWAY + "/llm";
-const TTS_URL   = GATEWAY + "/tts";
-let   LLM_MODEL = "google/gemma-2-9b-it";
+// PR #13: now hits the AI SDK Gateway (which forwards to EMS via Tailscale).
+// VS Code Remote SSH forwards Spark's 8000 to the laptop, so the browser
+// reaches the gateway via localhost.
+const GATEWAY   = "http://localhost:8000";
+const SDK_KEY   = "bsa_test_local_a0b727929d297299";
+const ASR_URL   = GATEWAY;
+const LLM_URL   = GATEWAY;
+const TTS_URL   = GATEWAY;
+let   LLM_MODEL = "qwen3.6-35b";
+const AUTH_HEADER = { "Authorization": `Bearer ${SDK_KEY}` };
 
 const ASR_SAMPLE_RATE = 16000;
 
@@ -190,10 +195,15 @@ function banner(msg){ const b=$("errBanner"); if(!msg){b.style.display="none";re
 async function asrTranscribe(wavBlob, language) {
   const form = new FormData();
   form.append("file", wavBlob, "audio.wav");
+  form.append("model", "whisper-1");  // OpenAI shape requires this
   if (language) form.append("language", language);
-  log("req", `POST ${ASR_URL}/transcribe   (multipart file=audio.wav, ${(wavBlob.size/1024|0)} KB${language?`, language=${language}`:""})`);
+  log("req", `POST ${ASR_URL}/v1/audio/transcriptions   (multipart file=audio.wav, ${(wavBlob.size/1024|0)} KB${language?`, language=${language}`:""})`);
   const t0 = performance.now();
-  const r = await fetch(ASR_URL + "/transcribe", { method:"POST", body:form });
+  const r = await fetch(ASR_URL + "/v1/audio/transcriptions", {
+    method: "POST",
+    headers: AUTH_HEADER,
+    body: form,
+  });
   if (!r.ok) throw new Error(`ASR HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
   const data = await r.json();
   let text = (data.text || "").trim();
@@ -217,7 +227,9 @@ async function llmTranslate(text, targetLabel) {
   log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  (user-only prompt, temp=0)`);
   const t0 = performance.now();
   const r = await fetch(LLM_URL + "/v1/chat/completions", {
-    method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...AUTH_HEADER },
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
   const data = await r.json();
@@ -232,7 +244,9 @@ async function ttsSpeak(text, voice) {
   log("req", `POST ${TTS_URL}/v1/audio/speech   voice=${voice}  (${text.length} chars) → audio/mpeg`);
   const t0 = performance.now();
   const r = await fetch(TTS_URL + "/v1/audio/speech", {
-    method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...AUTH_HEADER },
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`TTS HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
   const blob = await r.blob();
@@ -241,11 +255,11 @@ async function ttsSpeak(text, voice) {
   return { blob, ms };
 }
 async function ttsVoices() {
-  const r = await fetch(TTS_URL + "/v1/audio/voices");
-  if (!r.ok) return [];
-  const d = await r.json();
-  const arr = Array.isArray(d) ? d : (d.voices || d.data || []);
-  return arr.map(v => typeof v === "string" ? v : (v.id || v.name)).filter(Boolean);
+  // /v1/audio/voices is a Kokoro-specific endpoint not exposed by the
+  // gateway (OpenAI's TTS API has no voice-list endpoint). Fall back to
+  // the hardcoded TARGETS[].voice list. If you ever want dynamic voices,
+  // add a /v1/audio/voices passthrough to routers/audio.py.
+  return [];
 }
 
 let busy = false;
@@ -396,15 +410,28 @@ async function init() {
 async function healthCheck() {
   setDot("d-llm","warn");
   try {
-    const r = await fetch(LLM_URL+"/v1/models"); const d = await r.json();
+    const r = await fetch(LLM_URL+"/v1/models", { headers: AUTH_HEADER });
+    const d = await r.json();
     const id = d.data?.[0]?.id;
     if (id){ LLM_MODEL = id; $("llm-model").textContent = id; setDot("d-llm","ok"); log("res",`LLM models: ${d.data.map(m=>m.id).join(", ")}`); }
     else setDot("d-llm","err");
   } catch(e){ setDot("d-llm","err"); log("err","LLM 不可達: "+e.message); }
-  setDot("d-tts", voicesLoaded ? "ok" : "err");
+  // Gateway has no per-service ping endpoints (those belonged to the
+  // direct-EMS demo). Use the gateway's /health as a single reachability
+  // probe — if the gateway is up, ASR/TTS reachability is decided per
+  // call (a real ASR/TTS outage surfaces as 502/503 from the gateway).
   setDot("d-asr","warn");
-  try { const r = await fetch(ASR_URL+"/"); setDot("d-asr", r.ok ? "ok":"err"); if(r.ok) log("res","ASR 服務在線"); }
-  catch(e){ setDot("d-asr","err"); log("err","ASR 不可達: "+e.message); }
+  setDot("d-tts","warn");
+  try {
+    const r = await fetch(GATEWAY + "/health");
+    const ok = r.ok ? "ok" : "err";
+    setDot("d-asr", ok);
+    setDot("d-tts", ok);
+    if (r.ok) log("res", "Gateway /health 在線 (ASR/TTS 由 gateway 轉發到 EMS)");
+  } catch(e) {
+    setDot("d-asr","err"); setDot("d-tts","err");
+    log("err", "Gateway 不可達: " + e.message);
+  }
 }
 function setDot(id, state){ const d=$(id); d.className = "dot "+(state||""); }
 $("recheck").onclick = healthCheck;
