@@ -71,23 +71,33 @@ TIER_PROFILES: dict[str, dict[str, Any]] = {
 
 
 def _mangle_low(ref: str, src: str) -> str:
-    """Simulate a low-quality translation: lowercase + truncate."""
+    """Simulate a low-quality translation: half the reference, truncated.
+
+    R3 fix (#2): the previous version used ``ref.split()`` (whitespace),
+    which keeps CJK strings as a single "word" — meaning Chinese refs
+    would round-trip unchanged and mock-low scored ≈ mock-high in COMET,
+    destroying the quality gradient the mock exists to demonstrate.
+    Use character-level truncation that works for any script.
+    """
     if not ref:
-        return src.lower()
-    words = ref.split()
-    truncated = " ".join(words[: max(1, len(words) // 2)])
-    return truncated.lower() + " ..."
+        return (src or "")[:8] + " ..."
+    cut = max(3, len(ref) // 2)
+    return ref[:cut] + " ..."
 
 
 def _mangle_mid(ref: str, src: str) -> str:
-    """Simulate a mid-quality translation: drop one word, lowercase first char."""
+    """Simulate a mid-quality translation: drop every 4th character.
+
+    R3 fix (#2): character-level mangling (was whitespace-token-based).
+    Roughly mimics a mid-tier model that gets most of the meaning but
+    fumbles word-boundary tokens — drops ~25% of the signal so COMET
+    consistently scores between low and high.
+    """
     if not ref:
-        return src
-    words = ref.split()
-    if len(words) <= 3:
+        return src or ""
+    if len(ref) <= 4:
         return ref
-    dropped = words[:1] + words[2:]
-    return " ".join(dropped)
+    return "".join(c for i, c in enumerate(ref) if i % 4 != 3)
 
 
 @app.get("/v1/models")
@@ -172,17 +182,27 @@ def _blocking_response(completion: str, model: str) -> dict[str, Any]:
 
 
 async def _sse_stream(completion: str, profile: dict[str, Any], model: str):
-    """Emit completion as SSE chunks with simulated TTFT + per-token delay."""
+    """Emit completion as SSE chunks with simulated TTFT + per-token delay.
+
+    R3 fix #2/#13: chunk by ~3-char windows rather than by whitespace so
+    CJK output streams as multiple chunks (CJK has no spaces → previous
+    word-split produced ONE chunk and total ≈ TTFT, masking real TTFT
+    capture bugs in the benchmark). 3 chars/chunk roughly matches vLLM's
+    sub-token streaming granularity for CJK.
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
-    # Initial TTFT delay before first token.
+    # Initial TTFT delay before first content chunk.
     await asyncio.sleep(profile["ttft_ms"] / 1000)
 
-    # Stream the completion roughly word by word.
-    tokens = completion.split(" ") if completion else [""]
-    for i, tok in enumerate(tokens):
-        delta = tok if i == 0 else " " + tok
+    # Split into ~3-char windows so CJK and Latin both stream multi-chunk.
+    if not completion:
+        windows: list[str] = [""]
+    else:
+        windows = [completion[i : i + 3] for i in range(0, len(completion), 3)]
+
+    for delta in windows:
         chunk = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
