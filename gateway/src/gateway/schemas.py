@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 # ---------- Request ----------
 
@@ -123,11 +123,20 @@ class ChatCompletionRequest(BaseModel):
             "deployment modes."
         ),
     )
-    dataset_ids: list[str] | None = Field(
+    dataset_ids: list[Annotated[str, StringConstraints(max_length=128)]] | None = Field(
         default=None,
+        max_length=50,  # R1 #11: cap to prevent amplification via 404 envelope echo
         description=(
-            "Override the customer's default ``knowledge_bases`` list for "
-            "this request. Only meaningful with ``use_rag=True``."
+            "[v1: NOT YET SUPPORTED] Reserved for future per-request "
+            "override of the customer's ``knowledge_bases`` list. v1 "
+            "REJECTS any non-None value with 400 because the override is "
+            "not threaded through the Dify ``AppManager`` yet — without "
+            "the wiring, accepting the field would silently retrieve "
+            "from ALL of the customer's knowledge bases regardless of "
+            "the override, which is a security-sensitive contract "
+            "violation. Set to None (or omit) until the follow-up PR "
+            "lands. Cap of 50 items per list and 128 chars per id is "
+            "enforced to prevent 404-envelope echo amplification."
         ),
     )
 

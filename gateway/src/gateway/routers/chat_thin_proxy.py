@@ -91,6 +91,20 @@ async def chat_completions_thin_proxy(
     customer: CustomerEntry = request.state.customer
     request_id: str = request.state.request_id
 
+    # PR #14 R1 #5: in pure ``mode=thin_proxy`` deployments this router
+    # is mounted directly (no hybrid dispatcher in front), so a client
+    # request with ``use_rag=true`` lands here. Without an explicit
+    # rejection it would silently thin-proxy → no RAG → confused
+    # customer wondering why their toggle does nothing. The hybrid
+    # dispatcher already filters use_rag before delegating, so this
+    # path only fires under pure thin_proxy mounting.
+    if body.use_rag:
+        raise InvalidRequestError(
+            "use_rag=true is not supported in thin-proxy mode "
+            "(deploy mode='hybrid' or mode='dify' for RAG)",
+            param="use_rag",
+        )
+
     endpoint = settings.llm_endpoint.rstrip("/")
     if not endpoint:
         raise ServiceUnavailableError(
@@ -170,10 +184,16 @@ async def chat_completions_thin_proxy(
     forward_body = body.model_dump(exclude_none=True, by_alias=True)
     forward_body["model"] = selected_model
     for gateway_only in (
-        "llm_model",            # gateway-only escape hatch
-        "conversation_id",      # Dify-path stateful turn id
-        "safety_identifier",    # OpenAI deprecation alias for ``user``
+        "llm_model",              # gateway-only escape hatch
+        "conversation_id",        # Dify-path stateful turn id
+        "safety_identifier",      # OpenAI deprecation alias for ``user``
         "max_completion_tokens",  # OpenAI 2025 alias for ``max_tokens``
+        # PR #14 R1 #1: hybrid-mode routing fields must NEVER reach vLLM.
+        # Strict-validation vLLM rejects unknown body fields with 400;
+        # lenient LiteLLM forwards them, polluting prompt-cache keys and
+        # leaking gateway-internal vocabulary into upstream access logs.
+        "use_rag",
+        "dataset_ids",
     ):
         forward_body.pop(gateway_only, None)
     # Normalise OpenAI 2025 aliases by writing the schema-resolved value

@@ -274,15 +274,17 @@ class CustomerEntry(BaseModel):
     rag_enabled: bool = Field(
         default=False,
         description=(
-            "RAG entitlement gate (PR #14). In hybrid mode, a request body "
-            "with ``use_rag: true`` is routed through Dify for retrieval + "
-            "DSL orchestration; this flag must be True for the customer or "
-            "the request is rejected with 403 ``not_entitled``. RAG also "
-            "requires the customer's ``dify`` block to be populated — "
-            "without that the request gets a 503 misconfigured-backend. "
-            "Has no effect in pure ``mode=\"dify\"`` deployments (every "
-            "request goes through Dify regardless) or pure ``mode=\"thin_proxy\"`` "
-            "(RAG is unavailable entirely)."
+            "**HYBRID MODE ONLY** — RAG entitlement gate (PR #14). In "
+            "``mode=\"hybrid\"`` deployments, a request body with "
+            "``use_rag: true`` is routed through Dify for retrieval + "
+            "DSL orchestration; this flag must be True or the request "
+            "is rejected with 403 ``not_entitled``. **In pure ``dify`` "
+            "mode this flag is IGNORED** — every request goes through "
+            "Dify regardless of this value, so setting ``rag_enabled: "
+            "false`` on a dify-mode deployment will NOT prevent RAG "
+            "for that customer (use a separate gateway or per-customer "
+            "model whitelist to control that). In pure ``thin_proxy`` "
+            "mode RAG is unavailable entirely; this flag is moot."
         ),
     )
 

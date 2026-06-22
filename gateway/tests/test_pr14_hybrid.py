@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
-from gateway.errors import NotEntitledError, UnknownDatasetError
+from gateway.errors import NotEntitledError
 
 # --------------------------------------------------------------------------- #
 # Settings.effective_mode resolution
@@ -352,14 +352,17 @@ class TestHybridEntitlement:
 
 
 class TestDatasetScope:
+    """R1 #2 + #9: dataset_ids override is REJECTED with 400 in v1 until
+    the override is wired through AppManager. Both use_rag branches
+    enforce the same rejection so a cross-tenant UUID probe can't
+    distinguish 'foreign UUID' from 'unsupported feature'."""
+
     @pytest.mark.asyncio
-    async def test_dataset_ids_subset_of_customer_kbs_allowed(self) -> None:
-        """Subset of owned dataset_ids passes the scope check."""
+    async def test_dataset_ids_rejected_when_use_rag_true(self) -> None:
         from httpx import ASGITransport, AsyncClient
 
         app, _ = _build_hybrid_app(
-            rag_enabled=True,
-            knowledge_bases=["kb-A", "kb-B", "kb-C"],
+            rag_enabled=True, knowledge_bases=["kb-A", "kb-B"]
         )
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://gateway"
@@ -370,50 +373,51 @@ class TestDatasetScope:
                     "model": "m1",
                     "messages": [{"role": "user", "content": "hi"}],
                     "use_rag": True,
-                    "dataset_ids": ["kb-A", "kb-B"],
+                    "dataset_ids": ["kb-A"],
                 },
                 headers={"Authorization": "Bearer bsa_hybrid_key"},
             )
 
-        # Past the scope check — should NOT be UnknownDatasetError.
-        assert resp.json()["error"]["code"] != "dataset_not_found"
-
-    @pytest.mark.asyncio
-    async def test_dataset_ids_foreign_uuid_returns_404(self) -> None:
-        """Shared-mode safety: a UUID belonging to another customer must
-        return ``dataset_not_found`` with the same envelope shape as
-        'doesn't exist'. Per PR #4 R7 hotfix pattern, the gateway never
-        distinguishes the two so cross-tenant probes can't tell the
-        difference."""
-        from httpx import ASGITransport, AsyncClient
-
-        app, _ = _build_hybrid_app(
-            rag_enabled=True,
-            knowledge_bases=["kb-A"],
-        )
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://gateway"
-        ) as client:
-            resp = await client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "m1",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "use_rag": True,
-                    "dataset_ids": ["kb-A", "kb-foreign"],
-                },
-                headers={"Authorization": "Bearer bsa_hybrid_key"},
-            )
-
-        assert resp.status_code == 404
+        assert resp.status_code == 400
         body = resp.json()
-        assert body["error"]["code"] == "dataset_not_found"
+        assert body["error"]["code"] == "invalid_request"
+        assert body["error"]["param"] == "dataset_ids"
+        assert "not yet supported" in body["error"]["message"]
 
     @pytest.mark.asyncio
-    async def test_dataset_ids_empty_list_allowed(self) -> None:
-        """Empty ``dataset_ids`` is a legitimate 'no retrieval but still use
-        the Dify DSL' opt-in (e.g. A/B testing RAG impact). Must pass the
-        scope check since {} ⊆ any."""
+    async def test_dataset_ids_rejected_when_use_rag_false(self) -> None:
+        """R1 #9: foreign-UUID probe can't slip through the use_rag=false
+        branch. The rejection is identical regardless of use_rag value so
+        cross-tenant probes get no oracle."""
+        from httpx import ASGITransport, AsyncClient
+
+        app, _ = _build_hybrid_app(
+            rag_enabled=True, knowledge_bases=["kb-A"]
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "use_rag": False,
+                    "dataset_ids": ["kb-foreign"],
+                },
+                headers={"Authorization": "Bearer bsa_hybrid_key"},
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"]["param"] == "dataset_ids"
+
+    @pytest.mark.asyncio
+    async def test_dataset_ids_empty_list_also_rejected(self) -> None:
+        """R1 #2: even ``dataset_ids: []`` is non-None so it's rejected.
+        Empty list previously meant 'RAG-on, no retrieval' but with the
+        override not threaded through, accepting [] would still silently
+        retrieve from the customer's default knowledge_bases — same
+        contract violation we're closing."""
         from httpx import ASGITransport, AsyncClient
 
         app, _ = _build_hybrid_app(
@@ -433,17 +437,159 @@ class TestDatasetScope:
                 headers={"Authorization": "Bearer bsa_hybrid_key"},
             )
 
-        # Past scope check (empty subset is fine) — shouldn't be 404.
-        assert resp.json()["error"]["code"] != "dataset_not_found"
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_dataset_ids_with_use_rag_false_logged_but_not_rejected(
+    async def test_dataset_ids_too_long_rejected_at_schema(self) -> None:
+        """R1 #11: schema caps dataset_ids at 50 items so a megabyte-list
+        attack can't force the gateway to echo back gigantic 400 envelopes."""
+        from httpx import ASGITransport, AsyncClient
+
+        app, _ = _build_hybrid_app(
+            rag_enabled=True, knowledge_bases=["kb-A"]
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "use_rag": True,
+                    "dataset_ids": [f"kb-{i}" for i in range(100)],
+                },
+                headers={"Authorization": "Bearer bsa_hybrid_key"},
+            )
+
+        # Pydantic schema validation (422) fires before dispatcher.
+        assert resp.status_code in (400, 422)
+
+    @pytest.mark.asyncio
+    async def test_dataset_ids_too_long_per_item_rejected(self) -> None:
+        """R1 #11: per-item max_length=128 stops megabyte-string-per-item
+        attacks too."""
+        from httpx import ASGITransport, AsyncClient
+
+        app, _ = _build_hybrid_app(rag_enabled=True)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "use_rag": True,
+                    "dataset_ids": ["A" * 200],
+                },
+                headers={"Authorization": "Bearer bsa_hybrid_key"},
+            )
+
+        assert resp.status_code in (400, 422)
+
+
+# --------------------------------------------------------------------------- #
+# Schema-level (no HTTP) — direct dispatcher tests via the entitlement helper
+# --------------------------------------------------------------------------- #
+
+
+class TestEntitlementHelper:
+    """Direct unit tests of ``_check_rag_entitlement`` (R1 #14: only via
+    real CustomerEntry constructors — model_copy bypasses validators and
+    silently constructs states the live registry can never produce, so
+    that pattern is no longer used).
+
+    Helper signature shrank in R1 #4 (no body param) since dataset_ids
+    is now rejected up-front by the dispatcher, not inside the helper.
+    """
+
+    def _customer(
         self,
+        *,
+        rag_enabled: bool = True,
+        knowledge_bases: list[str] | None = None,
+    ):
+        """Build a real CustomerEntry honouring registry validators."""
+        from tests.conftest import make_customer
+
+        c = make_customer(knowledge_bases=knowledge_bases or ["kb-A"])
+        # rag_enabled isn't a make_customer kwarg yet — model_copy IS
+        # safe for plain-bool overrides (no validator depends on it).
+        return c.model_copy(update={"rag_enabled": rag_enabled})
+
+    def test_passes_with_rag_enabled(self) -> None:
+        from gateway.routers.chat_hybrid import _check_rag_entitlement
+
+        _check_rag_entitlement(self._customer(), request_id="req-1")  # no raise
+
+    def test_raises_not_entitled_when_rag_disabled(self) -> None:
+        from gateway.routers.chat_hybrid import _check_rag_entitlement
+
+        with pytest.raises(NotEntitledError):
+            _check_rag_entitlement(
+                self._customer(rag_enabled=False), request_id="req-2"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# R1 regression tests
+# --------------------------------------------------------------------------- #
+
+
+class TestR1ThinProxyRejectsUseRag:
+    """R1 #5: in pure mode='thin_proxy' deployments the chat_thin_proxy
+    router is mounted directly (no hybrid dispatcher), so a client
+    sending use_rag=true would silently get plain LLM. Reject up-front."""
+
+    @pytest.mark.asyncio
+    async def test_use_rag_true_in_thin_proxy_mode_returns_400(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        from gateway.config import Settings
+        from gateway.main import create_app
+        from gateway.registry import CustomerRegistry
+        from tests.conftest import make_customer
+
+        registry = CustomerRegistry.from_entries(
+            [make_customer(sdk_key="bsa_tp_key", customer_id="tp-co")]
+        )
+        s = Settings(
+            registry_path="unused.yaml",
+            log_json=False,
+            rate_limit_enabled=False,
+            mode="thin_proxy",
+            llm_endpoint="http://test/llm",
+        )
+        app = create_app(settings=s, registry=registry)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "use_rag": True,
+                },
+                headers={"Authorization": "Bearer bsa_tp_key"},
+            )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["param"] == "use_rag"
+        assert "not supported" in body["error"]["message"]
+
+
+class TestR1UseRagOmittedWarning:
+    """R1 #3: silent thin-proxy for a rag_enabled customer that doesn't
+    set use_rag is a quality-regression UX failure. The dispatcher emits
+    a warning event when that happens so operators can detect SDK lag."""
+
+    @pytest.mark.asyncio
+    async def test_warning_emitted_when_rag_enabled_customer_omits_use_rag(
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Internally inconsistent (dataset_ids set but use_rag false): the
-        dispatcher honours use_rag=false and routes thin-proxy. dataset_ids
-        is silently ignored. Behaviour-wise the request must succeed (or fail
-        for other reasons), NOT bounce on the inconsistency."""
         from httpx import ASGITransport, AsyncClient
 
         def _handler(_req: httpx.Request) -> httpx.Response:
@@ -477,115 +623,190 @@ class TestDatasetScope:
 
         chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
         try:
-            app, _ = _build_hybrid_app(
-                rag_enabled=True, knowledge_bases=["kb-A"]
-            )
+            app, _ = _build_hybrid_app(rag_enabled=True)
             async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://gateway"
+                transport=ASGITransport(app=app),
+                base_url="http://gateway",
             ) as client:
                 resp = await client.post(
                     "/v1/chat/completions",
                     json={
                         "model": "m1",
                         "messages": [{"role": "user", "content": "hi"}],
-                        "use_rag": False,
-                        "dataset_ids": ["kb-A"],
+                        # use_rag deliberately omitted (None)
                     },
                     headers={"Authorization": "Bearer bsa_hybrid_key"},
                 )
         finally:
             chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
 
-        # Thin-proxy succeeded; dataset_ids was silently ignored.
+        # Request still succeeded (we honour the omission with a warning,
+        # not a rejection).
         assert resp.status_code == 200
-
-
-# --------------------------------------------------------------------------- #
-# Schema-level (no HTTP) — direct dispatcher tests via the entitlement helper
-# --------------------------------------------------------------------------- #
-
-
-class TestEntitlementHelper:
-    """Direct unit tests of ``_check_rag_entitlement`` — avoids spinning up
-    a full FastAPI app for each scenario."""
-
-    def _customer(
-        self,
-        *,
-        rag_enabled: bool = True,
-        with_dify: bool = True,
-        knowledge_bases: list[str] | None = None,
-    ):
-        from tests.conftest import make_customer
-
-        c = make_customer(knowledge_bases=knowledge_bases or ["kb-A"])
-        update: dict[str, Any] = {"rag_enabled": rag_enabled}
-        if not with_dify:
-            update["dify"] = None  # type: ignore[assignment]
-        return c.model_copy(update=update)
-
-    def test_passes_with_full_entitlement(self) -> None:
-        from gateway.routers.chat_hybrid import _check_rag_entitlement
-        from gateway.schemas import ChatCompletionRequest, ChatMessage
-
-        body = ChatCompletionRequest(
-            model="m1",
-            messages=[ChatMessage(role="user", content="hi")],
-            use_rag=True,
+        # And the warning fired. structlog writes to stderr in the
+        # gateway's configured chain so capsys captures it there.
+        captured = capsys.readouterr()
+        assert (
+            "hybrid.use_rag_omitted_for_rag_enabled_customer"
+            in captured.out + captured.err
         )
-        _check_rag_entitlement(
-            self._customer(), body, request_id="req-1"
-        )  # no raise
 
-    def test_raises_not_entitled_when_rag_disabled(self) -> None:
-        from gateway.routers.chat_hybrid import _check_rag_entitlement
-        from gateway.schemas import ChatCompletionRequest, ChatMessage
+    @pytest.mark.asyncio
+    async def test_no_warning_for_rag_disabled_customer(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """rag_enabled=false customers omit use_rag all the time — no
+        warning."""
+        from httpx import ASGITransport, AsyncClient
 
-        body = ChatCompletionRequest(
-            model="m1",
-            messages=[ChatMessage(role="user", content="hi")],
-            use_rag=True,
-        )
-        with pytest.raises(NotEntitledError):
-            _check_rag_entitlement(
-                self._customer(rag_enabled=False),
-                body,
-                request_id="req-2",
+        def _handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
             )
 
-    def test_raises_unknown_dataset_for_foreign_uuid(self) -> None:
-        from gateway.routers.chat_hybrid import _check_rag_entitlement
-        from gateway.schemas import ChatCompletionRequest, ChatMessage
+        import gateway.routers.chat_thin_proxy as chat_mod
 
-        body = ChatCompletionRequest(
-            model="m1",
-            messages=[ChatMessage(role="user", content="hi")],
-            use_rag=True,
-            dataset_ids=["kb-A", "kb-foreign"],
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_hybrid_app(rag_enabled=False)
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://gateway",
+            ) as client:
+                await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": "Bearer bsa_hybrid_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        captured = capsys.readouterr()
+        assert (
+            "hybrid.use_rag_omitted"
+            not in captured.out + captured.err
         )
-        with pytest.raises(UnknownDatasetError) as ei:
-            _check_rag_entitlement(
-                self._customer(knowledge_bases=["kb-A"]),
-                body,
-                request_id="req-3",
+
+
+class TestR1ThinProxyStripsHybridFields:
+    """R1 #1: the thin-proxy forward body MUST NOT carry use_rag /
+    dataset_ids — vLLM 0.6+ rejects unknown fields with 400, and
+    LiteLLM access logs would otherwise show gateway-internal vocab."""
+
+    @pytest.mark.asyncio
+    async def test_use_rag_stripped_from_forward_body(self) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        captured_body: dict[str, Any] = {}
+
+        def _handler(req: httpx.Request) -> httpx.Response:
+            import json as _json
+
+            captured_body.update(_json.loads(req.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "x",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
             )
-        # The error message names the unknown ids (legitimate-operator
-        # debugging) but the HTTP code stays identical to "not found".
-        assert "kb-foreign" in str(ei.value)
 
-    def test_passes_with_empty_dataset_ids(self) -> None:
-        """Empty list is a valid 'RAG-off, DSL-on' opt-in."""
-        from gateway.routers.chat_hybrid import _check_rag_entitlement
-        from gateway.schemas import ChatCompletionRequest, ChatMessage
+        import gateway.routers.chat_thin_proxy as chat_mod
 
-        body = ChatCompletionRequest(
-            model="m1",
-            messages=[ChatMessage(role="user", content="hi")],
-            use_rag=True,
-            dataset_ids=[],
-        )
-        _check_rag_entitlement(
-            self._customer(knowledge_bases=["kb-A"]),
-            body,
-            request_id="req-4",
-        )  # no raise
+        original = chat_mod.httpx.AsyncClient
+
+        def _patched(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return original(*args, **kwargs)
+
+        chat_mod.httpx.AsyncClient = _patched  # type: ignore[misc]
+        try:
+            app, _ = _build_hybrid_app()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://gateway"
+            ) as client:
+                await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "m1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "use_rag": False,
+                        # dataset_ids omitted (would be rejected if set)
+                    },
+                    headers={"Authorization": "Bearer bsa_hybrid_key"},
+                )
+        finally:
+            chat_mod.httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert "use_rag" not in captured_body
+        assert "dataset_ids" not in captured_body
+        # Sanity: the actual OpenAI fields ARE forwarded.
+        assert captured_body.get("model") == "m1"
+
+
+class TestR1RagDispatchSuccessLog:
+    """R1 #6: when the dispatcher delegates to the RAG path, emit an
+    info-level ``hybrid.rag_dispatch`` so dashboards can count RAG
+    attempts independent of downstream success/failure."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_event_fires_before_chat_router_runs(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        app, _ = _build_hybrid_app(rag_enabled=True)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            # Will fail downstream (no FakeDifyClient wired) but the
+            # dispatch log must already have fired by then.
+            await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "use_rag": True,
+                },
+                headers={"Authorization": "Bearer bsa_hybrid_key"},
+            )
+
+        captured = capsys.readouterr()
+        assert "hybrid.rag_dispatch" in captured.out + captured.err
