@@ -37,6 +37,7 @@ from gateway.ratelimit.runtime_metrics import (
 from gateway.registry import CustomerEntry, CustomerRegistry
 from gateway.routers import audio as audio_router
 from gateway.routers import chat as chat_router
+from gateway.routers import chat_hybrid as chat_hybrid_router
 from gateway.routers import chat_thin_proxy as chat_thin_proxy_router
 from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
@@ -98,16 +99,17 @@ def create_app(
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
 
-    # PR #13 R1 #8: thin-proxy mode REQUIRES a non-empty llm_endpoint —
-    # without it, every /v1/chat/completions request would hit
-    # ServiceUnavailableError. Fail at startup so operators see the
-    # misconfiguration immediately, not on first traffic. ASR/TTS
-    # endpoints stay optional (a deployment with no audio hardware is
-    # legitimate; the audio routes 503 cleanly when called).
-    if settings.thin_proxy_mode and not settings.llm_endpoint.strip():
+    # PR #13 R1 #8 + PR #14: any mode that exposes thin-proxy chat
+    # (``thin_proxy`` or ``hybrid``) REQUIRES a non-empty llm_endpoint —
+    # without it every direct-LLM request would hit ServiceUnavailableError.
+    # Fail at startup so operators see the misconfiguration immediately,
+    # not on first traffic. ASR/TTS endpoints stay optional (a deployment
+    # with no audio hardware is legitimate; the audio routes 503 cleanly
+    # when called).
+    if settings.effective_mode in ("thin_proxy", "hybrid") and not settings.llm_endpoint.strip():
         raise RuntimeError(
-            "thin_proxy_mode=true requires GATEWAY_LLM_ENDPOINT to be set "
-            "(empty value would 503 every chat request)."
+            f"mode={settings.effective_mode!r} requires GATEWAY_LLM_ENDPOINT to be set "
+            "(empty value would 503 every direct-LLM chat request)."
         )
 
     registry = registry or CustomerRegistry.from_yaml(settings.registry_path)
@@ -180,7 +182,11 @@ def create_app(
             # stale Dify) since the chat/audio routes never call
             # AppManager / DifyClient. Skip the L2/L3/L4 round-trip;
             # the registry's pydantic validation (L1) has already run.
-            if settings.thin_proxy_mode:
+            #
+            # PR #14: hybrid mode runs BOTH paths so we still need the
+            # Dify health check (some customers will route through Dify
+            # for RAG). thin_proxy stays the only skip.
+            if settings.effective_mode == "thin_proxy":
                 logger.info(
                     "gateway.startup.thin_proxy_mode",
                     llm_endpoint=settings.llm_endpoint,
@@ -297,16 +303,24 @@ def create_app(
             max_age=600,  # cache preflight for 10 min to avoid OPTIONS spam
         )
 
-    # PR #13: thin-proxy mode swaps the Dify-based chat router for one
-    # that forwards directly to the EMS LLM endpoint, and mounts the
-    # new audio router (ASR + TTS). The Dify-flavoured datasets / files
-    # routes stay mounted unconditionally — clients calling them when
-    # no Dify is wired up will get a clean 502 from the path, not a
+    # Chat router selection per deployment mode (PR #13 + PR #14):
+    #   dify       → chat.py (Dify-orchestrated, RAG always on)
+    #   thin_proxy → chat_thin_proxy.py (direct to LLM, no RAG) + audio
+    #   hybrid     → chat_hybrid.py (per-request dispatch on use_rag) + audio
+    #
+    # All three modes register exactly one router at /v1/chat/completions
+    # so FastAPI never sees a path conflict. The Dify-flavoured datasets /
+    # files routes stay mounted unconditionally — clients calling them
+    # when no Dify is wired up will get a clean 502 from the path, not a
     # confusing 404.
-    if settings.thin_proxy_mode:
+    mode = settings.effective_mode
+    if mode == "thin_proxy":
         app.include_router(chat_thin_proxy_router.router)
         app.include_router(audio_router.router)
-    else:
+    elif mode == "hybrid":
+        app.include_router(chat_hybrid_router.router)
+        app.include_router(audio_router.router)
+    else:  # "dify"
         app.include_router(chat_router.router)
     app.include_router(embeddings_router.router)
     app.include_router(models_router.router)

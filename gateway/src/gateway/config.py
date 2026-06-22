@@ -6,7 +6,9 @@ once at startup (see ``main.py``) and injected into the FastAPI app state.
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -277,19 +279,56 @@ class Settings(BaseSettings):
     # auth + rate-limit + schema-translate + forward. Dify orchestration
     # becomes opt-in per customer. See Notion ``EMS Integration``.
 
+    # PR #14: 3-state deployment mode. ``thin_proxy_mode`` (below) is the
+    # PR #13 legacy boolean — kept as a backward-compat alias. ``mode``
+    # is the canonical knob going forward; computed precedence
+    # (see ``effective_mode``):
+    #   ``thin_proxy_mode=True``        → effective_mode = "thin_proxy"
+    #   ``thin_proxy_mode=False`` (default) → use ``mode`` field directly
+    #
+    # The three modes map to chat-router strategy:
+    #   dify       — every request through Dify (PR #1-#12 path)
+    #   thin_proxy — every request direct to vLLM (PR #13 path), audio mounted
+    #   hybrid     — per-request ``use_rag`` dispatch (PR #14 path), audio mounted
+    mode: Literal["dify", "thin_proxy", "hybrid"] = Field(
+        default="dify",
+        description=(
+            "Deployment mode (PR #14). ``dify`` (legacy default): every "
+            "/v1/chat/completions request goes through Dify orchestration. "
+            "``thin_proxy``: requests forward directly to ``llm_endpoint`` "
+            "bypassing Dify entirely; the /v1/audio/* routes activate. "
+            "``hybrid``: per-request routing — body with ``use_rag=true`` "
+            "goes through Dify, anything else thin-proxies. Audio routes "
+            "are mounted in both ``thin_proxy`` and ``hybrid`` modes. "
+            "``thin_proxy_mode=True`` overrides this field for backward "
+            "compatibility."
+        ),
+    )
     thin_proxy_mode: bool = Field(
         default=False,
         description=(
-            "When True, the gateway becomes a thin proxy: chat completions "
-            "forward directly to ``llm_endpoint`` (bypassing Dify, no "
-            "App lazy-build), the new /v1/audio/* routes activate, and "
-            "startup health check skips Dify reachability since there "
-            "may be no Dify at all. Customers in registry.yaml can still "
-            "carry ``dify`` config for the existing path (per-request "
-            "override TBD); when ``dify`` is omitted the customer is "
-            "thin-proxy-only and chat goes direct to LLM."
+            "[Legacy alias for ``mode``.] When True, the gateway becomes a "
+            "thin proxy: chat completions forward directly to "
+            "``llm_endpoint`` (bypassing Dify, no App lazy-build), the new "
+            "/v1/audio/* routes activate, and startup health check skips "
+            "Dify reachability since there may be no Dify at all. Customers "
+            "in registry.yaml can still carry ``dify`` config for the existing "
+            "path; when ``dify`` is omitted the customer is thin-proxy-only "
+            "and chat goes direct to LLM. New deployments should set "
+            "``mode=\"thin_proxy\"`` or ``mode=\"hybrid\"`` instead."
         ),
     )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def effective_mode(self) -> Literal["dify", "thin_proxy", "hybrid"]:
+        """Resolve the deployment mode honouring ``thin_proxy_mode`` backward-
+        compat alias. Single source of truth for ``main.py`` and all
+        routers — do NOT read ``mode`` / ``thin_proxy_mode`` directly.
+        """
+        if self.thin_proxy_mode:
+            return "thin_proxy"
+        return self.mode
     llm_endpoint: str = Field(
         default="",
         description=(

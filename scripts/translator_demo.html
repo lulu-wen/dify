@@ -107,6 +107,11 @@
       <label style="display:flex;align-items:center;gap:8px;color:var(--txt);margin:0;cursor:pointer">
         <input type="checkbox" id="continuous" /> 連續對話模式
       </label>
+      <!-- PR #14: hybrid-mode RAG toggle. Sends body.use_rag=true when checked,
+           routing through Dify (knowledge base + DSL) instead of thin-proxy. -->
+      <label style="display:flex;align-items:center;gap:8px;color:var(--txt);margin:0;cursor:pointer" title="勾選會走 Dify+RAG (翻譯記憶庫 / 術語字典)；不勾走直接 LLM">
+        <input type="checkbox" id="useRag" /> 使用翻譯記憶庫 (RAG)
+      </label>
     </div>
   </div>
 
@@ -222,6 +227,7 @@ async function llmTranslate(text, targetLabel) {
   // (no <think>…</think> block emitted). DeepSeek-R1 and other reasoning
   // models ignore it harmlessly. The client-side regex strip in
   // llmTranslate() is the belt-and-braces fallback.
+  const useRag = !!document.getElementById("useRag")?.checked;
   const body = {
     model: LLM_MODEL,
     messages: [
@@ -230,8 +236,11 @@ async function llmTranslate(text, targetLabel) {
     ],
     temperature: 0,
     max_tokens: 256,
+    // PR #14: hybrid-mode opt-in. True routes through Dify (RAG + DSL),
+    // false (or omitted) thin-proxies straight to vLLM.
+    use_rag: useRag,
   };
-  log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  (user-only prompt, temp=0)`);
+  log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  ${useRag ? "[RAG via Dify]" : "[thin-proxy direct]"}`);
   const t0 = performance.now();
   const r = await fetch(LLM_URL + "/v1/chat/completions", {
     method: "POST",

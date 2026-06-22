@@ -271,6 +271,20 @@ class CustomerEntry(BaseModel):
             "mounted there)."
         ),
     )
+    rag_enabled: bool = Field(
+        default=False,
+        description=(
+            "RAG entitlement gate (PR #14). In hybrid mode, a request body "
+            "with ``use_rag: true`` is routed through Dify for retrieval + "
+            "DSL orchestration; this flag must be True for the customer or "
+            "the request is rejected with 403 ``not_entitled``. RAG also "
+            "requires the customer's ``dify`` block to be populated — "
+            "without that the request gets a 503 misconfigured-backend. "
+            "Has no effect in pure ``mode=\"dify\"`` deployments (every "
+            "request goes through Dify regardless) or pure ``mode=\"thin_proxy\"`` "
+            "(RAG is unavailable entirely)."
+        ),
+    )
 
     @field_validator("models")
     @classmethod

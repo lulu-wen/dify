@@ -105,6 +105,32 @@ class ChatCompletionRequest(BaseModel):
         ),
     )
 
+    # PR #14: hybrid-mode RAG routing. When ``use_rag`` is True and the gateway
+    # is configured with ``mode="hybrid"``, the chat router dispatches the
+    # request through Dify (which performs the retrieval + DSL orchestration)
+    # instead of forwarding directly to vLLM. Default None → "no preference",
+    # treated the same as False (thin-proxy direct).
+    #
+    # ``dataset_ids`` lets the client override the customer's default
+    # ``knowledge_bases`` list per-request: pass a subset to scope retrieval
+    # to a particular glossary / TM / document set, or pass an empty list to
+    # disable retrieval while still going through Dify's DSL.
+    use_rag: bool | None = Field(
+        default=None,
+        description=(
+            "Hybrid-mode RAG opt-in. True routes the request through Dify "
+            "for retrieval + DSL. Ignored in pure thin-proxy or pure Dify "
+            "deployment modes."
+        ),
+    )
+    dataset_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Override the customer's default ``knowledge_bases`` list for "
+            "this request. Only meaningful with ``use_rag=True``."
+        ),
+    )
+
     @property
     def effective_max_tokens(self) -> int | None:
         """Resolve the token cap honoring OpenAI's deprecation precedence."""

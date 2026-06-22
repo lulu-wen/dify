@@ -57,6 +57,12 @@ customers:
     # so chat-only tenants don't silently get GPU-hungry ASR/TTS access.
     # Has no effect on Dify-mode deployments (audio routes are not mounted).
     audio_enabled: true
+    # PR #14: RAG entitlement gate (hybrid mode only). True allows clients
+    # to set ``body.use_rag=true`` and route through Dify (knowledge base +
+    # DSL). Requires the ``dify`` block above to be populated. Default
+    # false. Has no effect in pure ``mode="dify"`` or ``mode="thin_proxy"``
+    # deployments.
+    rag_enabled: true
 
   - sdk_key: "bsa_dev_example_def456"
     customer_id: "customer-b"
