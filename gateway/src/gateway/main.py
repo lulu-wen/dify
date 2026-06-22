@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from gateway.config import Settings
@@ -265,8 +266,12 @@ def create_app(
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):
-    #   request flow:  Logging -> BodySize -> Auth -> RateLimit -> route
-    # - Logging outermost: request id exists even on auth / rate-limit failure.
+    #   request flow:  CORS -> Logging -> BodySize -> Auth -> RateLimit -> route
+    # - CORS outermost: preflight ``OPTIONS`` requests must be answered with
+    #   ``Access-Control-Allow-Origin`` BEFORE any auth check. Auth middleware
+    #   would 401 the preflight (no Authorization header on an OPTIONS) and
+    #   the browser would never send the real request.
+    # - Logging next: request id exists even on auth / rate-limit failure.
     # - BodySize before Auth: a multi-GB body shouldn't even get to the auth
     #   parser (PR #13 R2 #9). Added AFTER Auth here so it ends up outer.
     # - RateLimit inner to Auth: it keys on request.state.customer, which
@@ -275,6 +280,22 @@ def create_app(
     app.add_middleware(AuthMiddleware, registry=registry)
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
+    # PR #13 R2 follow-up: enable CORS when configured. Empty list →
+    # middleware not installed (the production deployment behind a single
+    # domain may not need it). The demo HTML in scripts/translator_demo.html
+    # is served from a different localhost port than the gateway, so dev
+    # deployments must set ``GATEWAY_CORS_ALLOW_ORIGINS`` to either ``*``
+    # or the explicit dev origins.
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allow_origins,
+            allow_credentials=False,  # Authorization header travels in body, not cookies
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+            expose_headers=["X-Request-ID", "Retry-After"],
+            max_age=600,  # cache preflight for 10 min to avoid OPTIONS spam
+        )
 
     # PR #13: thin-proxy mode swaps the Dify-based chat router for one
     # that forwards directly to the EMS LLM endpoint, and mounts the

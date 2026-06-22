@@ -357,3 +357,18 @@ class Settings(BaseSettings):
             "raise when on-prem deployments need long-form audio uploads."
         ),
     )
+    cors_allow_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Origins permitted by CORSMiddleware. Empty list (default) → "
+            "CORS middleware is NOT installed (suits production deployments "
+            "behind a single domain where the browser and the gateway share "
+            "an origin). Dev deployments running the demo HTML on a "
+            "different localhost port must set this to either ``[\"*\"]`` "
+            "(any origin) or the explicit list, e.g. "
+            "``[\"http://localhost:5501\", \"http://localhost:5502\"]``. "
+            "Always parsed as JSON when read from env so a single env var "
+            "can carry the list: "
+            "``GATEWAY_CORS_ALLOW_ORIGINS='[\"http://localhost:5501\"]'``."
+        ),
+    )
