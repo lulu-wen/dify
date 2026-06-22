@@ -218,9 +218,16 @@ async function llmTranslate(text, targetLabel) {
   const prompt =
     `Translate the following text into ${targetLabel}. ` +
     `Output ONLY the translation, no explanations, no quotes.\n\nText: ${text}`;
+  // /no_think is the Qwen3 system directive that disables chain-of-thought
+  // (no <think>…</think> block emitted). DeepSeek-R1 and other reasoning
+  // models ignore it harmlessly. The client-side regex strip in
+  // llmTranslate() is the belt-and-braces fallback.
   const body = {
     model: LLM_MODEL,
-    messages: [{ role:"user", content: prompt }],
+    messages: [
+      { role: "system", content: "/no_think You are a translator. Output ONLY the translation." },
+      { role: "user", content: prompt },
+    ],
     temperature: 0,
     max_tokens: 256,
   };
@@ -233,7 +240,15 @@ async function llmTranslate(text, targetLabel) {
   });
   if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
   const data = await r.json();
-  const out = (data.choices?.[0]?.message?.content || "").trim();
+  let out = (data.choices?.[0]?.message?.content || "").trim();
+  // Strip <think>...</think> blocks emitted by reasoning models like
+  // Qwen3 / DeepSeek-R1. Without this, the thinking gets shown on
+  // screen + sent to TTS (TTS reads the entire chain-of-thought aloud).
+  out = out.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  // Some Qwen3 builds emit a half-open <think> with no closing tag —
+  // catch that too by taking everything after the last </think>.
+  const lastClose = out.lastIndexOf("</think>");
+  if (lastClose !== -1) out = out.slice(lastClose + "</think>".length).trim();
   const ms = (performance.now()-t0)|0;
   log("res", `LLM ${ms}ms  "${out}"`);
   return { text: out, ms };
