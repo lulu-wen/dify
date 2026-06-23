@@ -219,6 +219,35 @@ async function asrTranscribe(wavBlob, language) {
   return { text, language: data.language || "", raw: data, ms };
 }
 
+// PR #16: Dify conversation_id continuity.
+//
+// Dify's chat-messages API attributes turns to a conversation:
+//   * Request without conversation_id          → Dify creates a new one
+//   * Request with conversation_id="abc"       → continues "abc"'s context
+//
+// Without this, every translate request was a fresh Dify conversation —
+// the Dify dashboard filled with one-message conversations, each with
+// its own auto-generated title. Operationally noisy, plus prevents
+// session-level token accounting / audit.
+//
+// Behaviour:
+//   "連續對話模式" checkbox ON  + use_rag ON   → reuse conversation_id
+//   "連續對話模式" checkbox OFF                → clear + each turn is fresh
+//   use_rag OFF (thin-proxy)                  → vLLM is stateless, no id sent
+//
+// State is per-page-load — reloading the page (or clicking the checkbox
+// OFF) drops the conversation handle and Dify creates a new one on the
+// next RAG-on turn.
+let currentDifyConversationId = null;
+
+// Drop the saved id when the operator turns continuous mode off.
+document.getElementById("continuous")?.addEventListener("change", (e) => {
+  if (!e.target.checked && currentDifyConversationId) {
+    log("dim", `Continuous mode off — dropping Dify conversation ${currentDifyConversationId.slice(0, 8)}…`);
+    currentDifyConversationId = null;
+  }
+});
+
 async function llmTranslate(text, targetLabel) {
   const prompt =
     `Translate the following text into ${targetLabel}. ` +
@@ -228,6 +257,9 @@ async function llmTranslate(text, targetLabel) {
   // models ignore it harmlessly. The client-side regex strip in
   // llmTranslate() is the belt-and-braces fallback.
   const useRag = !!document.getElementById("useRag")?.checked;
+  const continuous = !!document.getElementById("continuous")?.checked;
+  const shouldContinueConversation = continuous && useRag;
+
   const body = {
     model: LLM_MODEL,
     messages: [
@@ -240,7 +272,18 @@ async function llmTranslate(text, targetLabel) {
     // false (or omitted) thin-proxies straight to vLLM.
     use_rag: useRag,
   };
-  log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  ${useRag ? "[RAG via Dify]" : "[thin-proxy direct]"}`);
+  // PR #16: thread the conversation_id back to Dify when continuing.
+  // Skipped when use_rag=false because thin-proxy hits vLLM which is
+  // stateless — sending a Dify-shaped UUID would be confusing dead-data
+  // even though chat_thin_proxy now pops it from forward_body (PR #15).
+  if (shouldContinueConversation && currentDifyConversationId) {
+    body.conversation_id = currentDifyConversationId;
+  }
+
+  const continuityTag = shouldContinueConversation
+    ? (currentDifyConversationId ? `[cont ${currentDifyConversationId.slice(0, 8)}]` : "[cont new]")
+    : "";
+  log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  ${useRag ? "[RAG via Dify]" : "[thin-proxy direct]"} ${continuityTag}`);
   const t0 = performance.now();
   const r = await fetch(LLM_URL + "/v1/chat/completions", {
     method: "POST",
@@ -258,6 +301,17 @@ async function llmTranslate(text, targetLabel) {
   // catch that too by taking everything after the last </think>.
   const lastClose = out.lastIndexOf("</think>");
   if (lastClose !== -1) out = out.slice(lastClose + "</think>".length).trim();
+
+  // PR #16: capture the conversation_id Dify returned so the next turn
+  // can continue it. Only refresh state when we asked to continue —
+  // a thin-proxy or one-shot RAG turn shouldn't pollute the saved id.
+  if (shouldContinueConversation) {
+    const newId = data.choices?.[0]?.message?.metadata?.conversation_id;
+    if (newId && newId !== currentDifyConversationId) {
+      currentDifyConversationId = newId;
+    }
+  }
+
   const ms = (performance.now()-t0)|0;
   log("res", `LLM ${ms}ms  "${out}"`);
   return { text: out, ms };
