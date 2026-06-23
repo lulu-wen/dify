@@ -219,6 +219,45 @@ async function asrTranscribe(wavBlob, language) {
   return { text, language: data.language || "", raw: data, ms };
 }
 
+// PR #17: stable end-user identifier for Dify.
+//
+// Dify scopes every conversation to (app_id, end_user). A conversation_id
+// returned for end_user A is INVALID for end_user B — Dify returns 404
+// "Conversation Not Exists". The gateway falls back to
+// "{customer_id}:{request_id}" when the body omits ``user``, which makes
+// every request a different end_user → PR #16's saved conversation_id
+// became unusable on turn 2.
+//
+// Fix: send a stable ``user`` per browser session (sessionStorage), so the
+// gateway forwards it verbatim and Dify pairs every turn with the same
+// end_user. sessionStorage scope = single tab lifetime, which lines up
+// with the conversation lifetime exactly.
+//
+// Hook point for the future: swap getSessionUserId() to return an
+// authenticated user id once login lands. The wire protocol does not
+// change; only this function does. setSessionUser() resets the saved
+// conversation_id because conversation_id is bound to the OLD user.
+function getSessionUserId() {
+  let id = sessionStorage.getItem("translator_demo_user");
+  if (!id) {
+    id = (crypto.randomUUID && crypto.randomUUID())
+      || `u-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem("translator_demo_user", id);
+  }
+  return id;
+}
+
+function setSessionUser(newId) {
+  if (!newId || newId === sessionStorage.getItem("translator_demo_user")) return;
+  sessionStorage.setItem("translator_demo_user", newId);
+  // Invariant: conversation_id is (user, conversation_id)-keyed in Dify.
+  // Carrying it across a user switch produces a 404 on the next turn.
+  if (currentDifyConversationId) {
+    log("dim", `Session user changed — dropping Dify conversation ${currentDifyConversationId.slice(0, 8)}…`);
+    currentDifyConversationId = null;
+  }
+}
+
 // PR #16: Dify conversation_id continuity.
 //
 // Dify's chat-messages API attributes turns to a conversation:
@@ -271,6 +310,10 @@ async function llmTranslate(text, targetLabel) {
     // PR #14: hybrid-mode opt-in. True routes through Dify (RAG + DSL),
     // false (or omitted) thin-proxies straight to vLLM.
     use_rag: useRag,
+    // PR #17: stable end-user id. Required for PR #16's conversation_id
+    // continuity to work — Dify (user, conversation_id) is the lookup
+    // key. Sent unconditionally; thin-proxy ignores it harmlessly.
+    user: getSessionUserId(),
   };
   // PR #16: thread the conversation_id back to Dify when continuing.
   // Skipped when use_rag=false because thin-proxy hits vLLM which is
