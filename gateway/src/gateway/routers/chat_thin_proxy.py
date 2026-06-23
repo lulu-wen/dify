@@ -45,6 +45,7 @@ from gateway.errors import (
     LLMTimeoutError,
     LLMUpstreamError,
     ServiceUnavailableError,
+    UnknownModelError,
     UpstreamClientError,
 )
 from gateway.registry import CustomerEntry
@@ -124,8 +125,15 @@ async def chat_completions_thin_proxy(
     # ``CustomerEntry.find_model`` is the registry-level whitelist; if the
     # customer has no matching entry, reject as 404 to match the Dify
     # path's behaviour.
+    #
+    # PR #15 R1 #7: previously raised ``InvalidRequestError`` (400) —
+    # inconsistent with chat.py which raises ``UnknownModelError`` (404)
+    # for the same condition. The 400 vs 404 mismatch broke SDK retry
+    # heuristics that branched on status code in hybrid mode (same
+    # request, different code depending on use_rag). Both routers now
+    # raise the same typed error.
     if customer.find_model(selected_model) is None:
-        raise InvalidRequestError(
+        raise UnknownModelError(
             f"model '{selected_model}' is not enabled for this customer",
             param="model",
         )

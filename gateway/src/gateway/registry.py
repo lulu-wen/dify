@@ -450,7 +450,50 @@ class CustomerRegistry:
             seen_customer_ids.add(entry.customer_id)
             by_key[entry.sdk_key] = entry
         cls._check_dify_consistency(by_key.values())
+        cls._check_knowledge_base_uniqueness(by_key.values())
         return cls(by_key)
+
+    @staticmethod
+    def _check_knowledge_base_uniqueness(entries: Any) -> None:
+        """PR #15 R1 #10: a knowledge_base UUID must appear in at most ONE
+        customer's ``knowledge_bases`` list.
+
+        The hybrid dispatcher's dataset_ids scope check (PR #14) takes
+        ``customer.knowledge_bases`` as the canonical owned-set: anything
+        not in the list is rejected with 404. If an operator accidentally
+        pastes the same UUID into two customers (easy under copy-paste-
+        and-rename onboarding), both customers legitimately "own" that
+        UUID from the gateway's perspective, and either can retrieve the
+        other's chunks. The Dify backend still has its own ownership
+        model in shared mode, but the gateway's scope check is the first
+        gate, and silently accepting cross-customer UUIDs reduces it to
+        no-op for the colliding ones.
+
+        We fail loud at registry load so the issue is caught in dev / CI,
+        not by a customer realising months later that their KB is
+        cross-readable. The error message lists the offending UUIDs and
+        which customers claimed them so the operator can find the
+        copy-paste source.
+        """
+        owners: dict[str, set[str]] = defaultdict(set)
+        for e in entries:
+            # set() per customer so a single customer listing the same
+            # UUID twice (silly but not a cross-tenant leak) does not
+            # spuriously fire this check — only true cross-customer
+            # collisions matter for data isolation.
+            for kb in set(e.knowledge_bases):
+                owners[kb].add(e.customer_id)
+        collisions = {kb: ids for kb, ids in owners.items() if len(ids) > 1}
+        if collisions:
+            details = "; ".join(
+                f"{kb!r} claimed by {sorted(ids)}"
+                for kb, ids in sorted(collisions.items())
+            )
+            raise ValueError(
+                f"knowledge_base UUID(s) shared across customers: {details}. "
+                "Each knowledge_base UUID must belong to exactly one "
+                "customer (likely an onboarding copy-paste error)."
+            )
 
     @staticmethod
     def _check_dify_consistency(entries: Any) -> None:

@@ -103,14 +103,36 @@ def create_app(
     # (``thin_proxy`` or ``hybrid``) REQUIRES a non-empty llm_endpoint —
     # without it every direct-LLM request would hit ServiceUnavailableError.
     # Fail at startup so operators see the misconfiguration immediately,
-    # not on first traffic. ASR/TTS endpoints stay optional (a deployment
-    # with no audio hardware is legitimate; the audio routes 503 cleanly
-    # when called).
+    # not on first traffic.
+    #
+    # PR #15 R1 #8: extend the same fail-fast principle to ASR/TTS in
+    # modes that mount the audio routes (``thin_proxy`` and ``hybrid``).
+    # Previously startup let an audio-route-mounted gateway boot with
+    # empty asr/tts endpoints, then every /v1/audio/* request 503'd at
+    # runtime — exactly the deferred-failure pattern PR #13 R1 #8 was
+    # supposed to close. The asr/tts checks are advisory (warn, don't
+    # abort) so a chat-only operator who hasn't wired audio infra
+    # doesn't get blocked from starting; a missing endpoint that the
+    # operator does intend to use later still surfaces clearly.
     if settings.effective_mode in ("thin_proxy", "hybrid") and not settings.llm_endpoint.strip():
         raise RuntimeError(
             f"mode={settings.effective_mode!r} requires GATEWAY_LLM_ENDPOINT to be set "
             "(empty value would 503 every direct-LLM chat request)."
         )
+    if settings.effective_mode in ("thin_proxy", "hybrid"):
+        for name, value in (
+            ("GATEWAY_ASR_ENDPOINT", settings.asr_endpoint),
+            ("GATEWAY_TTS_ENDPOINT", settings.tts_endpoint),
+        ):
+            if not value.strip():
+                logger.warning(
+                    "gateway.startup.audio_endpoint_unset",
+                    env_var=name,
+                    note=(
+                        "audio routes are mounted but this endpoint is empty; "
+                        "/v1/audio/* requests for this service will 503 until set"
+                    ),
+                )
 
     registry = registry or CustomerRegistry.from_yaml(settings.registry_path)
     logger.info("gateway.bootstrap", customers=len(registry))
