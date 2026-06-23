@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 # ---------- Request ----------
 
@@ -65,6 +65,32 @@ class ChatCompletionRequest(BaseModel):
         description="OpenAI 2025+ replacement for ``user``; preferred when both are provided",
     )
 
+    # PR #13 R2 #14: declare the common OpenAI fields the cost estimator
+    # cares about so we can read them on the typed schema instead of
+    # poking forward_body. Critically ``n`` multiplies output tokens —
+    # without declaring it, the cost estimator only saw max_output_tokens
+    # and a client sending n=10 made the admission gate's OOM guarantee
+    # silently 10x off. Other declared fields (top_p, stop, response_format,
+    # tools, tool_choice, seed, presence_penalty, frequency_penalty,
+    # logit_bias, logprobs, top_logprobs, parallel_tool_calls) don't
+    # affect cost but get type-checked validation at the gateway edge
+    # instead of being deferred to vLLM. ``extra="allow"`` is preserved
+    # so unknown future OpenAI fields still pass through.
+    n: int | None = Field(default=None, ge=1, le=128)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    stop: str | list[str] | None = Field(default=None)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    logit_bias: dict[str, float] | None = Field(default=None)
+    logprobs: bool | None = Field(default=None)
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    response_format: dict[str, Any] | None = Field(default=None)
+    seed: int | None = Field(default=None)
+    tools: list[dict[str, Any]] | None = Field(default=None)
+    tool_choice: str | dict[str, Any] | None = Field(default=None)
+    parallel_tool_calls: bool | None = Field(default=None)
+    stream_options: dict[str, Any] | None = Field(default=None)
+
     # Gateway extensions (kept under ``extra_body`` for client SDK compatibility).
     # The OpenAI Python SDK flattens ``extra_body={"foo":...}`` into top-level
     # JSON fields, so these appear at the request root despite being passed via
@@ -76,6 +102,41 @@ class ChatCompletionRequest(BaseModel):
             "Override the model used for app selection. When provided, the "
             "gateway resolves the Dify App via ``(customer, llm_model)``; "
             "otherwise it falls back to the standard ``model`` field."
+        ),
+    )
+
+    # PR #14: hybrid-mode RAG routing. When ``use_rag`` is True and the gateway
+    # is configured with ``mode="hybrid"``, the chat router dispatches the
+    # request through Dify (which performs the retrieval + DSL orchestration)
+    # instead of forwarding directly to vLLM. Default None → "no preference",
+    # treated the same as False (thin-proxy direct).
+    #
+    # ``dataset_ids`` lets the client override the customer's default
+    # ``knowledge_bases`` list per-request: pass a subset to scope retrieval
+    # to a particular glossary / TM / document set, or pass an empty list to
+    # disable retrieval while still going through Dify's DSL.
+    use_rag: bool | None = Field(
+        default=None,
+        description=(
+            "Hybrid-mode RAG opt-in. True routes the request through Dify "
+            "for retrieval + DSL. Ignored in pure thin-proxy or pure Dify "
+            "deployment modes."
+        ),
+    )
+    dataset_ids: list[Annotated[str, StringConstraints(max_length=128)]] | None = Field(
+        default=None,
+        max_length=50,  # R1 #11: cap to prevent amplification via 404 envelope echo
+        description=(
+            "[v1: NOT YET SUPPORTED] Reserved for future per-request "
+            "override of the customer's ``knowledge_bases`` list. v1 "
+            "REJECTS any non-None value with 400 because the override is "
+            "not threaded through the Dify ``AppManager`` yet — without "
+            "the wiring, accepting the field would silently retrieve "
+            "from ALL of the customer's knowledge bases regardless of "
+            "the override, which is a security-sensitive contract "
+            "violation. Set to None (or omit) until the follow-up PR "
+            "lands. Cap of 50 items per list and 128 chars per id is "
+            "enforced to prevent 404-envelope echo amplification."
         ),
     )
 

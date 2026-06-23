@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Amebaran 即時語音翻譯 · AI RAN</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#171c24; --panel2:#1f2630; --line:#2a323d;
+    --txt:#e6edf3; --muted:#9aa7b4; --accent:#3b82f6; --ok:#22c55e;
+    --warn:#f59e0b; --err:#ef4444; --asr:#06b6d4; --llm:#a855f7; --tts:#22c55e;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:15px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans CJK TC",sans-serif; }
+  header { padding:16px 22px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:13px; }
+  .wrap { max-width:880px; margin:0 auto; padding:22px; }
+  .status { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
+  .chip { display:flex; align-items:center; gap:7px; background:var(--panel);
+          border:1px solid var(--line); border-radius:999px; padding:6px 13px; font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:0 0 auto; }
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.warn{background:var(--warn)}
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+           padding:18px; margin-bottom:16px; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; }
+  select, input[type=text] { background:var(--panel2); color:var(--txt);
+    border:1px solid var(--line); border-radius:8px; padding:9px 11px; font-size:14px; min-width:160px; }
+  input[type=text]{ min-width:280px; }
+  .grow{ flex:1; }
+  button { cursor:pointer; border:none; border-radius:8px; padding:10px 16px;
+           font-size:14px; font-weight:600; color:#fff; background:var(--accent); }
+  button.secondary{ background:var(--panel2); border:1px solid var(--line); }
+  button:disabled{ opacity:.5; cursor:not-allowed; }
+  .mic { width:120px; height:120px; border-radius:50%; font-size:15px; margin:6px auto;
+         display:flex; align-items:center; justify-content:center; text-align:center;
+         background:var(--accent); transition:transform .1s,background .2s; }
+  .mic.rec { background:var(--err); animation:pulse 1.2s infinite; }
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}70%{box-shadow:0 0 0 18px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+  .center{ text-align:center; }
+  .stage { border-left:3px solid var(--line); padding:8px 0 8px 14px; margin:10px 0; }
+  .stage.asr{border-color:var(--asr)} .stage.llm{border-color:var(--llm)} .stage.tts{border-color:var(--tts)}
+  .stage .k { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .stage .v { font-size:18px; margin-top:3px; min-height:24px; word-break:break-word; }
+  .stage .t { font-size:11px; color:var(--muted); }
+  .tag { font-size:10px; font-weight:700; padding:2px 7px; border-radius:5px; color:#fff; }
+  .tag.asr{background:var(--asr)} .tag.llm{background:var(--llm)} .tag.tts{background:var(--tts)}
+  details { margin-top:8px; }
+  summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  pre.log { background:#0a0d12; border:1px solid var(--line); border-radius:8px; padding:12px;
+            font:12px/1.5 "SF Mono",ui-monospace,Menlo,monospace; color:#c9d4df;
+            max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  .log .req{color:#60a5fa} .log .res{color:#34d399} .log .err{color:#f87171} .log .dim{color:#6b7785}
+  audio{ width:100%; margin-top:10px; }
+  .hint{ color:var(--muted); font-size:12px; margin-top:6px; }
+  .err-banner{ background:#3a1416; border:1px solid var(--err); color:#fecaca;
+               padding:10px 14px; border-radius:8px; margin-bottom:14px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎙️ 即時語音翻譯</h1>
+  <span class="sub">語音 → ASR → 翻譯 → TTS 發音 · 直連 AI RAN (GB10) by IP</span>
+</header>
+
+<div class="wrap">
+  <div id="errBanner" class="err-banner"></div>
+
+  <div class="status" id="status">
+    <span class="chip"><span class="dot" id="d-asr"></span> ASR (WhisperX)</span>
+    <span class="chip"><span class="dot" id="d-llm"></span> LLM <span id="llm-model" class="dim"></span></span>
+    <span class="chip"><span class="dot" id="d-tts"></span> TTS (Kokoro)</span>
+    <button class="secondary" id="recheck" style="padding:5px 12px;font-size:12px">重新檢查</button>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label>來源語言 (ASR)</label>
+        <select id="srcLang">
+          <option value="">自動偵測</option>
+          <option value="en">English</option>
+          <option value="zh">中文</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="es">Español</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+        </select>
+      </div>
+      <div>
+        <label>翻譯目標 (LLM)</label>
+        <select id="tgtLang"></select>
+      </div>
+      <div class="grow">
+        <label>發音聲音 (TTS) — 依目標語言自動挑選，可手動覆寫</label>
+        <select id="voice" style="width:100%"></select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label style="display:flex;align-items:center;gap:8px;color:var(--txt);margin:0;cursor:pointer">
+        <input type="checkbox" id="vad" checked /> 自動斷句（靜音後自動送出）
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;color:var(--txt);margin:0;cursor:pointer">
+        <input type="checkbox" id="continuous" /> 連續對話模式
+      </label>
+      <!-- PR #14: hybrid-mode RAG toggle. Sends body.use_rag=true when checked,
+           routing through Dify (knowledge base + DSL) instead of thin-proxy. -->
+      <label style="display:flex;align-items:center;gap:8px;color:var(--txt);margin:0;cursor:pointer" title="勾選會走 Dify+RAG (翻譯記憶庫 / 術語字典)；不勾走直接 LLM">
+        <input type="checkbox" id="useRag" /> 使用翻譯記憶庫 (RAG)
+      </label>
+    </div>
+  </div>
+
+  <div class="panel center">
+    <button class="mic" id="mic">按一下<br>開始說話</button>
+    <div class="hint" id="micHint">需要麥克風權限；建議以 <code>http://localhost</code> 或 <code>file://</code> 開啟（安全內容才有麥克風）</div>
+  </div>
+
+  <div class="panel">
+    <div class="stage asr">
+      <div class="k"><span class="tag asr">1 · ASR</span> 聽到的內容（語音轉文字）</div>
+      <div class="v" id="srcText">—</div>
+      <div class="t" id="srcMeta"></div>
+    </div>
+    <div class="stage llm">
+      <div class="k"><span class="tag llm">2 · LLM</span> 翻譯結果</div>
+      <div class="v" id="tgtText">—</div>
+      <div class="t" id="tgtMeta"></div>
+    </div>
+    <div class="stage tts">
+      <div class="k"><span class="tag tts">3 · TTS</span> 合成語音</div>
+      <div class="t" id="ttsMeta"></div>
+      <audio id="player" controls></audio>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label>不用麥克風，直接打字測試 LLM + TTS：</label>
+    <div class="row">
+      <input type="text" id="manualText" class="grow" placeholder="輸入一句話，例如 Hello, where is the station?" />
+      <button id="manualGo">翻譯並發音</button>
+    </div>
+  </div>
+
+  <details open>
+    <summary>原始 HTTP 紀錄（每個服務實際怎麼界接）</summary>
+    <pre class="log" id="log"></pre>
+  </details>
+</div>
+
+<script>
+/* GATEWAY constant — point to the EMS Traefik ingress.
+ *
+ * When PR #13 (Gateway thin-proxy mode) lands and is running on Spark,
+ * switch this to the Gateway URL instead, e.g. "http://localhost:8080"
+ * (with appropriate Authorization header + path mapping handled by
+ * Gateway: /asr/transcribe → /v1/audio/transcriptions etc.).
+ *
+ * For now this hits the EMS Traefik directly for E2E validation.
+ */
+// PR #13: now hits the AI SDK Gateway (which forwards to EMS via Tailscale).
+// VS Code Remote SSH forwards Spark's 8000 to the laptop, so the browser
+// reaches the gateway via localhost.
+const GATEWAY   = "http://localhost:8000";
+const SDK_KEY   = "bsa_test_local_a0b727929d297299";
+const ASR_URL   = GATEWAY;
+const LLM_URL   = GATEWAY;
+const TTS_URL   = GATEWAY;
+let   LLM_MODEL = "qwen3.6-35b";
+const AUTH_HEADER = { "Authorization": `Bearer ${SDK_KEY}` };
+
+const ASR_SAMPLE_RATE = 16000;
+
+const TARGETS = [
+  { code:"zh-TW", label:"繁體中文 (Traditional Chinese)", voice:"zf_xiaoxiao" },
+  { code:"en",    label:"English",                       voice:"af_heart"    },
+  { code:"ja",    label:"日本語 (Japanese)",              voice:"jf_alpha"    },
+  { code:"es",    label:"Español (Spanish)",             voice:"ef_dora"     },
+  { code:"fr",    label:"Français (French)",             voice:"ff_siwis"    },
+  { code:"it",    label:"Italiano (Italian)",            voice:"if_sara"     },
+  { code:"pt-BR", label:"Português (Portuguese)",        voice:"pf_dora"     },
+  { code:"hi",    label:"हिन्दी (Hindi)",                  voice:"hf_alpha"    },
+];
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+function log(kind, msg) {
+  const cls = kind === "req" ? "req" : kind === "res" ? "res" : kind === "err" ? "err" : "dim";
+  const prefix = { req:"→ ", res:"← ", err:"✗ ", dim:"  " }[kind] || "  ";
+  logEl.innerHTML += `<span class="${cls}">${prefix}${escapeHtml(msg)}</span>\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function banner(msg){ const b=$("errBanner"); if(!msg){b.style.display="none";return;} b.textContent=msg; b.style.display="block"; }
+
+async function asrTranscribe(wavBlob, language) {
+  const form = new FormData();
+  form.append("file", wavBlob, "audio.wav");
+  form.append("model", "whisper-1");  // OpenAI shape requires this
+  if (language) form.append("language", language);
+  log("req", `POST ${ASR_URL}/v1/audio/transcriptions   (multipart file=audio.wav, ${(wavBlob.size/1024|0)} KB${language?`, language=${language}`:""})`);
+  const t0 = performance.now();
+  const r = await fetch(ASR_URL + "/v1/audio/transcriptions", {
+    method: "POST",
+    headers: AUTH_HEADER,
+    body: form,
+  });
+  if (!r.ok) throw new Error(`ASR HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
+  const data = await r.json();
+  let text = (data.text || "").trim();
+  if (!text && Array.isArray(data.segments))
+    text = data.segments.map(s => (s.text||"").trim()).join("").trim();
+  const ms = (performance.now()-t0)|0;
+  log("res", `ASR ${ms}ms  lang=${data.language||"?"}  text="${text}"`);
+  return { text, language: data.language || "", raw: data, ms };
+}
+
+async function llmTranslate(text, targetLabel) {
+  const prompt =
+    `Translate the following text into ${targetLabel}. ` +
+    `Output ONLY the translation, no explanations, no quotes.\n\nText: ${text}`;
+  // /no_think is the Qwen3 system directive that disables chain-of-thought
+  // (no <think>…</think> block emitted). DeepSeek-R1 and other reasoning
+  // models ignore it harmlessly. The client-side regex strip in
+  // llmTranslate() is the belt-and-braces fallback.
+  const useRag = !!document.getElementById("useRag")?.checked;
+  const body = {
+    model: LLM_MODEL,
+    messages: [
+      { role: "system", content: "/no_think You are a translator. Output ONLY the translation." },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0,
+    max_tokens: 256,
+    // PR #14: hybrid-mode opt-in. True routes through Dify (RAG + DSL),
+    // false (or omitted) thin-proxies straight to vLLM.
+    use_rag: useRag,
+  };
+  log("req", `POST ${LLM_URL}/v1/chat/completions   model=${LLM_MODEL}  ${useRag ? "[RAG via Dify]" : "[thin-proxy direct]"}`);
+  const t0 = performance.now();
+  const r = await fetch(LLM_URL + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...AUTH_HEADER },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`LLM HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
+  const data = await r.json();
+  let out = (data.choices?.[0]?.message?.content || "").trim();
+  // Strip <think>...</think> blocks emitted by reasoning models like
+  // Qwen3 / DeepSeek-R1. Without this, the thinking gets shown on
+  // screen + sent to TTS (TTS reads the entire chain-of-thought aloud).
+  out = out.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  // Some Qwen3 builds emit a half-open <think> with no closing tag —
+  // catch that too by taking everything after the last </think>.
+  const lastClose = out.lastIndexOf("</think>");
+  if (lastClose !== -1) out = out.slice(lastClose + "</think>".length).trim();
+  const ms = (performance.now()-t0)|0;
+  log("res", `LLM ${ms}ms  "${out}"`);
+  return { text: out, ms };
+}
+
+async function ttsSpeak(text, voice) {
+  const body = { model:"kokoro", input:text, voice, response_format:"mp3", speed:1.0 };
+  log("req", `POST ${TTS_URL}/v1/audio/speech   voice=${voice}  (${text.length} chars) → audio/mpeg`);
+  const t0 = performance.now();
+  const r = await fetch(TTS_URL + "/v1/audio/speech", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...AUTH_HEADER },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`TTS HTTP ${r.status}: ${(await r.text()).slice(0,200)}`);
+  const blob = await r.blob();
+  const ms = (performance.now()-t0)|0;
+  log("res", `TTS ${ms}ms  ${(blob.size/1024|0)} KB ${blob.type}`);
+  return { blob, ms };
+}
+async function ttsVoices() {
+  // /v1/audio/voices is a Kokoro-specific endpoint not exposed by the
+  // gateway (OpenAI's TTS API has no voice-list endpoint). Fall back to
+  // the hardcoded TARGETS[].voice list. If you ever want dynamic voices,
+  // add a /v1/audio/voices passthrough to routers/audio.py.
+  return [];
+}
+
+let busy = false;
+async function runPipeline(wavBlob) {
+  if (busy) return; busy = true; banner("");
+  setMic(false);
+  $("srcText").textContent = "辨識中…"; $("tgtText").textContent = "—";
+  $("srcMeta").textContent=""; $("tgtMeta").textContent=""; $("ttsMeta").textContent="";
+  try {
+    const srcLang = $("srcLang").value;
+    const asr = await asrTranscribe(wavBlob, srcLang);
+    $("srcText").textContent = asr.text || "（沒聽到內容）";
+    $("srcMeta").textContent = `偵測語言 ${asr.language||"?"} · ${asr.ms}ms`;
+    if (!asr.text) { busy=false; if(continuousOn()) startRecording(); return; }
+
+    const tgt = currentTarget();
+    $("tgtText").textContent = "翻譯中…";
+    const tr = await llmTranslate(asr.text, tgt.label);
+    $("tgtText").textContent = tr.text || "（無輸出）";
+    $("tgtMeta").textContent = `${LLM_MODEL} · ${tr.ms}ms`;
+    if (!tr.text) { busy=false; if(continuousOn()) startRecording(); return; }
+
+    const voice = $("voice").value || tgt.voice;
+    const tts = await ttsSpeak(tr.text, voice);
+    const url = URL.createObjectURL(tts.blob);
+    const player = $("player");
+    player.src = url;
+    $("ttsMeta").textContent = `${voice} · ${(tts.blob.size/1024|0)} KB · ${tts.ms}ms`;
+    await player.play().catch(()=>{});
+    player.onended = () => { URL.revokeObjectURL(url); if (continuousOn()) startRecording(); };
+  } catch (e) {
+    log("err", e.message);
+    banner("錯誤：" + e.message);
+  } finally {
+    busy = false;
+  }
+}
+
+let audioCtx, mediaStream, sourceNode, procNode, zeroGain, pcmChunks = [], capturing = false;
+let speechSeen = false, silenceMs = 0;
+
+async function startRecording() {
+  if (capturing || busy) return;
+  try {
+    if (!mediaStream)
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio:{ channelCount:1, echoCancellation:true, noiseSuppression:true } });
+  } catch (e) {
+    banner("無法取得麥克風：" + e.message + "（請以 https / localhost / file:// 開啟並允許權限）");
+    return;
+  }
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+  procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  zeroGain = audioCtx.createGain(); zeroGain.gain.value = 0;
+  pcmChunks = []; speechSeen = false; silenceMs = 0; capturing = true;
+
+  procNode.onaudioprocess = (ev) => {
+    if (!capturing) return;
+    const input = ev.inputBuffer.getChannelData(0);
+    pcmChunks.push(new Float32Array(input));
+    let sum = 0; for (let i=0;i<input.length;i++) sum += input[i]*input[i];
+    const rms = Math.sqrt(sum/input.length);
+    const frameMs = (input.length / audioCtx.sampleRate) * 1000;
+    if (rms > 0.012) { speechSeen = true; silenceMs = 0; }
+    else if (speechSeen) { silenceMs += frameMs; }
+    if ($("vad").checked && speechSeen && silenceMs > 1100) stopRecording();
+  };
+  sourceNode.connect(procNode); procNode.connect(zeroGain); zeroGain.connect(audioCtx.destination);
+  setMic(true);
+  log("dim", `🎙️ 開始錄音 @ ${audioCtx.sampleRate}Hz（將重新取樣為 ${ASR_SAMPLE_RATE}Hz WAV）`);
+}
+
+function stopRecording() {
+  if (!capturing) return;
+  capturing = false;
+  try { sourceNode.disconnect(); procNode.disconnect(); zeroGain.disconnect(); } catch(_){}
+  setMic(false);
+  const wav = encodeWav(pcmChunks, audioCtx.sampleRate, ASR_SAMPLE_RATE);
+  pcmChunks = [];
+  if (!wav || wav.size < 2000) { log("dim","（音檔太短，略過）"); if (continuousOn()) startRecording(); return; }
+  runPipeline(wav);
+}
+
+function encodeWav(chunks, srcRate, dstRate) {
+  let len = 0; for (const c of chunks) len += c.length;
+  if (len === 0) return null;
+  const merged = new Float32Array(len);
+  let off = 0; for (const c of chunks) { merged.set(c, off); off += c.length; }
+  const ratio = srcRate / dstRate;
+  const outLen = Math.floor(merged.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i=0;i<outLen;i++) {
+    const start = Math.floor(i*ratio), end = Math.min(merged.length, Math.floor((i+1)*ratio));
+    let s=0,n=0; for (let j=start;j<end;j++){ s+=merged[j]; n++; }
+    out[i] = n ? s/n : 0;
+  }
+  const buf = new ArrayBuffer(44 + outLen*2);
+  const dv = new DataView(buf);
+  const ws = (o,s)=>{ for(let i=0;i<s.length;i++) dv.setUint8(o+i, s.charCodeAt(i)); };
+  ws(0,"RIFF"); dv.setUint32(4, 36+outLen*2, true); ws(8,"WAVE");
+  ws(12,"fmt "); dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,dstRate,true); dv.setUint32(28,dstRate*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  ws(36,"data"); dv.setUint32(40,outLen*2,true);
+  let p=44; for (let i=0;i<outLen;i++){ let v=Math.max(-1,Math.min(1,out[i])); dv.setInt16(p, v<0?v*0x8000:v*0x7fff, true); p+=2; }
+  return new Blob([buf], { type:"audio/wav" });
+}
+
+function setMic(on){ const m=$("mic"); m.classList.toggle("rec",on); m.innerHTML = on ? "錄音中…<br>點擊送出" : "按一下<br>開始說話"; }
+function continuousOn(){ return $("continuous").checked; }
+function currentTarget(){ return TARGETS.find(t=>t.code===$("tgtLang").value) || TARGETS[0]; }
+
+$("mic").onclick = () => { if (capturing) stopRecording(); else startRecording(); };
+$("tgtLang").onchange = () => { if (voicesLoaded) $("voice").value = currentTarget().voice; };
+$("manualGo").onclick = async () => {
+  const text = $("manualText").value.trim(); if (!text) return;
+  if (busy) return; busy = true; banner("");
+  $("srcText").textContent = text; $("srcMeta").textContent = "（手動輸入）";
+  try {
+    const tgt = currentTarget();
+    $("tgtText").textContent = "翻譯中…";
+    const tr = await llmTranslate(text, tgt.label);
+    $("tgtText").textContent = tr.text; $("tgtMeta").textContent = `${LLM_MODEL} · ${tr.ms}ms`;
+    const voice = $("voice").value || tgt.voice;
+    const tts = await ttsSpeak(tr.text, voice);
+    const url = URL.createObjectURL(tts.blob); $("player").src = url;
+    $("ttsMeta").textContent = `${voice} · ${tts.ms}ms`;
+    await $("player").play().catch(()=>{});
+  } catch(e){ log("err",e.message); banner("錯誤："+e.message); }
+  finally { busy = false; }
+};
+
+let voicesLoaded = false;
+for (const t of TARGETS){ const o=document.createElement("option"); o.value=t.code; o.textContent=t.label; $("tgtLang").appendChild(o); }
+
+async function init() {
+  try {
+    const voices = await ttsVoices();
+    voicesLoaded = voices.length > 0;
+    const sel = $("voice");
+    for (const v of voices){ const o=document.createElement("option"); o.value=v; o.textContent=v; sel.appendChild(o); }
+    sel.value = currentTarget().voice;
+    log("dim", `TTS 可用聲音 ${voices.length} 個`);
+  } catch(e){ log("err","列 TTS 聲音失敗: "+e.message); }
+  await healthCheck();
+}
+
+async function healthCheck() {
+  setDot("d-llm","warn");
+  try {
+    const r = await fetch(LLM_URL+"/v1/models", { headers: AUTH_HEADER });
+    const d = await r.json();
+    const id = d.data?.[0]?.id;
+    if (id){ LLM_MODEL = id; $("llm-model").textContent = id; setDot("d-llm","ok"); log("res",`LLM models: ${d.data.map(m=>m.id).join(", ")}`); }
+    else setDot("d-llm","err");
+  } catch(e){ setDot("d-llm","err"); log("err","LLM 不可達: "+e.message); }
+  // Gateway has no per-service ping endpoints (those belonged to the
+  // direct-EMS demo). Use the gateway's /health as a single reachability
+  // probe — if the gateway is up, ASR/TTS reachability is decided per
+  // call (a real ASR/TTS outage surfaces as 502/503 from the gateway).
+  setDot("d-asr","warn");
+  setDot("d-tts","warn");
+  try {
+    const r = await fetch(GATEWAY + "/health");
+    const ok = r.ok ? "ok" : "err";
+    setDot("d-asr", ok);
+    setDot("d-tts", ok);
+    if (r.ok) log("res", "Gateway /health 在線 (ASR/TTS 由 gateway 轉發到 EMS)");
+  } catch(e) {
+    setDot("d-asr","err"); setDot("d-tts","err");
+    log("err", "Gateway 不可達: " + e.message);
+  }
+}
+function setDot(id, state){ const d=$(id); d.className = "dot "+(state||""); }
+$("recheck").onclick = healthCheck;
+
+init();
+</script>
+</body>
+</html>

@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from gateway.config import Settings
@@ -18,6 +19,7 @@ from gateway.dify.client import DifyClient
 from gateway.errors import GatewayError, InvalidRequestError
 from gateway.lifecycle import TaskSupervisor, safe_shutdown_step
 from gateway.middleware.auth import AuthMiddleware
+from gateway.middleware.body_size import BodySizeLimitMiddleware
 from gateway.middleware.logging import LoggingMiddleware, configure_logging
 from gateway.middleware.rate_limit import RateLimitMiddleware
 from gateway.ratelimit import (
@@ -33,7 +35,10 @@ from gateway.ratelimit.runtime_metrics import (
     run_metrics_poll_loop,
 )
 from gateway.registry import CustomerEntry, CustomerRegistry
+from gateway.routers import audio as audio_router
 from gateway.routers import chat as chat_router
+from gateway.routers import chat_hybrid as chat_hybrid_router
+from gateway.routers import chat_thin_proxy as chat_thin_proxy_router
 from gateway.routers import datasets as datasets_router
 from gateway.routers import embeddings as embeddings_router
 from gateway.routers import files as files_router
@@ -93,6 +98,19 @@ def create_app(
     """
     settings = settings or Settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
+
+    # PR #13 R1 #8 + PR #14: any mode that exposes thin-proxy chat
+    # (``thin_proxy`` or ``hybrid``) REQUIRES a non-empty llm_endpoint —
+    # without it every direct-LLM request would hit ServiceUnavailableError.
+    # Fail at startup so operators see the misconfiguration immediately,
+    # not on first traffic. ASR/TTS endpoints stay optional (a deployment
+    # with no audio hardware is legitimate; the audio routes 503 cleanly
+    # when called).
+    if settings.effective_mode in ("thin_proxy", "hybrid") and not settings.llm_endpoint.strip():
+        raise RuntimeError(
+            f"mode={settings.effective_mode!r} requires GATEWAY_LLM_ENDPOINT to be set "
+            "(empty value would 503 every direct-LLM chat request)."
+        )
 
     registry = registry or CustomerRegistry.from_yaml(settings.registry_path)
     logger.info("gateway.bootstrap", customers=len(registry))
@@ -159,22 +177,41 @@ def create_app(
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await app_manager.start()
         try:
-            # PR #5: validate registry against real Dify deployments before
-            # accepting traffic. Raises RuntimeError (and so aborts uvicorn
-            # startup with non-zero exit) when settings.strict_startup is
-            # True; otherwise logs warnings and continues.
+            # PR #13: thin-proxy mode bypasses Dify entirely — the
+            # startup check would fail (or worse, succeed against
+            # stale Dify) since the chat/audio routes never call
+            # AppManager / DifyClient. Skip the L2/L3/L4 round-trip;
+            # the registry's pydantic validation (L1) has already run.
             #
-            # Codex review-3 P2: read the factory from app.state at call
-            # time, NOT from the closure captured during create_app. Tests
-            # (see ``conftest.py::app``) replace
-            # ``app.state.dify_client_factory`` AFTER ``create_app`` returns
-            # so requests hit a FakeDifyClient instead of doing real HTTP.
-            active_factory = app_instance.state.dify_client_factory
-            await run_startup_check(
-                registry,
-                active_factory,
-                strict=settings.strict_startup,
-            )
+            # PR #14: hybrid mode runs BOTH paths so we still need the
+            # Dify health check (some customers will route through Dify
+            # for RAG). thin_proxy stays the only skip.
+            if settings.effective_mode == "thin_proxy":
+                logger.info(
+                    "gateway.startup.thin_proxy_mode",
+                    llm_endpoint=settings.llm_endpoint,
+                    asr_endpoint=settings.asr_endpoint,
+                    tts_endpoint=settings.tts_endpoint,
+                )
+            else:
+                # PR #5: validate registry against real Dify deployments
+                # before accepting traffic. Raises RuntimeError (and so
+                # aborts uvicorn startup with non-zero exit) when
+                # settings.strict_startup is True; otherwise logs warnings
+                # and continues.
+                #
+                # Codex review-3 P2: read the factory from app.state at
+                # call time, NOT from the closure captured during
+                # create_app. Tests (see ``conftest.py::app``) replace
+                # ``app.state.dify_client_factory`` AFTER ``create_app``
+                # returns so requests hit a FakeDifyClient instead of
+                # doing real HTTP.
+                active_factory = app_instance.state.dify_client_factory
+                await run_startup_check(
+                    registry,
+                    active_factory,
+                    strict=settings.strict_startup,
+                )
             # PR #9: start the headroom polling task AFTER startup checks
             # pass. PR #11: dispatched through task_supervisor so shutdown
             # gathers it with the chat router's cancel POSTs in one
@@ -235,15 +272,56 @@ def create_app(
 
     # Middleware ordering (add order is INNERMOST-first in Starlette, so the
     # last added runs outermost):
-    #   request flow:  Logging -> Auth -> RateLimit -> route
-    # - Logging outermost: request id exists even on auth / rate-limit failure.
+    #   request flow:  CORS -> Logging -> BodySize -> Auth -> RateLimit -> route
+    # - CORS outermost: preflight ``OPTIONS`` requests must be answered with
+    #   ``Access-Control-Allow-Origin`` BEFORE any auth check. Auth middleware
+    #   would 401 the preflight (no Authorization header on an OPTIONS) and
+    #   the browser would never send the real request.
+    # - Logging next: request id exists even on auth / rate-limit failure.
+    # - BodySize before Auth: a multi-GB body shouldn't even get to the auth
+    #   parser (PR #13 R2 #9). Added AFTER Auth here so it ends up outer.
     # - RateLimit inner to Auth: it keys on request.state.customer, which
     #   AuthMiddleware sets. Added BEFORE Auth here so it ends up inner.
     app.add_middleware(RateLimitMiddleware, limiter=rate_limiter, settings=settings)
     app.add_middleware(AuthMiddleware, registry=registry)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(LoggingMiddleware, request_id_header=settings.request_id_header)
+    # PR #13 R2 follow-up: enable CORS when configured. Empty list →
+    # middleware not installed (the production deployment behind a single
+    # domain may not need it). The demo HTML in scripts/translator_demo.html
+    # is served from a different localhost port than the gateway, so dev
+    # deployments must set ``GATEWAY_CORS_ALLOW_ORIGINS`` to either ``*``
+    # or the explicit dev origins.
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allow_origins,
+            allow_credentials=False,  # Authorization header travels in body, not cookies
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+            expose_headers=["X-Request-ID", "Retry-After"],
+            max_age=600,  # cache preflight for 10 min to avoid OPTIONS spam
+        )
 
-    app.include_router(chat_router.router)
+    # Chat router selection per deployment mode (PR #13 + PR #14):
+    #   dify       → chat.py (Dify-orchestrated, RAG always on)
+    #   thin_proxy → chat_thin_proxy.py (direct to LLM, no RAG) + audio
+    #   hybrid     → chat_hybrid.py (per-request dispatch on use_rag) + audio
+    #
+    # All three modes register exactly one router at /v1/chat/completions
+    # so FastAPI never sees a path conflict. The Dify-flavoured datasets /
+    # files routes stay mounted unconditionally — clients calling them
+    # when no Dify is wired up will get a clean 502 from the path, not a
+    # confusing 404.
+    mode = settings.effective_mode
+    if mode == "thin_proxy":
+        app.include_router(chat_thin_proxy_router.router)
+        app.include_router(audio_router.router)
+    elif mode == "hybrid":
+        app.include_router(chat_hybrid_router.router)
+        app.include_router(audio_router.router)
+    else:  # "dify"
+        app.include_router(chat_router.router)
     app.include_router(embeddings_router.router)
     app.include_router(models_router.router)
     app.include_router(datasets_router.router)

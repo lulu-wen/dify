@@ -83,6 +83,21 @@ class UnknownModelError(GatewayError):
     code = "model_not_found"
 
 
+class NotEntitledError(GatewayError):
+    """Authenticated customer lacks entitlement for the requested feature. → 403.
+
+    Distinct from :class:`InvalidSdkKeyError` (401, "your key is bad") and
+    :class:`UnknownModelError` (404, "this model isn't on your list"). 403
+    semantics: "we know who you are, your key is valid, but this feature
+    isn't on your plan". First consumer is the audio routes (PR #13 R2 #3)
+    — customers without ``audio_enabled`` hit this on /v1/audio/*.
+    """
+
+    status_code = 403
+    error_type = "invalid_request_error"
+    code = "not_entitled"
+
+
 class UnknownDatasetError(GatewayError):
     """Client referenced a dataset they don't own (or that doesn't exist). → 404.
 
@@ -184,3 +199,64 @@ class ServiceUnavailableError(GatewayError):
     status_code = 503
     error_type = "service_unavailable"
     code = "service_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# PR #13 R1: per-service upstream errors for thin-proxy mode.
+#
+# Original Dify*Error codes implied 'Customer's Dify deployment failed' —
+# but in thin-proxy mode the upstream is vLLM (LLM), WhisperX (ASR), or
+# Kokoro (TTS), none of which involve Dify. Reusing Dify*Error there
+# misleads operator dashboards and runbooks keyed on the ``code`` field.
+# Each non-Dify upstream now has its own typed class with a distinct
+# ``code`` ("llm_upstream_error", etc.) so the OpenAI envelope sent to
+# clients carries the truth.
+# --------------------------------------------------------------------------- #
+
+
+class LLMUpstreamError(GatewayError):
+    """EMS-managed LLM endpoint (vLLM/LiteLLM) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "llm_upstream_error"
+
+
+class LLMTimeoutError(GatewayError):
+    """EMS-managed LLM endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "llm_timeout"
+
+
+class ASRUpstreamError(GatewayError):
+    """EMS-managed ASR endpoint (WhisperX) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "asr_upstream_error"
+
+
+class ASRTimeoutError(GatewayError):
+    """EMS-managed ASR endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "asr_timeout"
+
+
+class TTSUpstreamError(GatewayError):
+    """EMS-managed TTS endpoint (Kokoro) returned non-2xx or unreachable. → 502."""
+
+    status_code = 502
+    error_type = "upstream_error"
+    code = "tts_upstream_error"
+
+
+class TTSTimeoutError(GatewayError):
+    """EMS-managed TTS endpoint timed out. → 504."""
+
+    status_code = 504
+    error_type = "upstream_error"
+    code = "tts_timeout"

@@ -258,6 +258,35 @@ class CustomerEntry(BaseModel):
             "positive when set, same rationale as rpm_limit."
         ),
     )
+    audio_enabled: bool = Field(
+        default=False,
+        description=(
+            "Audio entitlement gate (PR #13 R2 #3). When False, the audio "
+            "routes (``/v1/audio/transcriptions`` and ``/v1/audio/speech``) "
+            "reject this customer with 403 even though their SDK key is "
+            "valid. Default False so chat-only tenants don't silently get "
+            "GPU-hungry ASR/TTS access just because thin-proxy mode is on; "
+            "flip per tenant in registry.yaml when their plan includes audio. "
+            "Has no effect on Dify-mode deployments (audio routes are not "
+            "mounted there)."
+        ),
+    )
+    rag_enabled: bool = Field(
+        default=False,
+        description=(
+            "**HYBRID MODE ONLY** — RAG entitlement gate (PR #14). In "
+            "``mode=\"hybrid\"`` deployments, a request body with "
+            "``use_rag: true`` is routed through Dify for retrieval + "
+            "DSL orchestration; this flag must be True or the request "
+            "is rejected with 403 ``not_entitled``. **In pure ``dify`` "
+            "mode this flag is IGNORED** — every request goes through "
+            "Dify regardless of this value, so setting ``rag_enabled: "
+            "false`` on a dify-mode deployment will NOT prevent RAG "
+            "for that customer (use a separate gateway or per-customer "
+            "model whitelist to control that). In pure ``thin_proxy`` "
+            "mode RAG is unavailable entirely; this flag is moot."
+        ),
+    )
 
     @field_validator("models")
     @classmethod
