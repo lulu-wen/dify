@@ -117,17 +117,29 @@ def _build_system_prompt(messages: list[ChatMessage]) -> str:
 
 
 def _user_id(req: ChatCompletionRequest, customer: CustomerEntry, request_id: str) -> str:
-    """Stable end-user identifier sent to Dify.
+    """Stable end-user identifier sent to Dify, prefixed with the customer id.
 
     Honors OpenAI's deprecation precedence via ``effective_user``
-    (``safety_identifier`` > ``user``). Falls back to a deterministic
-    per-customer identifier when both are omitted, since Dify requires this field.
+    (``safety_identifier`` > ``user``).
+
+    Both branches prepend ``{customer_id}:`` so the Dify dashboard's
+    "使用者或賬戶" column shows which customer the EndUser belongs to.
+    The gateway is the only layer that knows the SDK-key → customer mapping
+    (the client only sees its own user string), so wrapping here keeps the
+    customer-tenancy view in Dify without every client having to know its
+    own customer_id.
+
+    Stability invariant: same client-supplied ``user`` string → same Dify
+    EndUser row across turns. Dify keys conversations by (app_id, end_user),
+    so this stability is what lets PR #16's conversation_id continuity work.
     """
     resolved = req.effective_user
     if resolved:
-        return resolved
-    # Use ``customer_id:request_id`` as fallback; not ideal for cross-call
-    # personalisation but unambiguous for tracing.
+        return f"{customer.customer_id}:{resolved}"
+    # Anonymous fallback: ``customer_id:request_id``. The trailing
+    # request_id is per-call, so every anonymous turn looks like a new
+    # EndUser to Dify — fine for tracing but breaks conversation_id reuse.
+    # Clients that need multi-turn continuity must supply ``user``.
     return f"{customer.customer_id}:{request_id}"
 
 

@@ -258,6 +258,9 @@ async def test_safety_identifier_preferred_over_user(
     """OpenAI 2025+ deprecates ``user`` in favor of ``safety_identifier``.
     When both are present, ``safety_identifier`` wins; we forward whichever
     is resolved as ``user`` to Dify (Dify only knows that field name).
+
+    PR #18: gateway prefixes the resolved id with ``{customer_id}:`` before
+    sending so the Dify dashboard's end-user column shows tenancy.
     """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
@@ -273,7 +276,7 @@ async def test_safety_identifier_preferred_over_user(
         )
 
     sent = fake_dify.calls["blocking"][0]
-    assert sent["user"] == "new-style-user-id"
+    assert sent["user"] == "test-a:new-style-user-id"
 
 
 @pytest.mark.asyncio
@@ -281,7 +284,10 @@ async def test_user_field_alone_still_accepted(
     app: FastAPI, fake_dify: FakeDifyClient
 ) -> None:
     """Backwards compatibility: clients on OpenAI SDK <2025 still write ``user``
-    and must keep working."""
+    and must keep working.
+
+    PR #18: gateway prefixes with ``{customer_id}:``.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
         await cli.post(
@@ -295,7 +301,67 @@ async def test_user_field_alone_still_accepted(
         )
 
     sent = fake_dify.calls["blocking"][0]
-    assert sent["user"] == "legacy-user-id"
+    assert sent["user"] == "test-a:legacy-user-id"
+
+
+@pytest.mark.asyncio
+async def test_user_id_stable_across_turns_when_client_supplies_user(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """PR #18: regression for PR #17/#16 multi-turn continuity.
+
+    When the client supplies the same ``user`` across two requests, the
+    string the gateway forwards to Dify must be identical for both — that
+    stability is what lets PR #16's saved conversation_id resolve to the
+    same Dify EndUser row on turn 2 (Dify keys conversations by
+    ``(app_id, end_user)``). Two independent request_ids must not leak
+    into the forwarded user.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        for _ in range(2):
+            await cli.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "user": "session-uuid-9ba1d3f4",
+                },
+            )
+
+    first = fake_dify.calls["blocking"][0]["user"]
+    second = fake_dify.calls["blocking"][1]["user"]
+    assert first == second == "test-a:session-uuid-9ba1d3f4"
+
+
+@pytest.mark.asyncio
+async def test_user_id_anonymous_fallback_includes_request_id(
+    app: FastAPI, fake_dify: FakeDifyClient
+) -> None:
+    """PR #18: when the client supplies no ``user``, gateway falls back to
+    ``{customer_id}:{request_id}``. The customer_id prefix matches the
+    explicit-user case; the request_id suffix means each call is a fresh
+    Dify EndUser — anonymous callers can't piggy-back on someone else's
+    conversation_id. Multi-turn continuity is opt-in via ``user``.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+        for _ in range(2):
+            await cli.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer bsa_test_a"},
+                json={
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+    first = fake_dify.calls["blocking"][0]["user"]
+    second = fake_dify.calls["blocking"][1]["user"]
+    assert first.startswith("test-a:")
+    assert second.startswith("test-a:")
+    assert first != second  # distinct request_ids → distinct anonymous users
 
 
 @pytest.mark.asyncio
